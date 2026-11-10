@@ -36,8 +36,10 @@ function parseCurrentRoute(): RouteState {
     return { view: 'present', sessionId: presentMatch[1] };
   }
 
-  // Preveri /host/:sessionId ali #/host/:sessionId
-  const hostMatch = path.match(/\/host\/([^/?#]+)/) || hash.match(/#\/host\/([^/?#]+)/);
+  // Preveri /host-remote/:sessionId ali /host/:sessionId
+  const hostMatch =
+    path.match(/\/host(?:-remote)?\/([^/?#]+)/) ||
+    hash.match(/#\/host(?:-remote)?\/([^/?#]+)/);
   if (hostMatch) {
     return { view: 'host_remote', sessionId: hostMatch[1] };
   }
@@ -162,11 +164,11 @@ export function App() {
                   QuizPulse <span className="text-emerald-400">Live</span>
                 </span>
                 <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                  Faza 2 &bull; Glavni zaslon &amp; Daljinec
+                  Faza 3 &bull; Daljinec &amp; Ocenjevanje
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 hidden sm:block">
-                Vodenje pub kviza v živo &bull; Predstavitveni zaslon &amp; Realtime
+                Vodenje pub kviza v živo &bull; Predstavitveni zaslon &amp; Ocenjevanje z Jokerji
               </p>
             </div>
           </div>
@@ -243,7 +245,7 @@ export function App() {
               window.open(`/present/${sessionId}`, '_blank');
             }}
             onOpenRemote={(sessionId) => {
-              window.open(`/host/${sessionId}`, '_blank');
+              window.open(`/host-remote/${sessionId}`, '_blank');
             }}
           />
         )}

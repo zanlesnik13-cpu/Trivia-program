@@ -1082,7 +1082,7 @@ export async function submitDemoAnswer(
       answer_text: answerText,
       is_correct: isCorrect,
       awarded_points: awardedPoints,
-      graded: true,
+      graded: false,
       created_at: new Date().toISOString(),
     };
     if (existingIdx >= 0) {
@@ -1106,6 +1106,68 @@ export async function submitDemoAnswer(
         answer_text: answerText,
         is_correct: isCorrect,
         awarded_points: awardedPoints,
+        graded: false,
+      },
+      { onConflict: 'session_id,player_id,slide_id' }
+    )
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data as Answer;
+}
+
+/**
+ * Posodobi ali ustvari ocenjen odgovor za določenega igralca na določenem slajdu.
+ */
+export async function upsertGradedAnswer(
+  sessionId: string,
+  playerId: string,
+  themeId: string,
+  slideId: string,
+  answerText: string,
+  isCorrect: boolean,
+  awardedPoints: number
+): Promise<Answer> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const existingIdx = db.answers.findIndex(
+      (a) => a.session_id === sessionId && a.player_id === playerId && a.slide_id === slideId
+    );
+    const ans: Answer = {
+      id: existingIdx >= 0 ? db.answers[existingIdx].id : crypto.randomUUID(),
+      session_id: sessionId,
+      player_id: playerId,
+      theme_id: themeId,
+      slide_id: slideId,
+      answer_text: answerText,
+      is_correct: isCorrect,
+      awarded_points: Number(awardedPoints),
+      graded: true,
+      created_at: new Date().toISOString(),
+    };
+    if (existingIdx >= 0) {
+      db.answers[existingIdx] = ans;
+    } else {
+      db.answers.push(ans);
+    }
+    saveDemoDb(db);
+    notifyDemoUpdate('ANSWERS_UPDATED', sessionId);
+    return ans;
+  }
+
+  const { data, error } = await supabase
+    .from('answers')
+    .upsert(
+      {
+        session_id: sessionId,
+        player_id: playerId,
+        theme_id: themeId,
+        slide_id: slideId,
+        answer_text: answerText,
+        is_correct: isCorrect,
+        awarded_points: Number(awardedPoints),
         graded: true,
       },
       { onConflict: 'session_id,player_id,slide_id' }
@@ -1116,3 +1178,205 @@ export async function submitDemoAnswer(
   if (error) throw error;
   return data as Answer;
 }
+
+/**
+ * Avtomatsko pred-oceni vse oddane odgovore za dano tematiko:
+ * - multiple_choice: primerja answer_text === correct_answer
+ * - closest_number: izračuna |odgovor_igralca - correct_answer| in označi najbližjega (ali več ob izenačenju) kot pravilnega
+ * - open_text: če še ni ocenjen, preveri ujemanje besedila (brez velikih/malih črk)
+ */
+export async function autoPreGradeTheme(
+  sessionId: string,
+  themeId: string,
+  slides: Slide[],
+  existingAnswers: Answer[]
+): Promise<void> {
+  const questionSlides = slides.filter(
+    (s) =>
+      s.slide_type === 'multiple_choice' ||
+      s.slide_type === 'closest_number' ||
+      s.slide_type === 'open_text'
+  );
+
+  const updatesToSave: Array<{
+    playerId: string;
+    slideId: string;
+    answerText: string;
+    isCorrect: boolean;
+    awardedPoints: number;
+  }> = [];
+
+  for (const slide of questionSlides) {
+    const slideAnswers = existingAnswers.filter((a) => a.slide_id === slide.id);
+    if (slideAnswers.length === 0) continue;
+
+    const correctRaw = (slide.correct_answer || '').trim();
+    const maxPts = Number(slide.points ?? 1);
+
+    if (slide.slide_type === 'multiple_choice') {
+      for (const ans of slideAnswers) {
+        if (ans.graded) continue;
+        const isMatch =
+          correctRaw !== '' &&
+          ans.answer_text.trim().toUpperCase() === correctRaw.toUpperCase();
+        updatesToSave.push({
+          playerId: ans.player_id,
+          slideId: slide.id,
+          answerText: ans.answer_text,
+          isCorrect: isMatch,
+          awardedPoints: isMatch ? maxPts : 0,
+        });
+      }
+    } else if (slide.slide_type === 'closest_number') {
+      const targetNum = parseFloat(correctRaw.replace(',', '.'));
+      if (!Number.isNaN(targetNum)) {
+        // Izračunaj absolutno razliko |odgovor_igralca - correct_answer| za vse veljavne številske odgovore
+        const diffs: Array<{ ans: Answer; diff: number }> = [];
+        for (const ans of slideAnswers) {
+          const val = parseFloat(ans.answer_text.trim().replace(',', '.'));
+          if (!Number.isNaN(val)) {
+            diffs.push({ ans, diff: Math.abs(val - targetNum) });
+          } else if (!ans.graded) {
+            updatesToSave.push({
+              playerId: ans.player_id,
+              slideId: slide.id,
+              answerText: ans.answer_text,
+              isCorrect: false,
+              awardedPoints: 0,
+            });
+          }
+        }
+
+        if (diffs.length > 0) {
+          const minDiff = Math.min(...diffs.map((d) => d.diff));
+          for (const { ans, diff } of diffs) {
+            if (ans.graded) continue;
+            const isWinner = Math.abs(diff - minDiff) < 1e-9;
+            updatesToSave.push({
+              playerId: ans.player_id,
+              slideId: slide.id,
+              answerText: ans.answer_text,
+              isCorrect: isWinner,
+              awardedPoints: isWinner ? maxPts : 0,
+            });
+          }
+        }
+      }
+    } else if (slide.slide_type === 'open_text') {
+      for (const ans of slideAnswers) {
+        if (ans.graded) continue;
+        const isExact =
+          correctRaw !== '' &&
+          ans.answer_text.trim().toLowerCase() === correctRaw.toLowerCase();
+        updatesToSave.push({
+          playerId: ans.player_id,
+          slideId: slide.id,
+          answerText: ans.answer_text,
+          isCorrect: isExact,
+          awardedPoints: isExact ? maxPts : 0,
+        });
+      }
+    }
+  }
+
+  for (const item of updatesToSave) {
+    await upsertGradedAnswer(
+      sessionId,
+      item.playerId,
+      themeId,
+      item.slideId,
+      item.answerText,
+      item.isCorrect,
+      item.awardedPoints
+    );
+  }
+}
+
+/**
+ * Potrdi ocene za tematiko, izračuna skupne točke vseh igralcev (upošteva 2x Joker za vsako temo!)
+ * in prestavi status seje v 'leaderboard'.
+ */
+export async function confirmThemeGradesAndShowLeaderboard(
+  sessionId: string
+): Promise<void> {
+  const presData = await fetchPresentationData(sessionId);
+  const { players, answers, playerJokers } = presData;
+
+  // Zgradi množico Jokerjev: ključ `${player_id}_${theme_id}`
+  const jokerSet = new Set(
+    playerJokers.map((pj) => `${pj.player_id}_${pj.theme_id}`)
+  );
+
+  // Za vsakega igralca izračunamo točke po vseh tematikah:
+  // Če je v določeni temi uporabil Jokerja, se vsota točk tiste teme pomnoži z 2!
+  const newScoresByPlayer: Record<string, number> = {};
+  for (const p of players) {
+    newScoresByPlayer[p.id] = 0;
+  }
+
+  // Grupiraj odgovore po igralcu in temi
+  const playerThemeSums: Record<string, Record<string, number>> = {};
+  for (const ans of answers) {
+    const pts = Number(ans.awarded_points ?? 0);
+    if (!playerThemeSums[ans.player_id]) {
+      playerThemeSums[ans.player_id] = {};
+    }
+    playerThemeSums[ans.player_id][ans.theme_id] =
+      (playerThemeSums[ans.player_id][ans.theme_id] || 0) + pts;
+  }
+
+  for (const player of players) {
+    const themeSums = playerThemeSums[player.id] || {};
+    let total = 0;
+    for (const [tId, themeSum] of Object.entries(themeSums)) {
+      const hasJoker = jokerSet.has(`${player.id}_${tId}`);
+      total += hasJoker ? themeSum * 2 : themeSum;
+    }
+    newScoresByPlayer[player.id] = Math.round(total * 100) / 100;
+  }
+
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    for (const p of db.players) {
+      if (p.session_id === sessionId && newScoresByPlayer[p.id] !== undefined) {
+        p.total_score = newScoresByPlayer[p.id];
+      }
+    }
+    for (const a of db.answers) {
+      if (a.session_id === sessionId) {
+        a.graded = true;
+      }
+    }
+    const sIdx = db.game_sessions.findIndex((s) => s.id === sessionId);
+    if (sIdx >= 0) {
+      db.game_sessions[sIdx].status = 'leaderboard';
+      db.game_sessions[sIdx].timer_started_at = null;
+      db.game_sessions[sIdx].timer_duration = 0;
+    }
+    saveDemoDb(db);
+    notifyDemoUpdate('LEADERBOARD_UPDATED', sessionId);
+    return;
+  }
+
+  // Posodobi total_score za vsakega igralca v Supabase
+  await Promise.all(
+    players.map((p) =>
+      supabase
+        .from('players')
+        .update({ total_score: newScoresByPlayer[p.id] ?? 0 })
+        .eq('id', p.id)
+    )
+  );
+
+  // Prestavi status seje v 'leaderboard'
+  await supabase
+    .from('game_sessions')
+    .update({
+      status: 'leaderboard',
+      timer_started_at: null,
+      timer_duration: 0,
+    })
+    .eq('id', sessionId);
+}
+
