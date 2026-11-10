@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   Database,
+  Home,
   LogOut,
   Smartphone,
   Sparkles,
@@ -10,6 +11,7 @@ import {
 import { HostAuth } from './components/HostAuth';
 import { HostDashboard } from './components/HostDashboard';
 import { HostRemoteController } from './components/HostRemoteController';
+import { LandingPage } from './components/LandingPage';
 import { PlayerView } from './components/PlayerView';
 import { PresentationView } from './components/PresentationView';
 import { QuizBuilder } from './components/QuizBuilder';
@@ -23,17 +25,18 @@ interface HostUser {
 }
 
 type RouteState =
-  | { view: 'dashboard'; sessionId?: null }
+  | { view: 'landing' }
+  | { view: 'host_portal' }
   | { view: 'present'; sessionId: string }
   | { view: 'host_remote'; sessionId: string }
   | { view: 'play'; roomCode?: string };
 
 function parseCurrentRoute(): RouteState {
-  if (typeof window === 'undefined') return { view: 'dashboard' };
+  if (typeof window === 'undefined') return { view: 'landing' };
   const path = window.location.pathname;
   const hash = window.location.hash;
 
-  // Preveri /play ali #/play z morebitnim ?code=XXXX ali #/play?code=XXXX
+  // 1. Preveri /play ali #/play z morebitnim ?code=XXXX ali #/play?code=XXXX
   if (
     path.startsWith('/play') ||
     hash.startsWith('#/play') ||
@@ -49,22 +52,36 @@ function parseCurrentRoute(): RouteState {
     return { view: 'play', roomCode: code };
   }
 
-  // Preveri /present/:sessionId ali #/present/:sessionId
+  // 2. Preveri /present/:sessionId ali #/present/:sessionId
   const presentMatch =
     path.match(/\/present\/([^/?#]+)/) || hash.match(/#\/present\/([^/?#]+)/);
   if (presentMatch) {
     return { view: 'present', sessionId: presentMatch[1] };
   }
 
-  // Preveri /host-remote/:sessionId ali /host/:sessionId
-  const hostMatch =
-    path.match(/\/host(?:-remote)?\/([^/?#]+)/) ||
-    hash.match(/#\/host(?:-remote)?\/([^/?#]+)/);
-  if (hostMatch) {
-    return { view: 'host_remote', sessionId: hostMatch[1] };
+  // 3. Preveri /host-remote/:sessionId ali #/host-remote/:sessionId
+  const hostRemoteMatch =
+    path.match(/\/host-remote\/([^/?#]+)/) ||
+    hash.match(/#\/host-remote\/([^/?#]+)/);
+  if (hostRemoteMatch) {
+    return { view: 'host_remote', sessionId: hostRemoteMatch[1] };
   }
 
-  return { view: 'dashboard' };
+  // 4. Preveri /host, /dashboard, /login, /admin (portal za gostitelja)
+  if (
+    path.startsWith('/host') ||
+    path.startsWith('/dashboard') ||
+    path.startsWith('/login') ||
+    path.startsWith('/admin') ||
+    hash.includes('/host') ||
+    hash.includes('/dashboard') ||
+    hash.includes('/login')
+  ) {
+    return { view: 'host_portal' };
+  }
+
+  // 5. Privzeto: vstopna stran (Landing Page) na /
+  return { view: 'landing' };
 }
 
 export function App() {
@@ -132,6 +149,26 @@ export function App() {
     setEditingQuizId(null);
   };
 
+  // Če je uporabnik na vstopni strani (Landing Page)
+  if (route.view === 'landing') {
+    return (
+      <>
+        <LandingPage
+          onJoinGame={(code) => navigateTo(`/play?code=${code}`)}
+          onOpenHost={() => navigateTo('/host')}
+          onOpenSupabaseModal={() => setShowSupabaseModal(true)}
+          isHostLoggedIn={Boolean(hostUser)}
+          hostEmail={hostUser?.email}
+        />
+        <SupabaseSetupModal
+          isOpen={showSupabaseModal}
+          onClose={() => setShowSupabaseModal(false)}
+          onConfigSaved={() => setConfigVersion((v) => v + 1)}
+        />
+      </>
+    );
+  }
+
   // Če je uporabnik na pogledu igralca (/play)
   if (route.view === 'play') {
     return (
@@ -147,7 +184,7 @@ export function App() {
     return (
       <PresentationView
         sessionId={route.sessionId}
-        onExit={() => navigateTo('/')}
+        onExit={() => navigateTo('/host')}
       />
     );
   }
@@ -157,7 +194,7 @@ export function App() {
     return (
       <HostRemoteController
         sessionId={route.sessionId}
-        onExit={() => navigateTo('/')}
+        onExit={() => navigateTo('/host')}
         onOpenPresentation={() => {
           window.open(`/present/${route.sessionId}`, '_blank');
         }}
@@ -179,9 +216,10 @@ export function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
           <div
             onClick={() => {
-              if (hostUser) setEditingQuizId(null);
+              navigateTo('/');
             }}
             className="flex items-center gap-3 cursor-pointer"
+            title="Pojdi na vstopno stran"
           >
             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 via-violet-600 to-emerald-500 p-[1px] shadow-lg shadow-indigo-500/20">
               <div className="w-full h-full bg-slate-950 rounded-[11px] flex items-center justify-center">
@@ -194,16 +232,26 @@ export function App() {
                   QuizPulse <span className="text-emerald-400">Live</span>
                 </span>
                 <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                  Faza 4 &bull; Mobilni igralec (/play)
+                  Faza 5 &bull; Objava &amp; Vercel
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 hidden sm:block">
-                Vodenje pub kviza v živo &bull; Predstavitveni zaslon &bull; Daljinec &bull; Igralci
+                Nadzorna plošča za gostitelje &bull; Urejanje in vodenje kvizov
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2.5 sm:gap-3">
+            {/* Gumb za prehod na vstopno stran */}
+            <button
+              onClick={() => navigateTo('/')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition-colors cursor-pointer"
+              title="Nazaj na začetno stran"
+            >
+              <Home className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="hidden md:inline">Vstopna stran</span>
+            </button>
+
             {/* Gumb za hiter vstop v igro kot igralec (/play) */}
             <button
               id="navbar-play-btn"

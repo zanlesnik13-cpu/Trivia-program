@@ -10,6 +10,7 @@ import {
   Lock,
   LogOut,
   Radio,
+  RefreshCw,
   Send,
   Sparkles,
 } from 'lucide-react';
@@ -105,6 +106,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     attemptReconnect();
   }, []);
 
+  const [refreshing, setRefreshing] = useState(false);
+
   // 2. Osveževanje podatkov o igralcu
   const refreshPlayerData = async () => {
     if (!activeSessionId || !activePlayerId) return;
@@ -126,8 +129,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         prevStatusRef.current !== full.session.status
       ) {
         confetti({
-          particleCount: 70,
-          spread: 70,
+          particleCount: full.session.status === 'finished' ? 100 : 70,
+          spread: 80,
           origin: { y: 0.6 },
         });
       }
@@ -137,7 +140,16 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     }
   };
 
-  // 3. Realtime naročnina na Supabase & Demo BroadcastChannel
+  const handleManualRefresh = async () => {
+    setRefreshing(true);
+    try {
+      await refreshPlayerData();
+    } finally {
+      setTimeout(() => setRefreshing(false), 500);
+    }
+  };
+
+  // 3. Realtime naročnina na Supabase & Demo BroadcastChannel s stabilnim fallbackom
   useEffect(() => {
     if (!activeSessionId || !activePlayerId) return;
 
@@ -184,12 +196,31 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     };
     window.addEventListener('trivia_demo_local_update', localHandler);
 
+    // Varnostni fallback ob vrnitvi fokusa ali ponovni povezavi
+    const handleRevalidate = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        refreshPlayerData();
+      }
+    };
+    window.addEventListener('visibilitychange', handleRevalidate);
+    window.addEventListener('focus', handleRevalidate);
+    window.addEventListener('online', handleRevalidate);
+
+    // Periodični varnostni heartbeat (vsakih 4 sekund) proti zamrznitvi
+    const fallbackPoll = setInterval(() => {
+      refreshPlayerData();
+    }, 4000);
+
     return () => {
       if (channel && supabase) {
         supabase.removeChannel(channel);
       }
       unsubDemo();
       window.removeEventListener('trivia_demo_local_update', localHandler);
+      window.removeEventListener('visibilitychange', handleRevalidate);
+      window.removeEventListener('focus', handleRevalidate);
+      window.removeEventListener('online', handleRevalidate);
+      clearInterval(fallbackPoll);
     };
   }, [activeSessionId, activePlayerId]);
 
@@ -559,6 +590,14 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
             <span>🃏</span>
             <span>{player.jokers_remaining}</span>
           </div>
+
+          <button
+            onClick={handleManualRefresh}
+            className="p-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-800 text-slate-400 hover:text-emerald-400 transition-colors cursor-pointer"
+            title="Ročno osveži stanje"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin text-emerald-400' : ''}`} />
+          </button>
 
           <button
             onClick={handleLeaveGame}
@@ -981,21 +1020,49 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         {(session.status === 'leaderboard' || session.status === 'finished') && (
           <div className="space-y-5 animate-fadeIn">
             {/* Kartica z uvrstitvijo tekmovalca */}
-            <div className="bg-gradient-to-b from-indigo-500/15 via-slate-900/90 to-slate-950 border-2 border-indigo-500/40 rounded-3xl p-6 text-center space-y-3 shadow-2xl">
-              <div className="w-16 h-16 rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 mx-auto text-2xl shadow-lg">
-                {myLeaderboardRank === 1 ? '👑' : myLeaderboardRank === 2 ? '🥈' : myLeaderboardRank === 3 ? '🥉' : '🏆'}
+            <div
+              className={`bg-gradient-to-b ${
+                session.status === 'finished'
+                  ? 'from-amber-500/20 via-slate-900/90 to-slate-950 border-2 border-amber-500/50'
+                  : 'from-indigo-500/15 via-slate-900/90 to-slate-950 border-2 border-indigo-500/40'
+              } rounded-3xl p-6 text-center space-y-3 shadow-2xl`}
+            >
+              <div
+                className={`w-16 h-16 rounded-2xl ${
+                  session.status === 'finished' && myLeaderboardRank <= 3
+                    ? 'bg-amber-500/30 border-2 border-amber-400 text-3xl animate-bounce'
+                    : 'bg-amber-500/20 border border-amber-500/40 text-2xl'
+                } flex items-center justify-center text-amber-300 mx-auto shadow-lg`}
+              >
+                {myLeaderboardRank === 1
+                  ? '👑'
+                  : myLeaderboardRank === 2
+                  ? '🥈'
+                  : myLeaderboardRank === 3
+                  ? '🥉'
+                  : '🏆'}
               </div>
 
               <div className="space-y-1">
                 <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">
-                  {session.status === 'finished' ? 'Končni rezultat kviza' : 'Trenutna uvrstitev'}
+                  {session.status === 'finished'
+                    ? '🎉 Kviz je zaključen!'
+                    : 'Trenutna uvrstitev'}
                 </span>
                 <h3 className="text-2xl font-black text-slate-100">
-                  Trenutno si na {myLeaderboardRank}. mestu!
+                  {session.status === 'finished'
+                    ? `Osvojil si ${myLeaderboardRank}. mesto!`
+                    : `Trenutno si na ${myLeaderboardRank}. mestu!`}
                 </h3>
                 <div className="text-3xl font-mono-code font-black text-emerald-400 pt-1">
                   {player.total_score} točk
                 </div>
+
+                {session.status === 'finished' && (
+                  <p className="text-xs text-slate-300 pt-3 border-t border-slate-800/80 mt-3 leading-relaxed">
+                    Iskrena hvala za sodelovanje in napeto igro! Upamo, da ste uživali. 🙌✨
+                  </p>
+                )}
               </div>
             </div>
 

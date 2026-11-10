@@ -13,6 +13,7 @@ import {
   Maximize,
   Minimize,
   Radio,
+  RefreshCw,
   Sparkles,
   Trophy,
   Users,
@@ -52,6 +53,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [addingBot, setAddingBot] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Časovnik v živo
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
@@ -72,11 +74,20 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     }
   };
 
+  const handleManualRefresh = async () => {
+    setRefreshing(true);
+    try {
+      await loadData();
+    } finally {
+      setTimeout(() => setRefreshing(false), 500);
+    }
+  };
+
   useEffect(() => {
     loadData();
   }, [sessionId]);
 
-  // Realtime naročnina na Supabase & Demo BroadcastChannel
+  // Realtime naročnina na Supabase & Demo BroadcastChannel s stabilnim fallbackom
   useEffect(() => {
     const supabase = getSupabaseClient();
     let channel: ReturnType<NonNullable<typeof supabase>['channel']> | null = null;
@@ -130,12 +141,31 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     };
     window.addEventListener('trivia_demo_local_update', localHandler);
 
+    // Varnostni fallback ob vrnitvi fokusa ali ponovni povezavi
+    const handleRevalidate = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        loadData();
+      }
+    };
+    window.addEventListener('visibilitychange', handleRevalidate);
+    window.addEventListener('focus', handleRevalidate);
+    window.addEventListener('online', handleRevalidate);
+
+    // Periodični varnostni heartbeat (vsakih 5 sekund) proti zamrznitvi
+    const fallbackPoll = setInterval(() => {
+      loadData();
+    }, 5000);
+
     return () => {
       if (channel && supabase) {
         supabase.removeChannel(channel);
       }
       unsubDemo();
       window.removeEventListener('trivia_demo_local_update', localHandler);
+      window.removeEventListener('visibilitychange', handleRevalidate);
+      window.removeEventListener('focus', handleRevalidate);
+      window.removeEventListener('online', handleRevalidate);
+      clearInterval(fallbackPoll);
     };
   }, [sessionId]);
 
@@ -171,29 +201,46 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   // Konfeti ob preklopu na lestvico ali konec kviza
   useEffect(() => {
     const status = data?.session?.status;
-    if ((status === 'leaderboard' || status === 'finished') && confettiFiredRef.current !== status) {
-      confettiFiredRef.current = status;
+    if (status === 'finished') {
+      if (confettiFiredRef.current !== 'finished') {
+        confettiFiredRef.current = 'finished';
+
+        const fireFestiveBurst = () => {
+          confetti({
+            particleCount: 110,
+            spread: 90,
+            origin: { y: 0.6 },
+            colors: ['#6366f1', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'],
+          });
+          setTimeout(() => {
+            confetti({
+              particleCount: 65,
+              angle: 60,
+              spread: 60,
+              origin: { x: 0, y: 0.7 },
+            });
+            confetti({
+              particleCount: 65,
+              angle: 120,
+              spread: 60,
+              origin: { x: 1, y: 0.7 },
+            });
+          }, 350);
+        };
+
+        fireFestiveBurst();
+        const interval = setInterval(fireFestiveBurst, 4500);
+        return () => clearInterval(interval);
+      }
+    } else if (status === 'leaderboard' && confettiFiredRef.current !== 'leaderboard') {
+      confettiFiredRef.current = 'leaderboard';
       confetti({
-        particleCount: 100,
-        spread: 80,
+        particleCount: 90,
+        spread: 75,
         origin: { y: 0.6 },
-        colors: ['#6366f1', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'],
+        colors: ['#6366f1', '#10b981', '#f59e0b'],
       });
-      setTimeout(() => {
-        confetti({
-          particleCount: 60,
-          angle: 60,
-          spread: 55,
-          origin: { x: 0 },
-        });
-        confetti({
-          particleCount: 60,
-          angle: 120,
-          spread: 55,
-          origin: { x: 1 },
-        });
-      }, 350);
-    } else if (status !== 'leaderboard' && status !== 'finished') {
+    } else if (status !== 'leaderboard') {
       confettiFiredRef.current = null;
     }
   }, [data?.session?.status]);
@@ -344,6 +391,15 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               {players.length === 1 ? 'ekipa' : players.length === 2 ? 'ekipi' : 'ekip'}
             </span>
           </div>
+
+          {/* Ročna osvežitev (Fallback) */}
+          <button
+            onClick={handleManualRefresh}
+            className="p-2 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 transition-colors cursor-pointer"
+            title="Ročno osveži podatke seje"
+          >
+            <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin text-emerald-400' : ''}`} />
+          </button>
 
           {/* Gumb za celozaslonski način (Fullscreen) */}
           <button
@@ -675,21 +731,167 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         )}
 
         {/* ===================================================================
-            5. STANJE: LEADERBOARD in FINISHED (Lestvica / Zmagovalci)
+            5. STANJE: FINISHED (Slavnostni oder zmagovalcev - Grand Podium)
             =================================================================== */}
-        {(session.status === 'leaderboard' || session.status === 'finished') && (
-          <div className="w-full max-w-4xl space-y-8 animate-fadeIn">
-            <div className="text-center space-y-2">
+        {session.status === 'finished' && (
+          <div className="w-full max-w-5xl space-y-10 animate-fadeIn text-center">
+            <div className="space-y-3">
+              <div className="inline-flex items-center gap-2 px-5 py-2 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-300 text-sm font-black shadow-lg shadow-amber-500/10">
+                <Crown className="w-5 h-5 text-amber-400 animate-bounce" />
+                <span>URADNA RAZGLASITEV ZMAGOVALCEV KVIZA</span>
+                <Trophy className="w-5 h-5 text-amber-400 animate-bounce" />
+              </div>
+              <h2 className="text-4xl sm:text-6xl font-black text-slate-100 font-display tracking-tight">
+                Čestitke zmagovalcem!
+              </h2>
+              <p className="text-sm sm:text-base text-slate-400 max-w-xl mx-auto">
+                Pub kviz je uspešno zaključen. Hvala vsem ekipam za sodelovanje in izjemen borbeni duh!
+              </p>
+            </div>
+
+            {/* ODER ZA ZMAGOVALCE (Olympic-style Podium) */}
+            <div className="grid grid-cols-3 gap-2 sm:gap-6 items-end pt-6 pb-2 max-w-3xl mx-auto">
+              {/* 2. MESTO (Srebro - levo) */}
+              <div className="flex flex-col items-center">
+                {players[1] ? (
+                  <>
+                    <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-slate-300/20 border-2 border-slate-300/40 flex items-center justify-center text-slate-200 text-2xl sm:text-3xl font-bold mb-3 shadow-xl shadow-slate-500/10 animate-pulse">
+                      🥈
+                    </div>
+                    <div className="text-center mb-2 px-1">
+                      <p className="text-sm sm:text-lg font-black text-slate-100 truncate max-w-[140px] sm:max-w-[200px]">
+                        {players[1].nickname}
+                      </p>
+                      <p className="text-xl sm:text-2xl font-mono-code font-black text-emerald-400">
+                        {players[1].total_score} <span className="text-xs font-normal text-slate-400">točk</span>
+                      </p>
+                    </div>
+                    <div className="w-full h-36 sm:h-44 rounded-t-3xl bg-gradient-to-t from-slate-900 to-slate-800/90 border-t-4 border-x border-slate-300/60 shadow-2xl flex flex-col items-center justify-center">
+                      <span className="font-display font-black text-3xl sm:text-5xl text-slate-400/40">
+                        2
+                      </span>
+                      <span className="text-[11px] font-bold text-slate-300 uppercase tracking-widest mt-1">
+                        Srebro
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="w-full h-24 rounded-t-2xl bg-slate-900/40 border-t border-slate-800" />
+                )}
+              </div>
+
+              {/* 1. MESTO (Zlato - sredina, najvišje) */}
+              <div className="flex flex-col items-center z-10">
+                {players[0] ? (
+                  <>
+                    <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-3xl bg-gradient-to-br from-amber-400/30 via-amber-500/40 to-amber-600/30 border-2 border-amber-400 flex items-center justify-center text-amber-300 text-3xl sm:text-4xl shadow-2xl shadow-amber-500/40 mb-3 animate-bounce">
+                      👑
+                    </div>
+                    <div className="text-center mb-2 px-1">
+                      <span className="inline-block px-3 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] sm:text-xs font-black uppercase tracking-wider mb-1">
+                        1. Mesto • Prvaki
+                      </span>
+                      <p className="text-base sm:text-2xl font-black text-amber-200 truncate max-w-[150px] sm:max-w-[240px]">
+                        {players[0].nickname}
+                      </p>
+                      <p className="text-2xl sm:text-4xl font-mono-code font-black text-emerald-400">
+                        {players[0].total_score} <span className="text-xs font-normal text-slate-400">točk</span>
+                      </p>
+                    </div>
+                    <div className="w-full h-48 sm:h-60 rounded-t-3xl bg-gradient-to-t from-amber-950/40 via-slate-900 to-amber-500/20 border-t-4 border-x border-amber-400 shadow-2xl shadow-amber-500/20 flex flex-col items-center justify-center relative overflow-hidden">
+                      <div className="absolute inset-0 bg-radial from-amber-400/10 to-transparent pointer-events-none" />
+                      <Trophy className="w-8 h-8 sm:w-10 sm:h-10 text-amber-400/80 mb-1" />
+                      <span className="font-display font-black text-4xl sm:text-6xl text-amber-400/80">
+                        1
+                      </span>
+                      <span className="text-xs font-black text-amber-300 uppercase tracking-widest mt-1">
+                        Zlato
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="w-full h-32 rounded-t-2xl bg-slate-900/40 border-t border-slate-800" />
+                )}
+              </div>
+
+              {/* 3. MESTO (Bron - desno) */}
+              <div className="flex flex-col items-center">
+                {players[2] ? (
+                  <>
+                    <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-amber-700/20 border-2 border-amber-700/40 flex items-center justify-center text-amber-600 text-2xl sm:text-3xl font-bold mb-3 shadow-xl shadow-amber-900/10 animate-pulse">
+                      🥉
+                    </div>
+                    <div className="text-center mb-2 px-1">
+                      <p className="text-sm sm:text-lg font-black text-slate-100 truncate max-w-[140px] sm:max-w-[200px]">
+                        {players[2].nickname}
+                      </p>
+                      <p className="text-xl sm:text-2xl font-mono-code font-black text-emerald-400">
+                        {players[2].total_score} <span className="text-xs font-normal text-slate-400">točk</span>
+                      </p>
+                    </div>
+                    <div className="w-full h-28 sm:h-36 rounded-t-3xl bg-gradient-to-t from-slate-900 to-slate-800/80 border-t-4 border-x border-amber-700/60 shadow-2xl flex flex-col items-center justify-center">
+                      <span className="font-display font-black text-3xl sm:text-5xl text-amber-700/40">
+                        3
+                      </span>
+                      <span className="text-[11px] font-bold text-amber-600 uppercase tracking-widest mt-1">
+                        Bron
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="w-full h-20 rounded-t-2xl bg-slate-900/40 border-t border-slate-800" />
+                )}
+              </div>
+            </div>
+
+            {/* SEZNAM OSTALIH EKIP (4. MESTO IN NAPREJ) */}
+            <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-3xl p-6 text-left max-w-3xl mx-auto shadow-2xl">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-400 block pb-3 border-b border-slate-800">
+                {players.length > 3
+                  ? 'Ostale sodelujoče ekipe (od 4. mesta naprej):'
+                  : 'Končna lestvica vseh sodelujočih ekip:'}
+              </span>
+
+              <div className="divide-y divide-slate-800/80 pt-2">
+                {(players.length > 3 ? players.slice(3) : players).map((player, idx) => {
+                  const actualRank = players.length > 3 ? idx + 4 : idx + 1;
+                  return (
+                    <div
+                      key={player.id}
+                      className="flex items-center justify-between py-3 px-2 hover:bg-slate-800/30 rounded-xl transition-colors"
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="w-8 h-8 rounded-lg bg-slate-800 text-slate-300 font-mono-code font-bold text-xs flex items-center justify-center">
+                          #{actualRank}
+                        </span>
+                        <span className="text-sm sm:text-base font-semibold text-slate-200">
+                          {player.nickname}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 font-mono-code font-bold text-emerald-400 text-sm sm:text-base">
+                        <span>{player.total_score}</span>
+                        <span className="text-xs text-slate-500 font-sans">točk</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ===================================================================
+            6. STANJE: LEADERBOARD (Vmesna lestvica po končani temi)
+            =================================================================== */}
+        {session.status === 'leaderboard' && (
+          <div className="w-full max-w-4xl space-y-8 animate-fadeIn text-center">
+            <div className="space-y-2">
               <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-bold">
                 <Trophy className="w-4 h-4 text-amber-400" />
-                <span>
-                  {session.status === 'finished'
-                    ? '🏆 Končni rezultati pub kviza'
-                    : 'Trenutna lestvica po tem sklopu'}
-                </span>
+                <span>Trenutna lestvica po tem sklopu</span>
               </div>
               <h2 className="text-3xl sm:text-5xl font-black text-slate-100 font-display">
-                {session.status === 'finished' ? 'Zmagovalci kviza!' : 'Rezultati ekip'}
+                Rezultati ekip
               </h2>
             </div>
 
@@ -719,7 +921,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                   </div>
                 )}
 
-                {/* 1. Mesto (Zlato - največje) */}
+                {/* 1. Mesto */}
                 {players[0] && (
                   <div className="flex flex-col items-center space-y-2">
                     <div className="w-16 h-16 rounded-2xl bg-amber-500/25 border-2 border-amber-500/50 flex items-center justify-center text-amber-300 font-black text-2xl shadow-xl shadow-amber-500/20 animate-bounce">
@@ -769,8 +971,8 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               </div>
             )}
 
-            {/* Celotna tabela / Seznam ekip z rezultati */}
-            <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
+            {/* Celotna tabela ekip */}
+            <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl overflow-hidden shadow-2xl text-left">
               <div className="divide-y divide-slate-800/80">
                 {players.map((player, idx) => {
                   const usedJoker = jokersForCurrentTheme.has(player.id);

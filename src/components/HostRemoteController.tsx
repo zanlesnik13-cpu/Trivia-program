@@ -16,6 +16,7 @@ import {
   Loader2,
   Play,
   Plus,
+  RefreshCw,
   RotateCcw,
   Sparkles,
   Tv,
@@ -61,6 +62,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Beležimo, za katero temo smo že sprožili avtomatsko pred-ocenjevanje v tem pogledu
   const preGradedThemeRef = useRef<string | null>(null);
@@ -77,11 +79,20 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
+  const handleManualRefresh = async () => {
+    setRefreshing(true);
+    try {
+      await loadData();
+    } finally {
+      setTimeout(() => setRefreshing(false), 500);
+    }
+  };
+
   useEffect(() => {
     loadData();
   }, [sessionId]);
 
-  // Realtime naročnina na Supabase in Demo BroadcastChannel
+  // Realtime naročnina na Supabase in Demo BroadcastChannel s stabilnim fallbackom
   useEffect(() => {
     const supabase = getSupabaseClient();
     let channel: ReturnType<NonNullable<typeof supabase>['channel']> | null = null;
@@ -126,12 +137,31 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     };
     window.addEventListener('trivia_demo_local_update', localHandler);
 
+    // Varnostni fallback ob vrnitvi fokusa ali ponovni povezavi
+    const handleRevalidate = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        loadData();
+      }
+    };
+    window.addEventListener('visibilitychange', handleRevalidate);
+    window.addEventListener('focus', handleRevalidate);
+    window.addEventListener('online', handleRevalidate);
+
+    // Periodični varnostni heartbeat (vsakih 5 sekund) proti zamrznitvi
+    const fallbackPoll = setInterval(() => {
+      loadData();
+    }, 5000);
+
     return () => {
       if (channel && supabase) {
         supabase.removeChannel(channel);
       }
       unsubDemo();
       window.removeEventListener('trivia_demo_local_update', localHandler);
+      window.removeEventListener('visibilitychange', handleRevalidate);
+      window.removeEventListener('focus', handleRevalidate);
+      window.removeEventListener('online', handleRevalidate);
+      clearInterval(fallbackPoll);
     };
   }, [sessionId]);
 
@@ -574,16 +604,26 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
           </div>
         </div>
 
-        {onOpenPresentation && (
+        <div className="flex items-center gap-1.5 shrink-0">
           <button
-            id="remote-open-projector-btn"
-            onClick={onOpenPresentation}
-            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold shrink-0 cursor-pointer"
+            onClick={handleManualRefresh}
+            className="p-2 rounded-xl bg-slate-800/80 hover:bg-slate-800 text-slate-300 hover:text-white transition-colors cursor-pointer"
+            title="Ročno osveži stanje kviza"
           >
-            <Tv className="w-4 h-4" />
-            <span>Projektor</span>
+            <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin text-emerald-400' : ''}`} />
           </button>
-        )}
+
+          {onOpenPresentation && (
+            <button
+              id="remote-open-projector-btn"
+              onClick={onOpenPresentation}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold cursor-pointer"
+            >
+              <Tv className="w-4 h-4" />
+              <span>Projektor</span>
+            </button>
+          )}
+        </div>
       </header>
 
       {/* GLAVNA VSEBINA DALJINCA */}
