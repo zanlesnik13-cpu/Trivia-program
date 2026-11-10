@@ -108,3 +108,16 @@ export interface PresentationData {
   playerJokers: PlayerJoker[];
   answers: Answer[];
 }
+
+export interface PlayerFullData {
+  player: Player;
+  session: GameSession;
+  quiz: Quiz;
+  themes: Theme[];
+  slidesByTheme: Record<string, Slide[]>;
+  currentTheme: Theme | null;
+  currentSlide: Slide | null;
+  playerJokers: PlayerJoker[];
+  myAnswers: Record<string, Answer>;
+  leaderboard: Array<{ id: string; nickname: string; total_score: number; rank: number }>;
+}

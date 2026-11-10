@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   Database,
   LogOut,
+  Smartphone,
   Sparkles,
   Tv,
   UserCheck,
@@ -9,6 +10,7 @@ import {
 import { HostAuth } from './components/HostAuth';
 import { HostDashboard } from './components/HostDashboard';
 import { HostRemoteController } from './components/HostRemoteController';
+import { PlayerView } from './components/PlayerView';
 import { PresentationView } from './components/PresentationView';
 import { QuizBuilder } from './components/QuizBuilder';
 import { SupabaseSetupModal } from './components/SupabaseSetupModal';
@@ -23,15 +25,33 @@ interface HostUser {
 type RouteState =
   | { view: 'dashboard'; sessionId?: null }
   | { view: 'present'; sessionId: string }
-  | { view: 'host_remote'; sessionId: string };
+  | { view: 'host_remote'; sessionId: string }
+  | { view: 'play'; roomCode?: string };
 
 function parseCurrentRoute(): RouteState {
   if (typeof window === 'undefined') return { view: 'dashboard' };
   const path = window.location.pathname;
   const hash = window.location.hash;
 
+  // Preveri /play ali #/play z morebitnim ?code=XXXX ali #/play?code=XXXX
+  if (
+    path.startsWith('/play') ||
+    hash.startsWith('#/play') ||
+    hash.includes('/play')
+  ) {
+    const urlParams = new URLSearchParams(window.location.search);
+    let code = urlParams.get('code') || '';
+    if (!code && hash.includes('?')) {
+      const hashQuery = hash.split('?')[1];
+      const hashParams = new URLSearchParams(hashQuery);
+      code = hashParams.get('code') || '';
+    }
+    return { view: 'play', roomCode: code };
+  }
+
   // Preveri /present/:sessionId ali #/present/:sessionId
-  const presentMatch = path.match(/\/present\/([^/?#]+)/) || hash.match(/#\/present\/([^/?#]+)/);
+  const presentMatch =
+    path.match(/\/present\/([^/?#]+)/) || hash.match(/#\/present\/([^/?#]+)/);
   if (presentMatch) {
     return { view: 'present', sessionId: presentMatch[1] };
   }
@@ -112,6 +132,16 @@ export function App() {
     setEditingQuizId(null);
   };
 
+  // Če je uporabnik na pogledu igralca (/play)
+  if (route.view === 'play') {
+    return (
+      <PlayerView
+        initialRoomCode={route.roomCode}
+        onExit={() => navigateTo('/')}
+      />
+    );
+  }
+
   // Če je uporabnik na pogledu prezentacije (/present/:sessionId), prikaži čisto platno za projektor
   if (route.view === 'present' && route.sessionId) {
     return (
@@ -163,17 +193,31 @@ export function App() {
                 <span className="font-bold text-base tracking-tight text-slate-100 font-display">
                   QuizPulse <span className="text-emerald-400">Live</span>
                 </span>
-                <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                  Faza 3 &bull; Daljinec &amp; Ocenjevanje
+                <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                  Faza 4 &bull; Mobilni igralec (/play)
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 hidden sm:block">
-                Vodenje pub kviza v živo &bull; Predstavitveni zaslon &amp; Ocenjevanje z Jokerji
+                Vodenje pub kviza v živo &bull; Predstavitveni zaslon &bull; Daljinec &bull; Igralci
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2.5 sm:gap-3">
+            {/* Gumb za hiter vstop v igro kot igralec (/play) */}
+            <button
+              id="navbar-play-btn"
+              onClick={() => {
+                window.open('/play', '_blank');
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-all cursor-pointer"
+              title="Odpri mobilni vmesnik za igralce v novem zavihku"
+            >
+              <Smartphone className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Igraj kviz (/play)</span>
+              <span className="md:hidden">/play</span>
+            </button>
+
             {/* Gumb za SQL skripto & Supabase povezavo */}
             <button
               id="navbar-supabase-setup-btn"
