@@ -1,7 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const STORAGE_URL_KEY = 'trivia_supabase_url';
-const STORAGE_ANON_KEY = 'trivia_supabase_anon_key';
+const STORAGE_URL_KEY = 'https://nwpftuydshsguorxlkie.supabase.co';
+const STORAGE_ANON_KEY = 'sb_publishable_0We5ATxLgWOT3yuorwoUZQ_ICO-SY5N';
 
 /**
  * Privzeta Supabase baza za aplikacijo (hardcoded fallback, če .env ali localStorage nista nastavljena).
