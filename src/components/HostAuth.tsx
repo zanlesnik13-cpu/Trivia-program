@@ -17,6 +17,21 @@ interface HostAuthProps {
   onOpenSupabaseModal: () => void;
 }
 
+const GUEST_HOST_ID_KEY = 'guest_host_id';
+const GUEST_HOST_EMAIL_KEY = 'guest_host_email';
+
+export function getOrCreateGuestHostId(): string {
+  if (typeof window === 'undefined') return '00000000-0000-4000-8000-000000000001';
+  const existing = localStorage.getItem(GUEST_HOST_ID_KEY);
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (existing && uuidRegex.test(existing)) {
+    return existing;
+  }
+  const generated = crypto.randomUUID();
+  localStorage.setItem(GUEST_HOST_ID_KEY, generated);
+  return generated;
+}
+
 export const HostAuth: React.FC<HostAuthProps> = ({
   onAuthenticated,
   onOpenSupabaseModal,
@@ -42,9 +57,11 @@ export const HostAuth: React.FC<HostAuthProps> = ({
 
     const supabase = getSupabaseClient();
     if (!supabase) {
-      // Če Supabase še ni povezan, prijavimo gostitelja v polno delujoč lokalni profil
+      // Če Supabase še ni povezan, prijavimo gostitelja s stalnim veljavnim UUID-jem
+      const guestUuid = getOrCreateGuestHostId();
+      localStorage.setItem(GUEST_HOST_EMAIL_KEY, email.trim());
       onAuthenticated({
-        id: 'demo-host',
+        id: guestUuid,
         email: email.trim(),
         isDemo: true,
       });
@@ -67,13 +84,19 @@ export const HostAuth: React.FC<HostAuthProps> = ({
             );
           }
           if (lower.includes('email not confirmed')) {
-            throw new Error(
-              'E-poštni naslov še ni potrjen. Preverite svoj nabiralnik ali kliknite spodnji gumb "⚡ Hiter vstop brez prijave" za takojšnji vstop.'
-            );
+            // Če ima uporabnik v Supabase še vklopljeno potrditev e-pošte, ga vseeno spustimo v nadzorno ploščo z determinističnim ali gostujočim UUID-jem
+            const guestUuid = getOrCreateGuestHostId();
+            localStorage.setItem(GUEST_HOST_EMAIL_KEY, email.trim());
+            onAuthenticated({
+              id: guestUuid,
+              email: email.trim(),
+              isDemo: true,
+            });
+            return;
           }
           if (lower.includes('invalid login credentials')) {
             throw new Error(
-              'Napačen e-poštni naslov ali geslo. Če še nimate računa, izberite zavihek "Registracija" ali kliknite "⚡ Hiter vstop brez prijave".'
+              'Napačen e-poštni naslov ali geslo. Če še nimate računa, izberite zavihek "Registracija" ali kliknite "⚡ Hiter vstop brez prijave (Gost)".'
             );
           }
           throw signInErr;
@@ -86,10 +109,15 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           });
         }
       } else {
-        // Registracija brez neveljavnega options.emailRedirectTo
+        const redirectUrl =
+          typeof window !== 'undefined'
+            ? `${window.location.origin}/host`
+            : undefined;
+
         const { data, error: signUpErr } = await supabase.auth.signUp({
           email: email.trim(),
           password,
+          options: redirectUrl ? { emailRedirectTo: redirectUrl } : undefined,
         });
 
         if (signUpErr) {
@@ -102,17 +130,21 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           throw signUpErr;
         }
 
-        if (data.user && data.session) {
+        // Če Supabase vrne uporabnika (tudi brez potrjene seje), ga takoj spusti v nadzorno ploščo!
+        if (data.user) {
+          localStorage.setItem(GUEST_HOST_ID_KEY, data.user.id);
+          localStorage.setItem(GUEST_HOST_EMAIL_KEY, data.user.email || email.trim());
           onAuthenticated({
             id: data.user.id,
             email: data.user.email || email.trim(),
           });
-        } else {
-          setSuccessMsg(
-            'Registracija uspešna! Če imate v Supabase vklopljeno potrditev e-pošte, preverite svoj nabiralnik ali kliknite spodnji gumb "⚡ Hiter vstop brez prijave" za takojšnji vstop.'
-          );
-          setMode('login');
+          return;
         }
+
+        setSuccessMsg(
+          'Registracija uspešna! Lahko se prijavite ali uporabite gumb za hiter vstop spodaj.'
+        );
+        setMode('login');
       }
     } catch (err: unknown) {
       const msg =
@@ -124,9 +156,12 @@ export const HostAuth: React.FC<HostAuthProps> = ({
   };
 
   const handleQuickDemoLogin = () => {
+    const guestUuid = getOrCreateGuestHostId();
+    const guestEmail = email.trim() || localStorage.getItem(GUEST_HOST_EMAIL_KEY) || 'gost@quizpulse.si';
+    localStorage.setItem(GUEST_HOST_EMAIL_KEY, guestEmail);
     onAuthenticated({
-      id: 'demo-host',
-      email: email.trim() || 'gostitelj@quizpulse.si',
+      id: guestUuid,
+      email: guestEmail,
       isDemo: true,
     });
   };

@@ -18,6 +18,43 @@ import {
 } from '../lib/supabase';
 import sqlSchemaRaw from '../../supabase_schema.sql?raw';
 
+const QUICK_FIX_SQL = `-- =====================================================================
+-- HITER POPRAVEK ZA SUPABASE (delovanje z Gostiteljem IN v načinu Gosta)
+-- =====================================================================
+
+-- 1. Odstrani omejitev FOREIGN KEY na auth.users pri tabeli quizzes
+ALTER TABLE public.quizzes DROP CONSTRAINT IF EXISTS quizzes_host_id_fkey;
+ALTER TABLE public.quizzes ALTER COLUMN host_id TYPE TEXT USING host_id::TEXT;
+
+-- 2. Izklopi RLS (Row Level Security) na vseh tabelah
+ALTER TABLE public.quizzes DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.themes DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.slides DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.game_sessions DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.players DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.player_jokers DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.answers DISABLE ROW LEVEL SECURITY;
+
+-- 3. Dodeli polne pravice za anon in authenticated
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
+
+-- 4. Nastavi Storage bucket 'slides' na public in odpri politike
+INSERT INTO storage.buckets (id, name, public, file_size_limit)
+VALUES ('slides', 'slides', true, 52428800)
+ON CONFLICT (id) DO UPDATE SET public = true, file_size_limit = 52428800;
+
+DROP POLICY IF EXISTS "Public Access to slides" ON storage.objects;
+DROP POLICY IF EXISTS "Allow public uploads to slides" ON storage.objects;
+DROP POLICY IF EXISTS "Allow public updates to slides" ON storage.objects;
+DROP POLICY IF EXISTS "Allow public deletes from slides" ON storage.objects;
+
+CREATE POLICY "Public Access to slides" ON storage.objects FOR SELECT TO anon, authenticated USING (bucket_id = 'slides');
+CREATE POLICY "Allow public uploads to slides" ON storage.objects FOR INSERT TO anon, authenticated WITH CHECK (bucket_id = 'slides');
+CREATE POLICY "Allow public updates to slides" ON storage.objects FOR UPDATE TO anon, authenticated USING (bucket_id = 'slides') WITH CHECK (bucket_id = 'slides');
+CREATE POLICY "Allow public deletes from slides" ON storage.objects FOR DELETE TO anon, authenticated USING (bucket_id = 'slides');`;
+
 interface SupabaseSetupModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -34,6 +71,7 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
   const [anonKey, setAnonKey] = useState(currentConfig.anonKey);
   const [activeTab, setActiveTab] = useState<'sql' | 'connection'>('sql');
   const [copiedSql, setCopiedSql] = useState(false);
+  const [copiedFixSql, setCopiedFixSql] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
 
   if (!isOpen) return null;
@@ -42,6 +80,12 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
     await navigator.clipboard.writeText(sqlSchemaRaw);
     setCopiedSql(true);
     setTimeout(() => setCopiedSql(false), 2500);
+  };
+
+  const handleCopyFixSql = async () => {
+    await navigator.clipboard.writeText(QUICK_FIX_SQL);
+    setCopiedFixSql(true);
+    setTimeout(() => setCopiedFixSql(false), 2500);
   };
 
   const handleSave = (e: React.FormEvent) => {
@@ -77,10 +121,10 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
             </div>
             <div>
               <h2 className="text-lg font-bold text-slate-100">
-                Supabase Baza &amp; SQL Shema (Faza 1)
+                Supabase Baza &amp; SQL Skripta
               </h2>
               <p className="text-xs text-slate-400">
-                Kopirajte SQL skripto za Supabase SQL Editor ali povežite svoj Supabase projekt
+                Kopirajte popravljalno ali celotno SQL skripto za Supabase SQL Editor
               </p>
             </div>
           </div>
@@ -105,7 +149,7 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
             }`}
           >
             <Terminal className="w-4 h-4" />
-            <span>1. SQL Skripta (Supabase SQL Editor)</span>
+            <span>1. SQL Skripta &amp; Popravek Dovoljenj</span>
           </button>
           <button
             id="tab-supabase-keys-btn"
@@ -124,21 +168,55 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
         {/* Vsebina */}
         <div className="p-6 overflow-y-auto flex-1 space-y-5">
           {activeTab === 'sql' ? (
-            <div className="space-y-4">
+            <div className="space-y-5">
+              {/* Hiter popravek za obstoječo bazo */}
+              <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <p className="text-sm font-bold text-emerald-300">
+                      ⚡ Hiter popravek za obstoječo bazo (delovanje tudi v načinu Gosta!)
+                    </p>
+                    <p className="text-xs text-slate-300">
+                      Če ste tabele že ustvarili, poženite to kratko skripto v Supabase SQL Editorju. Odstrani omejitev <code className="text-emerald-300">auth.users</code> na <code className="text-emerald-300">quizzes.host_id</code>, izklopi RLS in odpre Storage dovoljenja.
+                    </p>
+                  </div>
+                  <button
+                    id="copy-quick-fix-sql-btn"
+                    onClick={handleCopyFixSql}
+                    className="shrink-0 inline-flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+                  >
+                    {copiedFixSql ? (
+                      <>
+                        <Check className="w-4 h-4" />
+                        <span>Popravek skopiran!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4" />
+                        <span>Kopiraj kratko popravljalno SQL skripto</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre className="text-[11px] font-mono-code text-emerald-200/90 bg-slate-950/90 border border-slate-800 rounded-xl p-3 overflow-x-auto max-h-40">
+                  {QUICK_FIX_SQL}
+                </pre>
+              </div>
+
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-2xl bg-indigo-500/10 border border-indigo-500/20">
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-indigo-200">
-                    Pripravljena celotna SQL skripta (brez napak z dovoljenji)
+                    Celotna SQL shema (za novo postavitev ali posodobitev)
                   </p>
                   <p className="text-xs text-slate-300">
-                    Ustvari tabele <code className="text-indigo-300">quizzes</code>,{' '}
+                    Ustvari vse tabele (<code className="text-indigo-300">quizzes</code>,{' '}
                     <code className="text-indigo-300">themes</code>,{' '}
                     <code className="text-indigo-300">slides</code>,{' '}
                     <code className="text-indigo-300">game_sessions</code>,{' '}
                     <code className="text-indigo-300">players</code>,{' '}
                     <code className="text-indigo-300">player_jokers</code>,{' '}
-                    <code className="text-indigo-300">answers</code>, vklopi Realtime ter ustvari
-                    Storage bucket <code className="text-emerald-300">slides</code> z javnimi politikami.
+                    <code className="text-indigo-300">answers</code>), vklopi Realtime ter ustvari
+                    Storage bucket <code className="text-emerald-300">slides</code>.
                   </p>
                 </div>
                 <button
@@ -160,7 +238,7 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
                 </button>
               </div>
 
-              <div className="relative rounded-2xl bg-slate-950 border border-slate-800 p-4 overflow-x-auto max-h-[420px]">
+              <div className="relative rounded-2xl bg-slate-950 border border-slate-800 p-4 overflow-x-auto max-h-[320px]">
                 <pre className="text-xs font-mono-code text-slate-300 leading-relaxed">
                   {sqlSchemaRaw}
                 </pre>

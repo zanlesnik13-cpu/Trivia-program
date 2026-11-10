@@ -120,24 +120,36 @@ export function App() {
     const checkInitialAuth = async () => {
       setCheckingSession(true);
       const supabase = getSupabaseClient();
-      if (!supabase) {
-        setCheckingSession(false);
-        return;
+
+      if (supabase) {
+        try {
+          const { data } = await supabase.auth.getSession();
+          if (data.session?.user) {
+            setHostUser({
+              id: data.session.user.id,
+              email: data.session.user.email || 'gostitelj@quizpulse.si',
+            });
+            setCheckingSession(false);
+            return;
+          }
+        } catch {
+          // ignore session error
+        }
       }
 
-      try {
-        const { data } = await supabase.auth.getSession();
-        if (data.session?.user) {
-          setHostUser({
-            id: data.session.user.id,
-            email: data.session.user.email || 'gostitelj@quizpulse.si',
-          });
-        }
-      } catch {
-        // ignore session error
-      } finally {
-        setCheckingSession(false);
+      // Preveri, ali je uporabnik že vstopil kot Gost (Hiter vstop brez prijave)
+      const savedGuestActive = localStorage.getItem('trivia_guest_session_active');
+      const savedGuestId = localStorage.getItem('guest_host_id');
+      const savedGuestEmail = localStorage.getItem('guest_host_email');
+      if (savedGuestActive === 'true' && savedGuestId) {
+        setHostUser({
+          id: savedGuestId,
+          email: savedGuestEmail || 'gost@quizpulse.si',
+          isDemo: true,
+        });
       }
+
+      setCheckingSession(false);
     };
 
     checkInitialAuth();
@@ -148,6 +160,7 @@ export function App() {
     if (supabase) {
       await supabase.auth.signOut();
     }
+    localStorage.removeItem('trivia_guest_session_active');
     setHostUser(null);
     setEditingQuizId(null);
   };
@@ -322,7 +335,12 @@ export function App() {
           </div>
         ) : !hostUser ? (
           <HostAuth
-            onAuthenticated={(user) => setHostUser(user)}
+            onAuthenticated={(user) => {
+              localStorage.setItem('trivia_guest_session_active', 'true');
+              localStorage.setItem('guest_host_id', user.id);
+              localStorage.setItem('guest_host_email', user.email);
+              setHostUser(user);
+            }}
             onOpenSupabaseModal={() => setShowSupabaseModal(true)}
           />
         ) : editingQuizId ? (

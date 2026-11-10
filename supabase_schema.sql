@@ -1,21 +1,27 @@
 -- =============================================================================
--- LIVE TRIVIA APP (PUB KVIZ V ŽIVO) - SUPABASE SQL SHEMA (FAZA 1)
+-- LIVE TRIVIA APP (PUB KVIZ V ŽIVO) - SUPABASE SQL SHEMA & POPRAVEK DOVOLJENJ
 -- Kopirajte in zaženite to celotno skripto v Supabase SQL Editorju.
--- Skripta ustvari vse tabele, indekse, Realtime publikacijo, Storage bucket
--- 'slides' ter uredi/izklopi RLS politike za takojšnje delovanje brez napak.
+-- Skripta ustvari vse tabele (ali popravi obstoječe), odstrani omejitev
+-- na auth.users (tako da deluje tudi Hiter vstop / Gost!), izklopi RLS
+-- ter uredi Storage bucket 'slides' z javnimi dovoljenji.
 -- =============================================================================
 
 -- 0. Omogoči UUID razširitev
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- 1. Tabela: quizzes (Kvizi)
+-- Opomba: host_id je TEXT (brez REFERENCES auth.users), da deluje tako s Supabase Auth kot v načinu Gosta!
 CREATE TABLE IF NOT EXISTS public.quizzes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    host_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    host_id TEXT NOT NULL,
     title TEXT NOT NULL,
     max_jokers_per_player INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Če je bila tabela quizzes ustvarjena prej z omejitvijo FOREIGN KEY na auth.users, jo varno odstranimo:
+ALTER TABLE public.quizzes DROP CONSTRAINT IF EXISTS quizzes_host_id_fkey;
+ALTER TABLE public.quizzes ALTER COLUMN host_id TYPE TEXT USING host_id::TEXT;
 
 -- 2. Tabela: themes (Tematike / Sklopi)
 CREATE TABLE IF NOT EXISTS public.themes (
@@ -120,17 +126,16 @@ ALTER TABLE public.players DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.player_jokers DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.answers DISABLE ROW LEVEL SECURITY;
 
-GRANT ALL ON TABLE public.quizzes TO anon, authenticated, service_role;
-GRANT ALL ON TABLE public.themes TO anon, authenticated, service_role;
-GRANT ALL ON TABLE public.slides TO anon, authenticated, service_role;
-GRANT ALL ON TABLE public.game_sessions TO anon, authenticated, service_role;
-GRANT ALL ON TABLE public.players TO anon, authenticated, service_role;
-GRANT ALL ON TABLE public.player_jokers TO anon, authenticated, service_role;
-GRANT ALL ON TABLE public.answers TO anon, authenticated, service_role;
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
 
 -- =============================================================================
 -- SUPABASE REALTIME NASTAVITVE
 -- =============================================================================
+ALTER TABLE public.quizzes REPLICA IDENTITY FULL;
+ALTER TABLE public.themes REPLICA IDENTITY FULL;
+ALTER TABLE public.slides REPLICA IDENTITY FULL;
 ALTER TABLE public.game_sessions REPLICA IDENTITY FULL;
 ALTER TABLE public.players REPLICA IDENTITY FULL;
 ALTER TABLE public.player_jokers REPLICA IDENTITY FULL;
@@ -189,24 +194,25 @@ DROP POLICY IF EXISTS "Allow public uploads to slides" ON storage.objects;
 DROP POLICY IF EXISTS "Allow public updates to slides" ON storage.objects;
 DROP POLICY IF EXISTS "Allow public deletes from slides" ON storage.objects;
 
--- Ustvari odprte politike za bucket 'slides' (branje, nalaganje, urejanje, brisanje brez napak z dovoljenji)
+-- Ustvari odprte politike za bucket 'slides' za anon in authenticated (SELECT, INSERT, UPDATE, DELETE)
 CREATE POLICY "Public Access to slides"
 ON storage.objects FOR SELECT
-TO public
+TO anon, authenticated
 USING (bucket_id = 'slides');
 
 CREATE POLICY "Allow public uploads to slides"
 ON storage.objects FOR INSERT
-TO public
+TO anon, authenticated
 WITH CHECK (bucket_id = 'slides');
 
 CREATE POLICY "Allow public updates to slides"
 ON storage.objects FOR UPDATE
-TO public
+TO anon, authenticated
 USING (bucket_id = 'slides')
 WITH CHECK (bucket_id = 'slides');
 
 CREATE POLICY "Allow public deletes from slides"
 ON storage.objects FOR DELETE
-TO public
+TO anon, authenticated
 USING (bucket_id = 'slides');
+

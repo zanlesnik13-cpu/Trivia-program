@@ -103,6 +103,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
   const [loading, setLoading] = useState(true);
   const [savingQuizMeta, setSavingQuizMeta] = useState(false);
   const [savingSlide, setSavingSlide] = useState(false);
+  const [addingSlide, setAddingSlide] = useState(false);
   const [saveToast, setSaveToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -163,21 +164,42 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
   const currentSlide =
     currentSlides.find((s) => s.id === selectedSlideId) || currentSlides[0] || null;
 
-  // Shrani osnovne podatke kviza (naslov + max_jokers_per_player)
+  // Shrani osnovne podatke kviza (naslov + max_jokers_per_player) IN trenutno izbrani slajd
   const handleSaveQuizHeader = async () => {
     if (!quiz) return;
     setSavingQuizMeta(true);
+    setError(null);
     try {
       const updated = await updateQuizMeta(quiz.id, {
         title: quiz.title,
         max_jokers_per_player: quiz.max_jokers_per_player,
       });
       setQuiz(updated);
-      showToast('Nastavitve kviza in Jokerjev so shranjene.');
+
+      if (currentTheme && currentSlide) {
+        const savedSlide = await updateSlide(currentSlide.id, {
+          slide_type: currentSlide.slide_type,
+          question_text: currentSlide.question_text,
+          options: currentSlide.options,
+          correct_answer: currentSlide.correct_answer,
+          points: currentSlide.points,
+          timer_seconds: currentSlide.timer_seconds,
+          slide_image_url: currentSlide.slide_image_url,
+          order_index: currentSlide.order_index,
+        });
+        setSlidesByTheme((prev) => ({
+          ...prev,
+          [currentTheme.id]: (prev[currentTheme.id] || []).map((s) =>
+            s.id === savedSlide.id ? savedSlide : s
+          ),
+        }));
+      }
+
+      showToast('Vse spremembe kviza in slajda so shranjene!');
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri shranjevanju kviza.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri shranjevanju kviza.';
+      setError(msg);
+      window.alert(`Napaka pri shranjevanju:\n${msg}`);
     } finally {
       setSavingQuizMeta(false);
     }
@@ -191,6 +213,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       newThemeTitle.trim() || `${themes.length + 1}. sklop: Nova tematika`;
 
     setAddingTheme(true);
+    setError(null);
     try {
       const { theme, introSlide } = await createTheme(
         quiz.id,
@@ -207,9 +230,9 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       setNewThemeTitle('');
       showToast(`Dodana tematika "${theme.title}" z začetnim Joker slajdom.`);
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri ustvarjanju tematike.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri ustvarjanju tematike.';
+      setError(msg);
+      window.alert(`Napaka pri dodajanju tematike:\n${msg}`);
     } finally {
       setAddingTheme(false);
     }
@@ -266,8 +289,24 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
   // Dodaj nov prazen slajd v trenutno tematiko
   const handleAddBlankSlide = async (type: SlideType = 'multiple_choice') => {
-    if (!currentTheme) return;
+    if (!currentTheme || addingSlide) return;
+    setAddingSlide(true);
+    setError(null);
     try {
+      // Pred dodajanjem novega slajda samodejno shrani trenutno urejan slajd
+      if (currentSlide) {
+        await updateSlide(currentSlide.id, {
+          slide_type: currentSlide.slide_type,
+          question_text: currentSlide.question_text,
+          options: currentSlide.options,
+          correct_answer: currentSlide.correct_answer,
+          points: currentSlide.points,
+          timer_seconds: currentSlide.timer_seconds,
+          slide_image_url: currentSlide.slide_image_url,
+          order_index: currentSlide.order_index,
+        });
+      }
+
       const nextIndex = currentSlides.length;
       const created = await createSlide(currentTheme.id, {
         order_index: nextIndex,
@@ -287,7 +326,11 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       setSelectedSlideId(created.id);
       showToast('Nov slajd dodan v tematiko.');
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Napaka pri dodajanju slajda.');
+      const msg = err instanceof Error ? err.message : 'Napaka pri dodajanju slajda.';
+      setError(msg);
+      window.alert(`Napaka pri dodajanju slajda:\n${msg}`);
+    } finally {
+      setAddingSlide(false);
     }
   };
 
@@ -404,11 +447,12 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
         `Uspešno uvoženih ${renderedPages.length} strani iz PDF datoteke!`
       );
     } catch (err: unknown) {
-      setError(
+      const msg =
         err instanceof Error
           ? err.message
-          : 'Napaka pri pretvorbi ali nalaganju PDF datoteke.'
-      );
+          : 'Napaka pri pretvorbi ali nalaganju PDF datoteke.';
+      setError(msg);
+      window.alert(`Napaka pri uvozu PDF slajdov:\n${msg}`);
     } finally {
       setUploadStatus({ active: false, message: '', current: 0, total: 0 });
     }
@@ -471,9 +515,9 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       }
       showToast(`Uspešno dodanih ${createdSlides.length} slikovnih slajdov!`);
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri nalaganju slik.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri nalaganju slik.';
+      setError(msg);
+      window.alert(`Napaka pri nalaganju slik:\n${msg}`);
     } finally {
       setUploadStatus({ active: false, message: '', current: 0, total: 0 });
     }
@@ -512,9 +556,9 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       }));
       showToast('Slika slajda posodobljena.');
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri menjavi slike slajda.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri menjavi slike slajda.';
+      setError(msg);
+      window.alert(`Napaka pri menjavi slike:\n${msg}`);
     } finally {
       setUploadStatus({ active: false, message: '', current: 0, total: 0 });
     }
@@ -548,6 +592,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
     if (e) e.preventDefault();
     if (!currentTheme || !currentSlide) return;
     setSavingSlide(true);
+    setError(null);
     try {
       const saved = await updateSlide(currentSlide.id, {
         slide_type: currentSlide.slide_type,
@@ -568,9 +613,9 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       }));
       showToast('Slajd uspešno shranjen.');
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri shranjevanju slajda.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri shranjevanju slajda.';
+      setError(msg);
+      window.alert(`Napaka pri shranjevanju slajda:\n${msg}`);
     } finally {
       setSavingSlide(false);
     }
@@ -670,7 +715,25 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
         <div className="flex flex-col sm:flex-row sm:items-center gap-4 flex-1">
           <button
             id="back-to-dashboard-btn"
-            onClick={onBack}
+            onClick={async () => {
+              if (currentSlide) {
+                try {
+                  await updateSlide(currentSlide.id, {
+                    slide_type: currentSlide.slide_type,
+                    question_text: currentSlide.question_text,
+                    options: currentSlide.options,
+                    correct_answer: currentSlide.correct_answer,
+                    points: currentSlide.points,
+                    timer_seconds: currentSlide.timer_seconds,
+                    slide_image_url: currentSlide.slide_image_url,
+                    order_index: currentSlide.order_index,
+                  });
+                } catch {
+                  // nadaljuj nazaj
+                }
+              }
+              onBack();
+            }}
             className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-800/90 hover:bg-slate-800 text-slate-200 border border-slate-700/80 transition-colors self-start sm:self-auto cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -717,10 +780,14 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                   id="save-quiz-meta-btn"
                   onClick={handleSaveQuizHeader}
                   disabled={savingQuizMeta}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
                 >
-                  <Save className="w-3.5 h-3.5" />
-                  <span>{savingQuizMeta ? '...' : 'Shrani'}</span>
+                  {savingQuizMeta ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Save className="w-3.5 h-3.5" />
+                  )}
+                  <span>{savingQuizMeta ? 'Shranjevanje...' : 'Shrani vse'}</span>
                 </button>
               </div>
             </div>
@@ -761,7 +828,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
               </p>
               <p className="text-xs text-indigo-300">
                 Vsaka stran se samodejno pretvori v sliko in shrani v Supabase Storage bucket{' '}
-                <code>slides</code>.
+                <code>slides</code> (oz. stisnjeno sliko v bazi).
               </p>
             </div>
           </div>
@@ -868,9 +935,13 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
               id="add-theme-btn"
               type="submit"
               disabled={addingTheme}
-              className="w-full py-2.5 px-3 rounded-xl text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+              className="w-full py-2.5 px-3 rounded-xl text-xs font-semibold bg-indigo-600/20 hover:bg-indigo-600/30 disabled:opacity-60 text-indigo-300 border border-indigo-500/30 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
             >
-              <FolderPlus className="w-3.5 h-3.5" />
+              {addingTheme ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <FolderPlus className="w-3.5 h-3.5" />
+              )}
               <span>{addingTheme ? 'Dodajanje...' : 'Dodaj tematiko'}</span>
             </button>
           </form>
@@ -954,6 +1025,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                   </span>
                   <button
                     type="button"
+                    disabled={addingSlide}
                     onClick={() => handleAddBlankSlide('theme_intro')}
                     className="shrink-0 px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold cursor-pointer"
                   >
@@ -1054,11 +1126,16 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                 <button
                   id="add-blank-slide-btn"
                   type="button"
+                  disabled={addingSlide}
                   onClick={() => handleAddBlankSlide('multiple_choice')}
-                  className="flex-1 py-2.5 px-3 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  className="flex-1 py-2.5 px-3 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
                 >
-                  <Plus className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Dodaj prazen slajd</span>
+                  {addingSlide ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                  ) : (
+                    <Plus className="w-3.5 h-3.5 text-emerald-400" />
+                  )}
+                  <span>{addingSlide ? 'Dodajanje slajda...' : 'Dodaj prazen slajd'}</span>
                 </button>
               </div>
             </>
@@ -1095,9 +1172,13 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                     id="save-slide-settings-btn"
                     type="submit"
                     disabled={savingSlide}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
                   >
-                    <Save className="w-3.5 h-3.5" />
+                    {savingSlide ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Save className="w-3.5 h-3.5" />
+                    )}
                     <span>{savingSlide ? 'Shranjevanje...' : 'Shrani slajd'}</span>
                   </button>
                 </div>

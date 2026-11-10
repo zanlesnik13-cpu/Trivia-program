@@ -1,3 +1,4 @@
+import { compressImageBlobToDataUrl } from './pdfConverter';
 import { getSupabaseClient } from './supabase';
 import type {
   Answer,
@@ -209,6 +210,30 @@ function normalizeOptions(raw: unknown): SlideOptions {
 // KVIZI & TEMATIKE
 // -----------------------------------------------------------------------------
 
+function formatSupabaseError(err: unknown, context: string): Error {
+  if (err && typeof err === 'object') {
+    const obj = err as { code?: string; message?: string; details?: string; hint?: string };
+    const code = obj.code ? ` [${obj.code}]` : '';
+    const msg = obj.message || 'Neznana napaka.';
+    const details = obj.details ? ` (${obj.details})` : '';
+
+    // Če gre za napako foreign key na quizzes_host_id_fkey ali RLS (42501 / 23503)
+    if (obj.code === '23503' && msg.includes('quizzes_host_id_fkey')) {
+      return new Error(
+        `${context}: Tabela "quizzes" ima še vedno staro omejitev na auth.users. Odprite "SQL Skripta & Supabase" in v Supabase SQL Editorju poženite kratko popravljalno SQL skripto! (${msg})`
+      );
+    }
+    if (obj.code === '42501') {
+      return new Error(
+        `${context}: Zavrnjen dostop zaradi RLS politik${code}. Odprite "SQL Skripta & Supabase" in v Supabase SQL Editorju poženite kratko popravljalno SQL skripto za izklop RLS! (${msg})`
+      );
+    }
+    return new Error(`${context}${code}: ${msg}${details}`);
+  }
+  if (err instanceof Error) return err;
+  return new Error(`${context}: Neznana napaka.`);
+}
+
 export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]> {
   const supabase = getSupabaseClient();
   if (!supabase) {
@@ -231,7 +256,7 @@ export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]>
     .eq('host_id', hostId)
     .order('created_at', { ascending: false });
 
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri nalaganju kvizov');
   if (!quizzes || quizzes.length === 0) return [];
 
   const quizIds = quizzes.map((q) => q.id);
@@ -315,9 +340,9 @@ export async function createQuiz(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri ustvarjanju kviza v Supabase');
 
-  const { data: theme } = await supabase
+  const { data: theme, error: themeErr } = await supabase
     .from('themes')
     .insert({
       quiz_id: quiz.id,
@@ -327,8 +352,10 @@ export async function createQuiz(
     .select('*')
     .single();
 
+  if (themeErr) throw formatSupabaseError(themeErr, 'Napaka pri ustvarjanju uvodne tematike');
+
   if (theme) {
-    await supabase.from('slides').insert({
+    const { error: slideErr } = await supabase.from('slides').insert({
       theme_id: theme.id,
       order_index: 0,
       slide_type: 'theme_intro',
@@ -338,6 +365,7 @@ export async function createQuiz(
       points: 0,
       timer_seconds: 0,
     });
+    if (slideErr) throw formatSupabaseError(slideErr, 'Napaka pri ustvarjanju uvodnega slajda');
   }
 
   return quiz as Quiz;
@@ -364,7 +392,7 @@ export async function updateQuizMeta(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri shranjevanju nastavitev kviza');
   return data as Quiz;
 }
 
@@ -381,7 +409,7 @@ export async function deleteQuiz(quizId: string): Promise<void> {
   }
 
   const { error } = await supabase.from('quizzes').delete().eq('id', quizId);
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri brisanju kviza');
 }
 
 export async function fetchQuizDetails(quizId: string): Promise<{
@@ -418,7 +446,9 @@ export async function fetchQuizDetails(quizId: string): Promise<{
     .eq('id', quizId)
     .single();
 
-  if (quizErr || !quiz) throw quizErr || new Error('Kviz ni bil najden.');
+  if (quizErr || !quiz) {
+    throw formatSupabaseError(quizErr || new Error('Kviz ni bil najden.'), 'Napaka pri branju kviza');
+  }
 
   const { data: themesData, error: themesErr } = await supabase
     .from('themes')
@@ -426,7 +456,7 @@ export async function fetchQuizDetails(quizId: string): Promise<{
     .eq('quiz_id', quizId)
     .order('order_index', { ascending: true });
 
-  if (themesErr) throw themesErr;
+  if (themesErr) throw formatSupabaseError(themesErr, 'Napaka pri branju tematik');
   const themes = (themesData || []) as Theme[];
 
   const slidesByTheme: Record<string, Slide[]> = {};
@@ -442,7 +472,7 @@ export async function fetchQuizDetails(quizId: string): Promise<{
       .in('theme_id', themeIds)
       .order('order_index', { ascending: true });
 
-    if (slidesErr) throw slidesErr;
+    if (slidesErr) throw formatSupabaseError(slidesErr, 'Napaka pri branju slajdov');
 
     for (const rawSlide of slidesData || []) {
       const slide: Slide = {
@@ -509,7 +539,7 @@ export async function createTheme(
     .select('*')
     .single();
 
-  if (themeErr) throw themeErr;
+  if (themeErr) throw formatSupabaseError(themeErr, 'Napaka pri dodajanju tematike');
 
   const { data: slideData, error: slideErr } = await supabase
     .from('slides')
@@ -526,7 +556,7 @@ export async function createTheme(
     .select('*')
     .single();
 
-  if (slideErr) throw slideErr;
+  if (slideErr) throw formatSupabaseError(slideErr, 'Napaka pri dodajanju uvodnega slajda teme');
 
   return {
     theme: themeData as Theme,
@@ -558,7 +588,7 @@ export async function updateTheme(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri shranjevanju tematike');
   return data as Theme;
 }
 
@@ -573,7 +603,7 @@ export async function deleteTheme(themeId: string): Promise<void> {
   }
 
   const { error } = await supabase.from('themes').delete().eq('id', themeId);
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri brisanju tematike');
 }
 
 export async function createSlide(
@@ -610,7 +640,7 @@ export async function createSlide(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri ustvarjanju slajda');
   return {
     ...(data as Slide),
     options: normalizeOptions(data.options),
@@ -640,7 +670,7 @@ export async function updateSlide(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri shranjevanju slajda');
   return {
     ...(data as Slide),
     options: normalizeOptions(data.options),
@@ -659,9 +689,15 @@ export async function deleteSlide(slideId: string): Promise<void> {
   }
 
   const { error } = await supabase.from('slides').delete().eq('id', slideId);
-  if (error) throw error;
+  if (error) throw formatSupabaseError(error, 'Napaka pri brisanju slajda');
 }
 
+/**
+ * Naloži sliko slajda v Supabase Storage bucket 'slides'.
+ * Če Supabase ni povezan ali če nalaganje v Storage bucket spodleti (npr. zaradi manjkajočega bucketa ali RLS politik),
+ * sliko samodejno stisne v optimiziran JPEG Base64 data URL (kvaliteta 0.7, max širina 1280px)
+ * in jo vrne za neposredno shranjevanje v polje `slide_image_url`, da nalaganje 100% deluje!
+ */
 export async function uploadSlideImage(
   quizId: string,
   themeId: string,
@@ -670,28 +706,33 @@ export async function uploadSlideImage(
 ): Promise<string> {
   const supabase = getSupabaseClient();
   if (!supabase) {
-    return await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(new Error('Napaka pri branju slike.'));
-      reader.readAsDataURL(blob);
-    });
+    return await compressImageBlobToDataUrl(blob, 1280, 0.7);
   }
 
-  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const filePath = `${quizId}/${themeId}/${Date.now()}_${crypto.randomUUID().slice(0, 8)}_${safeName}`;
+  try {
+    const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const filePath = `${quizId}/${themeId}/${Date.now()}_${crypto.randomUUID().slice(0, 8)}_${safeName}`;
 
-  const { error: uploadError } = await supabase.storage
-    .from('slides')
-    .upload(filePath, blob, {
-      contentType: blob.type || 'image/jpeg',
-      upsert: true,
-    });
+    const { error: uploadError } = await supabase.storage
+      .from('slides')
+      .upload(filePath, blob, {
+        contentType: blob.type || 'image/jpeg',
+        upsert: true,
+      });
 
-  if (uploadError) throw uploadError;
+    if (uploadError) {
+      // Če nalaganje v Storage bucket 'slides' spodleti, uporabi stisnjen Base64 data URL fallback
+      return await compressImageBlobToDataUrl(blob, 1280, 0.7);
+    }
 
-  const { data } = supabase.storage.from('slides').getPublicUrl(filePath);
-  return data.publicUrl;
+    const { data } = supabase.storage.from('slides').getPublicUrl(filePath);
+    if (data?.publicUrl) {
+      return data.publicUrl;
+    }
+    return await compressImageBlobToDataUrl(blob, 1280, 0.7);
+  } catch {
+    return await compressImageBlobToDataUrl(blob, 1280, 0.7);
+  }
 }
 
 // -----------------------------------------------------------------------------
