@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import {
+  AlertTriangle,
   Calendar,
   Check,
   Copy,
@@ -7,21 +9,30 @@ import {
   ExternalLink,
   FolderKanban,
   Layers,
+  Loader2,
   Play,
   Plus,
+  QrCode,
   Radio,
+  RefreshCw,
   Smartphone,
   Sparkles,
+  StopCircle,
   Trash2,
   Tv,
+  Users,
   X,
 } from 'lucide-react';
 import {
+  type ActiveGameSessionWithQuiz,
+  closeGameSession,
   createLiveGameSession,
   createQuiz,
   deleteQuiz,
+  fetchHostActiveSessions,
   fetchHostQuizzes,
 } from '../lib/quizService';
+import { getSupabaseConfig } from '../lib/supabase';
 import type { GameSession, QuizWithStats } from '../types/quiz';
 
 interface HostDashboardProps {
@@ -33,6 +44,15 @@ interface HostDashboardProps {
   onOpenRemote: (sessionId: string) => void;
 }
 
+const SESSION_STATUS_LABELS: Record<GameSession['status'], string> = {
+  lobby: 'Čakalnica (Lobby)',
+  theme_intro: 'Uvod v tematiko (Joker)',
+  active_theme: 'Vprašanja v teku',
+  grading_theme: 'Ocenjevanje sklopa',
+  leaderboard: 'Lestvica rezultatov',
+  finished: 'Zaključeno',
+};
+
 export const HostDashboard: React.FC<HostDashboardProps> = ({
   hostId,
   hostEmail,
@@ -42,7 +62,9 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   onOpenRemote,
 }) => {
   const [quizzes, setQuizzes] = useState<QuizWithStats[]>([]);
+  const [activeSessions, setActiveSessions] = useState<ActiveGameSessionWithQuiz[]>([]);
   const [loading, setLoading] = useState(true);
+  const [launchingQuizId, setLaunchingQuizId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Modal za nov kviz
@@ -51,23 +73,30 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   const [newMaxJokers, setNewMaxJokers] = useState(1);
   const [creating, setCreating] = useState(false);
 
-  // Modal ob zagonu kviza v živo
+  // Modal ob zagonu kviza v živo (izbira naprave: Računalnik/TV ali Telefon Daljinec)
   const [activeLiveSession, setActiveLiveSession] = useState<{
     session: GameSession;
     quizTitle: string;
   } | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [copiedRemoteLink, setCopiedRemoteLink] = useState(false);
 
-  const loadQuizzes = async () => {
+  const supabaseConfig = getSupabaseConfig();
+
+  const loadDashboardData = async () => {
     setLoading(true);
     setError(null);
     try {
-      const list = await fetchHostQuizzes(hostId);
-      setQuizzes(list);
+      const [quizList, sessionList] = await Promise.all([
+        fetchHostQuizzes(hostId),
+        fetchHostActiveSessions(hostId),
+      ]);
+      setQuizzes(quizList);
+      setActiveSessions(sessionList);
     } catch (err: unknown) {
       setError(
-        err instanceof Error ? err.message : 'Napaka pri nalaganju kvizov.'
+        err instanceof Error ? err.message : 'Napaka pri nalaganju podatkov nadzorne plošče.'
       );
     } finally {
       setLoading(false);
@@ -75,7 +104,7 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   };
 
   useEffect(() => {
-    loadQuizzes();
+    loadDashboardData();
   }, [hostId]);
 
   const handleCreateQuiz = async (e: React.FormEvent) => {
@@ -89,9 +118,9 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
       setNewMaxJokers(1);
       onEditQuiz(created.id);
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri ustvarjanju kviza.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri ustvarjanju kviza.';
+      setError(msg);
+      window.alert(`Napaka pri ustvarjanju kviza:\n${msg}`);
     } finally {
       setCreating(false);
     }
@@ -106,21 +135,50 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
     try {
       await deleteQuiz(quiz.id);
       setQuizzes((prev) => prev.filter((q) => q.id !== quiz.id));
+      setActiveSessions((prev) => prev.filter((s) => s.session.quiz_id !== quiz.id));
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri brisanju kviza.'
-      );
+      const msg = err instanceof Error ? err.message : 'Napaka pri brisanju kviza.';
+      setError(msg);
     }
   };
 
   const handleLaunchLive = async (quiz: QuizWithStats) => {
+    if (launchingQuizId) return;
+    setLaunchingQuizId(quiz.id);
+    setError(null);
     try {
       const session = await createLiveGameSession(quiz.id);
+      // Osveži seznam aktivnih sej in odpri pojavno okno (Modal) za izbiro naprave (BREZ samodejne preusmeritve)
+      setActiveSessions((prev) => [
+        { session, quizTitle: quiz.title, playerCount: 0 },
+        ...prev.filter((item) => item.session.id !== session.id),
+      ]);
       setActiveLiveSession({ session, quizTitle: quiz.title });
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : 'Napaka pri zagonu kviza v živo.'
-      );
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Prišlo je do neznane napake pri ustvarjanju seje v tabeli game_sessions.';
+      setError(msg);
+      window.alert(`Napaka pri zagonu kviza v živo:\n\n${msg}`);
+    } finally {
+      setLaunchingQuizId(null);
+    }
+  };
+
+  const handleCloseActiveSession = async (sessionId: string, quizTitle: string) => {
+    const confirmed = window.confirm(
+      `Ali res želite zaključiti aktivno sejo za kviz "${quizTitle}"?`
+    );
+    if (!confirmed) return;
+
+    try {
+      await closeGameSession(sessionId);
+      setActiveSessions((prev) => prev.filter((item) => item.session.id !== sessionId));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Napaka pri zaključevanju seje.';
+      setError(msg);
+      window.alert(msg);
     }
   };
 
@@ -131,11 +189,29 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   };
 
   const handleCopyPlayerLink = async (code: string) => {
-    const link = typeof window !== 'undefined' ? `${window.location.origin}/play?code=${code}` : `https://quizpulse.si/play?code=${code}`;
+    const link =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/play?code=${code}`
+        : `https://trivia-program.vercel.app/play?code=${code}`;
     await navigator.clipboard.writeText(link);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
   };
+
+  const handleCopyRemoteLink = async (sessionId: string) => {
+    const link =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/host-remote/${sessionId}`
+        : `https://trivia-program.vercel.app/host-remote/${sessionId}`;
+    await navigator.clipboard.writeText(link);
+    setCopiedRemoteLink(true);
+    setTimeout(() => setCopiedRemoteLink(false), 2000);
+  };
+
+  const getHostRemoteUrl = (sessionId: string) =>
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/host-remote/${sessionId}`
+      : `https://trivia-program.vercel.app/host-remote/${sessionId}`;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -156,6 +232,15 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
 
         <div className="flex flex-wrap items-center gap-3">
           <button
+            onClick={loadDashboardData}
+            className="inline-flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-medium bg-slate-800/80 hover:bg-slate-800 text-slate-300 border border-slate-700/80 transition-all cursor-pointer"
+            title="Osveži seznam kvizov in aktivnih sej"
+          >
+            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-emerald-400' : ''}`} />
+            <span className="hidden sm:inline">Osveži</span>
+          </button>
+
+          <button
             id="open-sql-schema-dashboard-btn"
             onClick={onOpenSqlModal}
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium bg-slate-800/80 hover:bg-slate-800 text-slate-200 border border-slate-700/80 transition-all cursor-pointer"
@@ -174,15 +259,119 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
         </div>
       </div>
 
+      {/* Opozorilo, če Supabase ni povezan (Demo način) */}
+      {!supabaseConfig.isConfigured && (
+        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs sm:text-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <strong className="font-bold text-amber-300">Demo način (lokalni pomnilnik):</strong>{' '}
+              Če želite igro voditi s telefonom prek QR kode na drugi napravi, povežite svojo{' '}
+              <strong>Supabase bazo</strong> (gumb &ldquo;SQL Skripta &amp; Supabase&rdquo;), saj lokalni pomnilnik brskalnika ne prenaša podatkov med računalnikom in telefonom.
+            </div>
+          </div>
+          <button
+            onClick={onOpenSqlModal}
+            className="px-3.5 py-2 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-semibold text-xs shrink-0 cursor-pointer"
+          >
+            Nastavi Supabase
+          </button>
+        </div>
+      )}
+
       {error && (
-        <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm flex items-center justify-between">
-          <span>{error}</span>
+        <div className="p-4 rounded-2xl bg-rose-500/15 border border-rose-500/40 text-rose-200 text-sm flex items-center justify-between gap-4 shadow-lg">
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
+            <span>{error}</span>
+          </div>
           <button
             onClick={() => setError(null)}
-            className="text-xs underline hover:text-white"
+            className="text-xs font-semibold underline hover:text-white shrink-0 cursor-pointer"
           >
             Skrij
           </button>
+        </div>
+      )}
+
+      {/* =====================================================================
+          AKTIVNE SEJE V TEKU (Gostitelj se lahko kadarkoli vrne v odprto igro)
+          ===================================================================== */}
+      {activeSessions.length > 0 && (
+        <div className="bg-slate-900/85 backdrop-blur-xl border border-emerald-500/30 rounded-2xl p-6 shadow-xl space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <span className="w-3 h-3 rounded-full bg-emerald-400 animate-ping" />
+              <h2 className="text-lg font-bold text-slate-100">
+                Aktivne seje v teku ({activeSessions.length})
+              </h2>
+            </div>
+            <span className="text-xs text-slate-400">
+              Izberite aktivno igro za odpiranje zaslona ali QR kode za telefon
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {activeSessions.map(({ session, quizTitle, playerCount }) => (
+              <div
+                key={session.id}
+                className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-slate-950/80 border border-slate-800 hover:border-emerald-500/40 transition-all"
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-mono-code font-black text-sm">
+                      Koda: {session.room_code}
+                    </span>
+                    <span className="px-2.5 py-0.5 rounded-lg bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
+                      {SESSION_STATUS_LABELS[session.status] || session.status}
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-xs text-slate-400">
+                      <Users className="w-3.5 h-3.5 text-indigo-400" />
+                      {playerCount} {playerCount === 1 ? 'ekipa' : 'ekip'}
+                    </span>
+                  </div>
+                  <h3 className="text-base font-bold text-slate-100">{quizTitle}</h3>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => setActiveLiveSession({ session, quizTitle })}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white shadow-md shadow-indigo-600/20 cursor-pointer"
+                    title="Prikaži QR kodo za telefon in možnosti zaslona"
+                  >
+                    <QrCode className="w-3.5 h-3.5" />
+                    <span>Poveži napravi / QR</span>
+                  </button>
+
+                  <button
+                    onClick={() => onOpenPresentation(session.id)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer"
+                    title="Odpri Glavni Zaslon (Prezentacija)"
+                  >
+                    <Tv className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Zaslon</span>
+                  </button>
+
+                  <button
+                    onClick={() => onOpenRemote(session.id)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer"
+                    title="Odpri Daljinec za gostitelja"
+                  >
+                    <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Daljinec</span>
+                  </button>
+
+                  <button
+                    onClick={() => handleCloseActiveSession(session.id, quizTitle)}
+                    className="p-2 rounded-xl text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+                    title="Zaključi to sejo"
+                  >
+                    <StopCircle className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -220,91 +409,104 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {quizzes.map((quiz) => (
-            <div
-              key={quiz.id}
-              className="group relative flex flex-col justify-between bg-slate-900/80 backdrop-blur-xl border border-slate-800 hover:border-indigo-500/50 rounded-2xl p-6 shadow-xl transition-all duration-200 hover:-translate-y-0.5"
-            >
-              <div className="space-y-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                    <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>
-                      {quiz.max_jokers_per_player}{' '}
-                      {quiz.max_jokers_per_player === 1 ? 'Joker' : 'Jokerji'} / igralca
-                    </span>
+          {quizzes.map((quiz) => {
+            const isLaunching = launchingQuizId === quiz.id;
+            return (
+              <div
+                key={quiz.id}
+                className="group relative flex flex-col justify-between bg-slate-900/80 backdrop-blur-xl border border-slate-800 hover:border-indigo-500/50 rounded-2xl p-6 shadow-xl transition-all duration-200 hover:-translate-y-0.5"
+              >
+                <div className="space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                      <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>
+                        {quiz.max_jokers_per_player}{' '}
+                        {quiz.max_jokers_per_player === 1 ? 'Joker' : 'Jokerji'} / igralca
+                      </span>
+                    </div>
+                    <button
+                      id={`delete-quiz-${quiz.id}`}
+                      onClick={() => handleDeleteQuiz(quiz)}
+                      title="Izbriši kviz"
+                      className="p-2 rounded-xl text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
+
+                  <div>
+                    <h2 className="text-xl font-bold text-slate-100 group-hover:text-indigo-300 transition-colors line-clamp-2">
+                      {quiz.title}
+                    </h2>
+                    <div className="flex items-center gap-2 mt-2 text-xs text-slate-400">
+                      <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                      <span>
+                        Ustvarjeno:{' '}
+                        {new Date(quiz.created_at).toLocaleDateString('sl-SI', {
+                          day: '2-digit',
+                          month: '2-digit',
+                          year: 'numeric',
+                        })}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Statistika tematike / slajdi */}
+                  <div className="grid grid-cols-2 gap-3 pt-2">
+                    <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80">
+                      <div className="text-xs text-slate-400 flex items-center gap-1.5">
+                        <FolderKanban className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Tematike</span>
+                      </div>
+                      <p className="text-lg font-bold text-slate-100 mt-0.5">
+                        {quiz.theme_count}
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80">
+                      <div className="text-xs text-slate-400 flex items-center gap-1.5">
+                        <Layers className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Slajdi skupaj</span>
+                      </div>
+                      <p className="text-lg font-bold text-slate-100 mt-0.5">
+                        {quiz.slide_count}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Akcijska gumba */}
+                <div className="grid grid-cols-2 gap-3 pt-6 mt-6 border-t border-slate-800/80">
                   <button
-                    id={`delete-quiz-${quiz.id}`}
-                    onClick={() => handleDeleteQuiz(quiz)}
-                    title="Izbriši kviz"
-                    className="p-2 rounded-xl text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+                    id={`edit-quiz-${quiz.id}`}
+                    onClick={() => onEditQuiz(quiz.id)}
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 transition-all cursor-pointer"
                   >
-                    <Trash2 className="w-4 h-4" />
+                    <Edit3 className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Uredi kviz</span>
+                  </button>
+                  <button
+                    id={`launch-quiz-${quiz.id}`}
+                    onClick={() => handleLaunchLive(quiz)}
+                    disabled={isLaunching}
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+                  >
+                    {isLaunching ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Zaganjam...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                        <span>Zaženi kviz v živo</span>
+                      </>
+                    )}
                   </button>
                 </div>
-
-                <div>
-                  <h2 className="text-xl font-bold text-slate-100 group-hover:text-indigo-300 transition-colors line-clamp-2">
-                    {quiz.title}
-                  </h2>
-                  <div className="flex items-center gap-2 mt-2 text-xs text-slate-400">
-                    <Calendar className="w-3.5 h-3.5 text-slate-500" />
-                    <span>
-                      Ustvarjeno:{' '}
-                      {new Date(quiz.created_at).toLocaleDateString('sl-SI', {
-                        day: '2-digit',
-                        month: '2-digit',
-                        year: 'numeric',
-                      })}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Statistika tematike / slajdi */}
-                <div className="grid grid-cols-2 gap-3 pt-2">
-                  <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80">
-                    <div className="text-xs text-slate-400 flex items-center gap-1.5">
-                      <FolderKanban className="w-3.5 h-3.5 text-indigo-400" />
-                      <span>Tematike</span>
-                    </div>
-                    <p className="text-lg font-bold text-slate-100 mt-0.5">
-                      {quiz.theme_count}
-                    </p>
-                  </div>
-                  <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80">
-                    <div className="text-xs text-slate-400 flex items-center gap-1.5">
-                      <Layers className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Slajdi skupaj</span>
-                    </div>
-                    <p className="text-lg font-bold text-slate-100 mt-0.5">
-                      {quiz.slide_count}
-                    </p>
-                  </div>
-                </div>
               </div>
-
-              {/* Akcijska gumba */}
-              <div className="grid grid-cols-2 gap-3 pt-6 mt-6 border-t border-slate-800/80">
-                <button
-                  id={`edit-quiz-${quiz.id}`}
-                  onClick={() => onEditQuiz(quiz.id)}
-                  className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 transition-all cursor-pointer"
-                >
-                  <Edit3 className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Uredi kviz</span>
-                </button>
-                <button
-                  id={`launch-quiz-${quiz.id}`}
-                  onClick={() => handleLaunchLive(quiz)}
-                  className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
-                >
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  <span>Zaženi kviz v živo</span>
-                </button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -385,114 +587,194 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
         </div>
       )}
 
-      {/* Modal ob kliku na "Zaženi kviz v živo" */}
+      {/* =====================================================================
+          POJAVNO OKNO (MODAL) ZA IZBIRO NAPRAVE OB ZAGONU KVIZA V ŽIVO
+          ===================================================================== */}
       {activeLiveSession && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
-          <div className="w-full max-w-xl bg-slate-900/95 backdrop-blur-xl border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md overflow-y-auto">
+          <div className="w-full max-w-3xl bg-slate-900/95 backdrop-blur-xl border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6 my-auto">
+            {/* Glava Modala */}
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800">
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                <div className="w-11 h-11 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
                   <Radio className="w-5 h-5 animate-pulse" />
                 </div>
                 <div>
                   <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
-                    Kviz v živo pripravljen • Status: {activeLiveSession.session.status}
+                    Seja v živo ustvarjena • Koda sobe: {activeLiveSession.session.room_code}
                   </span>
-                  <h3 className="text-lg font-bold text-slate-100">
+                  <h3 className="text-lg sm:text-xl font-bold text-slate-100">
                     {activeLiveSession.quizTitle}
                   </h3>
                 </div>
               </div>
               <button
                 onClick={() => setActiveLiveSession(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* 4-mestna številčna koda sobe */}
-            <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 flex flex-col items-center gap-2 text-center">
-              <span className="text-[11px] uppercase tracking-widest text-slate-400 font-bold">
-                4-MESTNA KODA SOBE (ROOM CODE)
-              </span>
-              <div className="flex items-center gap-3">
-                <span className="text-5xl font-bold font-mono-code tracking-widest text-emerald-400 drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">
-                  {activeLiveSession.session.room_code}
-                </span>
+            {/* Koda sobe za tekmovalce */}
+            <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="flex items-center gap-4">
+                <div className="px-4 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+                  <span className="text-[10px] uppercase tracking-widest text-slate-400 block font-bold">
+                    Koda za igralce
+                  </span>
+                  <span className="text-3xl font-black font-mono-code tracking-widest text-emerald-400">
+                    {activeLiveSession.session.room_code}
+                  </span>
+                </div>
+                <div className="text-left">
+                  <p className="text-xs font-bold text-slate-200">
+                    Tekmovalci se pridružijo na <code className="text-indigo-300">/play</code>
+                  </p>
+                  <p className="text-[11px] text-slate-400">
+                    QR koda za tekmovalce se prikaže na Glavnem zaslonu (Prezentaciji).
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
                 <button
-                  onClick={() =>
-                    handleCopyRoomCode(activeLiveSession.session.room_code)
-                  }
-                  className="p-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors cursor-pointer"
-                  title="Kopiraj kodo sobe"
+                  onClick={() => handleCopyRoomCode(activeLiveSession.session.room_code)}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition-colors cursor-pointer"
                 >
                   {copiedCode ? (
-                    <Check className="w-5 h-5 text-emerald-400" />
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Koda skopirana</span>
+                    </>
                   ) : (
-                    <Copy className="w-5 h-5" />
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Kopiraj kodo</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={() => handleCopyPlayerLink(activeLiveSession.session.room_code)}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-semibold transition-colors cursor-pointer"
+                >
+                  {copiedLink ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Skopirano!</span>
+                    </>
+                  ) : (
+                    <>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Povezava za igralce</span>
+                    </>
                   )}
                 </button>
               </div>
-              <button
-                onClick={() => handleCopyPlayerLink(activeLiveSession.session.room_code)}
-                className="text-xs text-indigo-400 hover:text-indigo-300 underline mt-1 cursor-pointer flex items-center gap-1"
-              >
-                {copiedLink ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Povezava za igralce skopirana!</span>
-                  </>
-                ) : (
-                  <>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    <span>Kopiraj direktno povezavo za tekmovalce (/play?code=...)</span>
-                  </>
-                )}
-              </button>
             </div>
 
-            {/* DVA GLAVNA GUMBA: 1. Glavni zaslon (Prezentacija) & 2. Daljinec (Telefon) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <button
-                id="open-presentation-screen-btn"
-                onClick={() => {
-                  const sId = activeLiveSession.session.id;
-                  setActiveLiveSession(null);
-                  onOpenPresentation(sId);
-                }}
-                className="flex flex-col items-center justify-center gap-2 p-5 rounded-2xl bg-gradient-to-br from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white shadow-xl shadow-indigo-600/25 border border-indigo-400/30 transition-all cursor-pointer group"
-              >
-                <div className="w-12 h-12 rounded-xl bg-white/10 flex items-center justify-center group-hover:scale-110 transition-transform">
-                  <Tv className="w-6 h-6 text-white" />
+            {/* DVE JASNI MOŽNOSTI ZA GOSTITELJA: 1. RAČUNALNIK / TV  in  2. TELEFON GOSTITELJA (QR + Gumb) */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* MOŽNOST A: ZA RAČUNALNIK / TV / PROJEKTOR */}
+              <div className="flex flex-col justify-between p-6 rounded-2xl bg-gradient-to-b from-indigo-950/60 to-slate-950/90 border border-indigo-500/40 shadow-xl space-y-5">
+                <div className="space-y-3">
+                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-xs font-bold">
+                    <Tv className="w-3.5 h-3.5" />
+                    <span>1. ZA RAČUNALNIK / TV / PROJEKTOR</span>
+                  </div>
+                  <h4 className="text-lg font-bold text-slate-100">
+                    Glavni zaslon (Prezentacija)
+                  </h4>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Odprite ta pogled na prenosniku, tablici ali TV zaslonu, ki je obrnjen proti
+                    tekmovalcem. Na njem se v živo prikazujejo QR koda za vstop, slajdi, časovnik in lestvica.
+                  </p>
                 </div>
-                <div className="text-center">
-                  <span className="block font-bold text-sm">Odpri glavni zaslon</span>
-                  <span className="block text-[11px] text-indigo-200 opacity-80">
-                    Prezentacija za projektor / TV
-                  </span>
-                </div>
-              </button>
 
-              <button
-                id="open-host-remote-btn"
-                onClick={() => {
-                  const sId = activeLiveSession.session.id;
-                  setActiveLiveSession(null);
-                  onOpenRemote(sId);
-                }}
-                className="flex flex-col items-center justify-center gap-2 p-5 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-700 hover:from-emerald-500 hover:to-teal-600 text-white shadow-xl shadow-emerald-600/25 border border-emerald-400/30 transition-all cursor-pointer group"
-              >
-                <div className="w-12 h-12 rounded-xl bg-white/10 flex items-center justify-center group-hover:scale-110 transition-transform">
-                  <Smartphone className="w-6 h-6 text-white" />
+                <div className="space-y-2.5 pt-2">
+                  <button
+                    id="open-presentation-screen-btn"
+                    onClick={() => {
+                      const sId = activeLiveSession.session.id;
+                      onOpenPresentation(sId);
+                    }}
+                    className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-bold text-sm shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition-all cursor-pointer"
+                  >
+                    <Tv className="w-4 h-4" />
+                    <span>Odpri Glavni Zaslon (Prezentacija)</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      const url = `${window.location.origin}/present/${activeLiveSession.session.id}`;
+                      window.open(url, '_blank', 'noopener,noreferrer');
+                    }}
+                    className="w-full py-2.5 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Odpri Prezentacijo v novem zavihku</span>
+                  </button>
                 </div>
-                <div className="text-center">
-                  <span className="block font-bold text-sm">Odpri daljinec za gostitelja</span>
-                  <span className="block text-[11px] text-emerald-200 opacity-80">
-                    Nadzor slajdov in časovnika (Telefon)
-                  </span>
+              </div>
+
+              {/* MOŽNOST B: ZA TELEFON GOSTITELJA (QR KODA + DIREKTNI DOSTOP BREZ PRIJAVE) */}
+              <div className="flex flex-col justify-between p-6 rounded-2xl bg-gradient-to-b from-emerald-950/50 to-slate-950/90 border border-emerald-500/40 shadow-xl space-y-4">
+                <div className="space-y-2">
+                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs font-bold">
+                    <Smartphone className="w-3.5 h-3.5" />
+                    <span>2. ZA TELEFON GOSTITELJA (DALJINEC)</span>
+                  </div>
+                  <h4 className="text-lg font-bold text-slate-100">
+                    Skeniraj QR kodo s telefonom
+                  </h4>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Poskenirajte QR kodo s kamero telefona. Odprl se bo mobilni daljinec{' '}
+                    <strong className="text-emerald-300">brez zahtevane prijave</strong> za prestavljanje slajdov in ocenjevanje!
+                  </p>
                 </div>
-              </button>
+
+                {/* QR Koda za /host-remote/:sessionId */}
+                <div className="flex flex-col items-center justify-center py-2">
+                  <div className="p-3.5 rounded-2xl bg-white shadow-xl border-4 border-emerald-500/30">
+                    <QRCodeSVG
+                      value={getHostRemoteUrl(activeLiveSession.session.id)}
+                      size={156}
+                      level="H"
+                      includeMargin={false}
+                    />
+                  </div>
+                  <button
+                    onClick={() => handleCopyRemoteLink(activeLiveSession.session.id)}
+                    className="mt-2.5 inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 underline cursor-pointer"
+                  >
+                    {copiedRemoteLink ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Povezava do daljinca skopirana!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Kopiraj povezavo za daljinec (/host-remote/...)</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                <div className="space-y-2">
+                  <button
+                    id="open-host-remote-btn"
+                    onClick={() => {
+                      const sId = activeLiveSession.session.id;
+                      onOpenRemote(sId);
+                    }}
+                    className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-sm shadow-lg shadow-emerald-600/25 flex items-center justify-center gap-2 transition-all cursor-pointer"
+                  >
+                    <Smartphone className="w-4 h-4" />
+                    <span>Odpri Daljinec tukaj</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -500,3 +782,4 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
     </div>
   );
 };
+

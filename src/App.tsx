@@ -59,10 +59,13 @@ function parseCurrentRoute(): RouteState {
     return { view: 'present', sessionId: presentMatch[1] };
   }
 
-  // 3. Preveri /host-remote/:sessionId ali #/host-remote/:sessionId
+  // 3. Preveri /host-remote/:sessionId, /remote/:sessionId ali /host/:sessionId (direktni dostop do daljinca brez prijave)
   const hostRemoteMatch =
     path.match(/\/host-remote\/([^/?#]+)/) ||
-    hash.match(/#\/host-remote\/([^/?#]+)/);
+    hash.match(/#\/host-remote\/([^/?#]+)/) ||
+    path.match(/\/remote\/([^/?#]+)/) ||
+    hash.match(/#\/remote\/([^/?#]+)/) ||
+    path.match(/^\/host\/([^/?#]+)/);
   if (hostRemoteMatch) {
     return { view: 'host_remote', sessionId: hostRemoteMatch[1] };
   }

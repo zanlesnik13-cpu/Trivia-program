@@ -698,6 +698,12 @@ export async function uploadSlideImage(
 // LIVE GAME SESSIONS, PRESENTATION & CONTROLLER
 // -----------------------------------------------------------------------------
 
+export interface ActiveGameSessionWithQuiz {
+  session: GameSession;
+  quizTitle: string;
+  playerCount: number;
+}
+
 /**
  * Ustvari novo živo sejo s 4-mestno številčno kodo ('room_code') in statusom 'lobby'.
  */
@@ -708,7 +714,6 @@ export async function createLiveGameSession(quizId: string): Promise<GameSession
   };
 
   const supabase = getSupabaseClient();
-  const roomCode = generateNumericRoomCode();
 
   if (!supabase) {
     const db = getInitialDemoDb();
@@ -721,6 +726,13 @@ export async function createLiveGameSession(quizId: string): Promise<GameSession
           .filter((s) => s.theme_id === firstTheme.id)
           .sort((a, b) => a.order_index - b.order_index)[0] || null
       : null;
+
+    let roomCode = generateNumericRoomCode();
+    const existingCodes = new Set(db.game_sessions.map((s) => s.room_code));
+    for (let i = 0; i < 10; i++) {
+      if (!existingCodes.has(roomCode)) break;
+      roomCode = generateNumericRoomCode();
+    }
 
     const session: GameSession = {
       id: crypto.randomUUID(),
@@ -740,45 +752,172 @@ export async function createLiveGameSession(quizId: string): Promise<GameSession
     return session;
   }
 
-  const { data: themes } = await supabase
+  const { data: themes, error: themeError } = await supabase
     .from('themes')
     .select('id, order_index')
     .eq('quiz_id', quizId)
     .order('order_index', { ascending: true })
     .limit(1);
 
+  if (themeError) {
+    throw new Error(
+      `Supabase napaka pri branju tematik (${themeError.code || 'UNKNOWN'}): ${themeError.message}`
+    );
+  }
+
   const firstThemeId = themes && themes.length > 0 ? themes[0].id : null;
   let firstSlideId: string | null = null;
 
   if (firstThemeId) {
-    const { data: slides } = await supabase
+    const { data: slides, error: slideError } = await supabase
       .from('slides')
       .select('id, order_index')
       .eq('theme_id', firstThemeId)
       .order('order_index', { ascending: true })
       .limit(1);
+
+    if (slideError) {
+      throw new Error(
+        `Supabase napaka pri branju slajdov (${slideError.code || 'UNKNOWN'}): ${slideError.message}`
+      );
+    }
+
     if (slides && slides.length > 0) {
       firstSlideId = slides[0].id;
     }
   }
 
-  const { data, error } = await supabase
-    .from('game_sessions')
-    .insert({
-      quiz_id: quizId,
-      room_code: roomCode,
-      status: 'lobby',
-      current_theme_id: firstThemeId,
-      current_slide_id: firstSlideId,
-      max_slide_index_reached: 0,
-      timer_started_at: null,
-      timer_duration: 0,
-    })
-    .select('*')
-    .single();
+  let lastError: { code?: string; message?: string; details?: string } | null = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const roomCode = generateNumericRoomCode();
+    const { data, error } = await supabase
+      .from('game_sessions')
+      .insert({
+        quiz_id: quizId,
+        room_code: roomCode,
+        status: 'lobby',
+        current_theme_id: firstThemeId,
+        current_slide_id: firstSlideId,
+        max_slide_index_reached: 0,
+        timer_started_at: null,
+        timer_duration: 0,
+      })
+      .select('*')
+      .single();
 
-  if (error) throw error;
-  return data as GameSession;
+    if (!error && data) {
+      return data as GameSession;
+    }
+
+    lastError = error;
+    // Če gre za podvojeno room_code (23505), poskusi znova z novo naključno 4-mestno kodo
+    if (error && error.code === '23505') {
+      continue;
+    }
+    break;
+  }
+
+  const errMsg = lastError
+    ? `Supabase napaka pri ustvarjanju seje (${lastError.code || 'ERROR'}): ${lastError.message}${
+        lastError.details ? ` — ${lastError.details}` : ''
+      }`
+    : 'Neznana napaka pri ustvarjanju seje v tabeli game_sessions.';
+  throw new Error(errMsg);
+}
+
+/**
+ * Vrne vse aktivne (še nezaključene) seje gostitelja skupaj z imenom kviza in številom igralcev.
+ */
+export async function fetchHostActiveSessions(
+  hostId: string
+): Promise<ActiveGameSessionWithQuiz[]> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const hostQuizMap = new Map<string, string>();
+    for (const q of db.quizzes) {
+      hostQuizMap.set(q.id, q.title);
+    }
+
+    return db.game_sessions
+      .filter((s) => s.status !== 'finished' && hostQuizMap.has(s.quiz_id))
+      .map((session) => ({
+        session,
+        quizTitle: hostQuizMap.get(session.quiz_id) || 'Kviz v živo',
+        playerCount: db.players.filter((p) => p.session_id === session.id).length,
+      }));
+  }
+
+  const { data: quizzes, error: qErr } = await supabase
+    .from('quizzes')
+    .select('id, title')
+    .eq('host_id', hostId);
+
+  if (qErr || !quizzes || quizzes.length === 0) {
+    return [];
+  }
+
+  const quizTitleMap = new Map<string, string>();
+  const quizIds: string[] = [];
+  for (const q of quizzes) {
+    quizTitleMap.set(q.id, q.title);
+    quizIds.push(q.id);
+  }
+
+  const { data: sessions, error: sErr } = await supabase
+    .from('game_sessions')
+    .select('*')
+    .in('quiz_id', quizIds)
+    .neq('status', 'finished')
+    .order('created_at', { ascending: false })
+    .limit(12);
+
+  if (sErr || !sessions || sessions.length === 0) {
+    return [];
+  }
+
+  const sessionIds = sessions.map((s) => s.id);
+  const { data: playersData } = await supabase
+    .from('players')
+    .select('id, session_id')
+    .in('session_id', sessionIds);
+
+  const playerCountBySession: Record<string, number> = {};
+  for (const p of playersData || []) {
+    playerCountBySession[p.session_id] = (playerCountBySession[p.session_id] || 0) + 1;
+  }
+
+  return (sessions as GameSession[]).map((session) => ({
+    session,
+    quizTitle: quizTitleMap.get(session.quiz_id) || 'Kviz v živo',
+    playerCount: playerCountBySession[session.id] || 0,
+  }));
+}
+
+/**
+ * Zaključi aktivno sejo (postavi status na 'finished').
+ */
+export async function closeGameSession(sessionId: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const idx = db.game_sessions.findIndex((s) => s.id === sessionId);
+    if (idx !== -1) {
+      db.game_sessions[idx] = { ...db.game_sessions[idx], status: 'finished' };
+      saveDemoDb(db);
+      notifyDemoUpdate('SESSION_FINISHED', sessionId);
+    }
+    return;
+  }
+
+  const { error } = await supabase
+    .from('game_sessions')
+    .update({ status: 'finished' })
+    .eq('id', sessionId);
+
+  if (error) {
+    throw new Error(`Napaka pri zaključevanju seje: ${error.message}`);
+  }
 }
 
 export async function fetchGameSession(sessionId: string): Promise<GameSession | null> {

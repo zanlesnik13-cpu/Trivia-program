@@ -3,9 +3,12 @@ import { QRCodeSVG } from 'qrcode.react';
 import confetti from 'canvas-confetti';
 import {
   AlertCircle,
+  Check,
   CheckCircle2,
   Clock,
+  Copy,
   Crown,
+  ExternalLink,
   Eye,
   HelpCircle,
   Layers,
@@ -14,9 +17,11 @@ import {
   Minimize,
   Radio,
   RefreshCw,
+  Smartphone,
   Sparkles,
   Trophy,
   Users,
+  X,
 } from 'lucide-react';
 import {
   addDemoPlayer,
@@ -54,6 +59,8 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [addingBot, setAddingBot] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [showRemoteQrModal, setShowRemoteQrModal] = useState(false);
+  const [copiedRemoteUrl, setCopiedRemoteUrl] = useState(false);
 
   // Časovnik v živo
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
@@ -329,8 +336,22 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   }
 
   const { session, quiz, currentTheme, currentSlide, players } = data;
-  const playerJoinUrl = typeof window !== 'undefined' ? `${window.location.origin}/play?code=${session.room_code}` : `https://quizpulse.si/play?code=${session.room_code}`;
-  const displayUrl = typeof window !== 'undefined' ? `${window.location.host}/play` : 'quizpulse.si/play';
+  const playerJoinUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/play?code=${session.room_code}`
+      : `https://trivia-program.vercel.app/play?code=${session.room_code}`;
+  const hostRemoteUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/host-remote/${session.id}`
+      : `https://trivia-program.vercel.app/host-remote/${session.id}`;
+  const displayUrl =
+    typeof window !== 'undefined' ? `${window.location.host}/play` : 'trivia-program.vercel.app/play';
+
+  const handleCopyRemoteUrl = async () => {
+    await navigator.clipboard.writeText(hostRemoteUrl);
+    setCopiedRemoteUrl(true);
+    setTimeout(() => setCopiedRemoteUrl(false), 2000);
+  };
 
   // Indeks trenutnega slajda v temi
   const themeSlides = currentTheme ? data.slidesByTheme[currentTheme.id] || [] : [];
@@ -374,7 +395,19 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         </div>
 
         {/* Sredinski / Desni indikatorji */}
-        <div className="flex items-center gap-3 sm:gap-4">
+        <div className="flex items-center gap-2.5 sm:gap-3.5">
+          {/* Gumb: Poveži telefon gostitelja (Daljinec) */}
+          <button
+            id="open-host-remote-qr-header-btn"
+            onClick={() => setShowRemoteQrModal(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35 text-xs font-semibold transition-all cursor-pointer"
+            title="Prikaži QR kodo za telefon gostitelja (Daljinec)"
+          >
+            <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden md:inline">📱 Poveži telefon gostitelja (Daljinec)</span>
+            <span className="md:hidden">📱 Daljinec</span>
+          </button>
+
           {/* 4-mestna koda sobe */}
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs">
             <span className="text-slate-400 font-medium hidden sm:inline">Koda sobe:</span>
@@ -486,23 +519,35 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
             {/* Seznam prijavljenih ekip / igralcev v živo */}
             <div className="w-full max-w-4xl space-y-3">
-              <div className="flex items-center justify-between px-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 px-2">
                 <div className="flex items-center gap-2">
                   <Users className="w-4 h-4 text-emerald-400" />
                   <span className="text-sm font-bold uppercase tracking-wider text-slate-300">
                     Prijavljene ekipe v čakalnici ({players.length})
                   </span>
                 </div>
-                {/* Pomožni gumb za takojšen preizkus čakalnice */}
-                <button
-                  id="demo-add-player-btn"
-                  onClick={handleAddTestPlayer}
-                  disabled={addingBot}
-                  className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/20 px-3 py-1.5 rounded-xl border border-indigo-500/25 transition-all cursor-pointer disabled:opacity-50"
-                  title="Doda testno ekipo za vizualni preizkus čakalnice"
-                >
-                  {addingBot ? '+ Dodajanje...' : '+ Dodaj testno ekipo'}
-                </button>
+                <div className="flex items-center gap-2">
+                  {/* Gumb za povezavo telefona gostitelja */}
+                  <button
+                    id="lobby-connect-host-remote-btn"
+                    onClick={() => setShowRemoteQrModal(true)}
+                    className="text-xs font-semibold text-emerald-300 hover:text-emerald-200 bg-emerald-500/15 hover:bg-emerald-500/25 px-3 py-1.5 rounded-xl border border-emerald-500/35 transition-all cursor-pointer flex items-center gap-1.5"
+                  >
+                    <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>📱 Poveži telefon gostitelja (Daljinec)</span>
+                  </button>
+
+                  {/* Pomožni gumb za takojšen preizkus čakalnice */}
+                  <button
+                    id="demo-add-player-btn"
+                    onClick={handleAddTestPlayer}
+                    disabled={addingBot}
+                    className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/20 px-3 py-1.5 rounded-xl border border-indigo-500/25 transition-all cursor-pointer disabled:opacity-50"
+                    title="Doda testno ekipo za vizualni preizkus čakalnice"
+                  >
+                    {addingBot ? '+ Dodajanje...' : '+ Dodaj testno ekipo'}
+                  </button>
+                </div>
               </div>
 
               {players.length === 0 ? (
@@ -1011,6 +1056,92 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
           </div>
         )}
       </main>
+
+      {/* ===================================================================
+          MODAL ZA HITRO POVEZAVO TELEFONA GOSTITELJA (DALJINEC PREK QR KODE)
+          =================================================================== */}
+      {showRemoteQrModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
+          <div className="w-full max-w-md bg-slate-900/95 backdrop-blur-xl border border-emerald-500/40 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6 text-center animate-scaleIn">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2.5 text-left">
+                <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
+                  <Smartphone className="w-5 h-5" />
+                </div>
+                <div>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400 block">
+                    Daljinec za gostitelja
+                  </span>
+                  <h3 className="text-base font-bold text-slate-100">
+                    Povežite svoj telefon
+                  </h3>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowRemoteQrModal(false)}
+                className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-xs text-slate-300 leading-relaxed">
+                Poskenirajte spodnjo QR kodo s kamero svojega telefona. Odprl se bo mobilni daljinec za sejo{' '}
+                <strong className="font-mono-code text-emerald-400">{session.room_code}</strong>{' '}
+                brez ponovne prijave!
+              </p>
+
+              <div className="inline-block p-4 rounded-2xl bg-white shadow-2xl border-4 border-emerald-500/40 mx-auto">
+                <QRCodeSVG
+                  value={hostRemoteUrl}
+                  size={200}
+                  level="H"
+                  includeMargin={false}
+                />
+              </div>
+
+              <div className="pt-1">
+                <button
+                  onClick={handleCopyRemoteUrl}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold transition-colors cursor-pointer"
+                >
+                  {copiedRemoteUrl ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Povezava skopirana!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Kopiraj direktno povezavo do daljinca</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-slate-800 flex items-center justify-between gap-3">
+              <a
+                href={hostRemoteUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 shadow-lg shadow-emerald-600/25 transition-all"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>Odpri daljinec v novem zavihku</span>
+              </a>
+              <button
+                onClick={() => setShowRemoteQrModal(false)}
+                className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold cursor-pointer"
+              >
+                Zapri
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+
