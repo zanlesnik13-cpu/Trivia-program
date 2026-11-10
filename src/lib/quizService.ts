@@ -1,6 +1,10 @@
 import { getSupabaseClient } from './supabase';
 import type {
+  Answer,
   GameSession,
+  Player,
+  PlayerJoker,
+  PresentationData,
   Quiz,
   QuizWithStats,
   Slide,
@@ -9,25 +13,72 @@ import type {
   Theme,
 } from '../types/quiz';
 
-const DEMO_STORAGE_KEY = 'trivia_demo_data_v1';
+const DEMO_STORAGE_KEY = 'trivia_demo_data_v2';
+const DEMO_CHANNEL_NAME = 'trivia_demo_broadcast_channel';
+
+// BroadcastChannel za medsebojno komunikacijo med zavihki v Demo načinu
+let demoBroadcastChannel: BroadcastChannel | null = null;
+if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+  demoBroadcastChannel = new BroadcastChannel(DEMO_CHANNEL_NAME);
+}
+
+export function subscribeToDemoUpdates(callback: (event: { type: string; sessionId?: string }) => void) {
+  if (!demoBroadcastChannel) return () => {};
+  const handler = (e: MessageEvent) => {
+    if (e.data) callback(e.data);
+  };
+  demoBroadcastChannel.addEventListener('message', handler);
+  return () => {
+    demoBroadcastChannel?.removeEventListener('message', handler);
+  };
+}
+
+function notifyDemoUpdate(type: string, sessionId?: string) {
+  if (demoBroadcastChannel) {
+    demoBroadcastChannel.postMessage({ type, sessionId });
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('trivia_demo_local_update', { detail: { type, sessionId } }));
+  }
+}
 
 interface DemoDatabase {
   quizzes: Quiz[];
   themes: Theme[];
   slides: Slide[];
   game_sessions: GameSession[];
+  players: Player[];
+  player_jokers: PlayerJoker[];
+  answers: Answer[];
 }
 
 function getInitialDemoDb(): DemoDatabase {
   if (typeof window === 'undefined') {
-    return { quizzes: [], themes: [], slides: [], game_sessions: [] };
+    return {
+      quizzes: [],
+      themes: [],
+      slides: [],
+      game_sessions: [],
+      players: [],
+      player_jokers: [],
+      answers: [],
+    };
   }
   const raw = localStorage.getItem(DEMO_STORAGE_KEY);
   if (raw) {
     try {
-      return JSON.parse(raw) as DemoDatabase;
+      const parsed = JSON.parse(raw) as Partial<DemoDatabase>;
+      return {
+        quizzes: parsed.quizzes || [],
+        themes: parsed.themes || [],
+        slides: parsed.slides || [],
+        game_sessions: parsed.game_sessions || [],
+        players: parsed.players || [],
+        player_jokers: parsed.player_jokers || [],
+        answers: parsed.answers || [],
+      };
     } catch {
-      // ignore invalid json
+      // ignore
     }
   }
 
@@ -66,7 +117,7 @@ function getInitialDemoDb(): DemoDatabase {
         order_index: 0,
         slide_image_url: null,
         slide_type: 'theme_intro',
-        question_text: '1. sklop: Film in Pop Kultura — Tukaj lahko aktivirate svojega Jokerja za dvojne točke v tej temi!',
+        question_text: '1. sklop: Film in Pop Kultura — Čas za aktivacijo Jokerja na vaših telefonih!',
         options: { A: '', B: '', C: '', D: '' },
         correct_answer: '',
         points: 0,
@@ -127,6 +178,9 @@ function getInitialDemoDb(): DemoDatabase {
       },
     ],
     game_sessions: [],
+    players: [],
+    player_jokers: [],
+    answers: [],
   };
 
   localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(initial));
@@ -149,6 +203,10 @@ function normalizeOptions(raw: unknown): SlideOptions {
   }
   return { A: '', B: '', C: '', D: '' };
 }
+
+// -----------------------------------------------------------------------------
+// KVIZI & TEMATIKE
+// -----------------------------------------------------------------------------
 
 export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]> {
   const supabase = getSupabaseClient();
@@ -258,7 +316,6 @@ export async function createQuiz(
 
   if (error) throw error;
 
-  // Samodejno ustvari 1. tematiko in začetni 'theme_intro' slajd za Jokerja
   const { data: theme } = await supabase
     .from('themes')
     .insert({
@@ -612,7 +669,6 @@ export async function uploadSlideImage(
 ): Promise<string> {
   const supabase = getSupabaseClient();
   if (!supabase) {
-    // V Demo načinu pretvorimo sliko v Data URL za takojšnji predogled
     return await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
@@ -637,18 +693,21 @@ export async function uploadSlideImage(
   return data.publicUrl;
 }
 
+// -----------------------------------------------------------------------------
+// LIVE GAME SESSIONS, PRESENTATION & CONTROLLER
+// -----------------------------------------------------------------------------
+
+/**
+ * Ustvari novo živo sejo s 4-mestno številčno kodo ('room_code') in statusom 'lobby'.
+ */
 export async function createLiveGameSession(quizId: string): Promise<GameSession> {
-  const generateRoomCode = () => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let code = '';
-    for (let i = 0; i < 4; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return code;
+  const generateNumericRoomCode = () => {
+    // 4-mestna številčna koda med 1000 in 9999
+    return String(Math.floor(1000 + Math.random() * 9000));
   };
 
   const supabase = getSupabaseClient();
-  const roomCode = generateRoomCode();
+  const roomCode = generateNumericRoomCode();
 
   if (!supabase) {
     const db = getInitialDemoDb();
@@ -676,6 +735,7 @@ export async function createLiveGameSession(quizId: string): Promise<GameSession
     };
     db.game_sessions.unshift(session);
     saveDemoDb(db);
+    notifyDemoUpdate('SESSION_CREATED', session.id);
     return session;
   }
 
@@ -718,4 +778,341 @@ export async function createLiveGameSession(quizId: string): Promise<GameSession
 
   if (error) throw error;
   return data as GameSession;
+}
+
+export async function fetchGameSession(sessionId: string): Promise<GameSession | null> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    return db.game_sessions.find((s) => s.id === sessionId) || null;
+  }
+
+  const { data, error } = await supabase
+    .from('game_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .single();
+
+  if (error) return null;
+  return data as GameSession;
+}
+
+export async function fetchPresentationData(sessionId: string): Promise<PresentationData> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const session = db.game_sessions.find((s) => s.id === sessionId);
+    if (!session) throw new Error('Seja ne obstaja.');
+
+    const quiz = db.quizzes.find((q) => q.id === session.quiz_id);
+    if (!quiz) throw new Error('Kviz te seje ne obstaja.');
+
+    const themes = db.themes
+      .filter((t) => t.quiz_id === quiz.id)
+      .sort((a, b) => a.order_index - b.order_index);
+
+    const slidesByTheme: Record<string, Slide[]> = {};
+    for (const t of themes) {
+      slidesByTheme[t.id] = db.slides
+        .filter((s) => s.theme_id === t.id)
+        .sort((a, b) => a.order_index - b.order_index)
+        .map((s) => ({
+          ...s,
+          options: normalizeOptions(s.options),
+          points: Number(s.points ?? 1),
+          timer_seconds: Number(s.timer_seconds ?? 0),
+        }));
+    }
+
+    const currentTheme = themes.find((t) => t.id === session.current_theme_id) || themes[0] || null;
+    const currentThemeSlides = currentTheme ? slidesByTheme[currentTheme.id] || [] : [];
+    const currentSlide =
+      currentThemeSlides.find((s) => s.id === session.current_slide_id) ||
+      currentThemeSlides[0] ||
+      null;
+
+    const players = db.players
+      .filter((p) => p.session_id === sessionId)
+      .sort((a, b) => b.total_score - a.total_score);
+
+    const playerJokers = db.player_jokers.filter((pj) => pj.session_id === sessionId);
+    const answers = db.answers.filter((a) => a.session_id === sessionId);
+
+    return {
+      session,
+      quiz,
+      themes,
+      slidesByTheme,
+      currentTheme,
+      currentSlide,
+      players,
+      playerJokers,
+      answers,
+    };
+  }
+
+  // Supabase klic
+  const { data: session, error: sErr } = await supabase
+    .from('game_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .single();
+
+  if (sErr || !session) throw sErr || new Error('Seja ni bila najdena.');
+
+  const { data: quiz, error: qErr } = await supabase
+    .from('quizzes')
+    .select('*')
+    .eq('id', session.quiz_id)
+    .single();
+
+  if (qErr || !quiz) throw qErr || new Error('Kviz ni bil najden.');
+
+  const { data: themesData, error: tErr } = await supabase
+    .from('themes')
+    .select('*')
+    .eq('quiz_id', quiz.id)
+    .order('order_index', { ascending: true });
+
+  if (tErr) throw tErr;
+  const themes = (themesData || []) as Theme[];
+
+  const slidesByTheme: Record<string, Slide[]> = {};
+  for (const t of themes) {
+    slidesByTheme[t.id] = [];
+  }
+
+  if (themes.length > 0) {
+    const themeIds = themes.map((t) => t.id);
+    const { data: slidesData } = await supabase
+      .from('slides')
+      .select('*')
+      .in('theme_id', themeIds)
+      .order('order_index', { ascending: true });
+
+    for (const raw of slidesData || []) {
+      const slide: Slide = {
+        id: raw.id,
+        theme_id: raw.theme_id,
+        order_index: raw.order_index,
+        slide_image_url: raw.slide_image_url,
+        slide_type: raw.slide_type as SlideType,
+        question_text: raw.question_text || '',
+        options: normalizeOptions(raw.options),
+        correct_answer: raw.correct_answer || '',
+        points: Number(raw.points ?? 1),
+        timer_seconds: Number(raw.timer_seconds ?? 0),
+      };
+      if (!slidesByTheme[slide.theme_id]) slidesByTheme[slide.theme_id] = [];
+      slidesByTheme[slide.theme_id].push(slide);
+    }
+  }
+
+  const currentTheme = themes.find((t) => t.id === session.current_theme_id) || themes[0] || null;
+  const currentThemeSlides = currentTheme ? slidesByTheme[currentTheme.id] || [] : [];
+  const currentSlide =
+    currentThemeSlides.find((s) => s.id === session.current_slide_id) ||
+    currentThemeSlides[0] ||
+    null;
+
+  const { data: playersData } = await supabase
+    .from('players')
+    .select('*')
+    .eq('session_id', sessionId)
+    .order('total_score', { ascending: false });
+
+  const { data: jokersData } = await supabase
+    .from('player_jokers')
+    .select('*')
+    .eq('session_id', sessionId);
+
+  const { data: answersData } = await supabase
+    .from('answers')
+    .select('*')
+    .eq('session_id', sessionId);
+
+  return {
+    session: session as GameSession,
+    quiz: quiz as Quiz,
+    themes,
+    slidesByTheme,
+    currentTheme,
+    currentSlide,
+    players: (playersData || []) as Player[],
+    playerJokers: (jokersData || []) as PlayerJoker[],
+    answers: (answersData || []) as Answer[],
+  };
+}
+
+export async function updateGameSession(
+  sessionId: string,
+  updates: Partial<Omit<GameSession, 'id' | 'room_code' | 'quiz_id'>>
+): Promise<GameSession> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const idx = db.game_sessions.findIndex((s) => s.id === sessionId);
+    if (idx === -1) throw new Error('Seja ne obstaja.');
+    db.game_sessions[idx] = { ...db.game_sessions[idx], ...updates };
+    saveDemoDb(db);
+    notifyDemoUpdate('SESSION_UPDATED', sessionId);
+    return db.game_sessions[idx];
+  }
+
+  const { data, error } = await supabase
+    .from('game_sessions')
+    .update(updates)
+    .eq('id', sessionId)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data as GameSession;
+}
+
+export async function addDemoPlayer(
+  sessionId: string,
+  nickname: string
+): Promise<Player> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const newPlayer: Player = {
+      id: crypto.randomUUID(),
+      session_id: sessionId,
+      nickname,
+      reconnect_token: crypto.randomUUID(),
+      total_score: 0,
+      jokers_remaining: 1,
+      created_at: new Date().toISOString(),
+    };
+    db.players.push(newPlayer);
+    saveDemoDb(db);
+    notifyDemoUpdate('PLAYERS_UPDATED', sessionId);
+    return newPlayer;
+  }
+
+  const { data, error } = await supabase
+    .from('players')
+    .insert({
+      session_id: sessionId,
+      nickname,
+      total_score: 0,
+      jokers_remaining: 1,
+    })
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data as Player;
+}
+
+export async function togglePlayerJoker(
+  sessionId: string,
+  playerId: string,
+  themeId: string
+): Promise<boolean> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const idx = db.player_jokers.findIndex(
+      (pj) => pj.session_id === sessionId && pj.player_id === playerId && pj.theme_id === themeId
+    );
+    let active = false;
+    if (idx >= 0) {
+      db.player_jokers.splice(idx, 1);
+      active = false;
+    } else {
+      db.player_jokers.push({
+        id: crypto.randomUUID(),
+        session_id: sessionId,
+        player_id: playerId,
+        theme_id: themeId,
+        created_at: new Date().toISOString(),
+      });
+      active = true;
+    }
+    saveDemoDb(db);
+    notifyDemoUpdate('JOKER_UPDATED', sessionId);
+    return active;
+  }
+
+  const { data: existing } = await supabase
+    .from('player_jokers')
+    .select('id')
+    .eq('session_id', sessionId)
+    .eq('player_id', playerId)
+    .eq('theme_id', themeId)
+    .maybeSingle();
+
+  if (existing) {
+    await supabase.from('player_jokers').delete().eq('id', existing.id);
+    return false;
+  } else {
+    await supabase.from('player_jokers').insert({
+      session_id: sessionId,
+      player_id: playerId,
+      theme_id: themeId,
+    });
+    return true;
+  }
+}
+
+export async function submitDemoAnswer(
+  sessionId: string,
+  playerId: string,
+  themeId: string,
+  slideId: string,
+  answerText: string,
+  isCorrect: boolean = false,
+  awardedPoints: number = 0
+): Promise<Answer> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    const db = getInitialDemoDb();
+    const existingIdx = db.answers.findIndex(
+      (a) => a.session_id === sessionId && a.player_id === playerId && a.slide_id === slideId
+    );
+    const ans: Answer = {
+      id: existingIdx >= 0 ? db.answers[existingIdx].id : crypto.randomUUID(),
+      session_id: sessionId,
+      player_id: playerId,
+      theme_id: themeId,
+      slide_id: slideId,
+      answer_text: answerText,
+      is_correct: isCorrect,
+      awarded_points: awardedPoints,
+      graded: true,
+      created_at: new Date().toISOString(),
+    };
+    if (existingIdx >= 0) {
+      db.answers[existingIdx] = ans;
+    } else {
+      db.answers.push(ans);
+    }
+    saveDemoDb(db);
+    notifyDemoUpdate('ANSWERS_UPDATED', sessionId);
+    return ans;
+  }
+
+  const { data, error } = await supabase
+    .from('answers')
+    .upsert(
+      {
+        session_id: sessionId,
+        player_id: playerId,
+        theme_id: themeId,
+        slide_id: slideId,
+        answer_text: answerText,
+        is_correct: isCorrect,
+        awarded_points: awardedPoints,
+        graded: true,
+      },
+      { onConflict: 'session_id,player_id,slide_id' }
+    )
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data as Answer;
 }

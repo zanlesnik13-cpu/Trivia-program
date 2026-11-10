@@ -8,6 +8,8 @@ import {
 } from 'lucide-react';
 import { HostAuth } from './components/HostAuth';
 import { HostDashboard } from './components/HostDashboard';
+import { HostRemoteController } from './components/HostRemoteController';
+import { PresentationView } from './components/PresentationView';
 import { QuizBuilder } from './components/QuizBuilder';
 import { SupabaseSetupModal } from './components/SupabaseSetupModal';
 import { getSupabaseClient, getSupabaseConfig } from './lib/supabase';
@@ -18,6 +20,31 @@ interface HostUser {
   isDemo?: boolean;
 }
 
+type RouteState =
+  | { view: 'dashboard'; sessionId?: null }
+  | { view: 'present'; sessionId: string }
+  | { view: 'host_remote'; sessionId: string };
+
+function parseCurrentRoute(): RouteState {
+  if (typeof window === 'undefined') return { view: 'dashboard' };
+  const path = window.location.pathname;
+  const hash = window.location.hash;
+
+  // Preveri /present/:sessionId ali #/present/:sessionId
+  const presentMatch = path.match(/\/present\/([^/?#]+)/) || hash.match(/#\/present\/([^/?#]+)/);
+  if (presentMatch) {
+    return { view: 'present', sessionId: presentMatch[1] };
+  }
+
+  // Preveri /host/:sessionId ali #/host/:sessionId
+  const hostMatch = path.match(/\/host\/([^/?#]+)/) || hash.match(/#\/host\/([^/?#]+)/);
+  if (hostMatch) {
+    return { view: 'host_remote', sessionId: hostMatch[1] };
+  }
+
+  return { view: 'dashboard' };
+}
+
 export function App() {
   const [hostUser, setHostUser] = useState<HostUser | null>(null);
   const [editingQuizId, setEditingQuizId] = useState<string | null>(null);
@@ -25,7 +52,27 @@ export function App() {
   const [checkingSession, setCheckingSession] = useState(true);
   const [, setConfigVersion] = useState(0);
 
+  const [route, setRoute] = useState<RouteState>(parseCurrentRoute);
+
   const supabaseConfig = getSupabaseConfig();
+
+  // Poslušaj spremembe URL-ja (popstate)
+  useEffect(() => {
+    const handlePopState = () => {
+      setRoute(parseCurrentRoute());
+    };
+    window.addEventListener('popstate', handlePopState);
+    window.addEventListener('hashchange', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+      window.removeEventListener('hashchange', handlePopState);
+    };
+  }, []);
+
+  const navigateTo = (newPath: string) => {
+    window.history.pushState({}, '', newPath);
+    setRoute(parseCurrentRoute());
+  };
 
   useEffect(() => {
     const checkInitialAuth = async () => {
@@ -63,6 +110,29 @@ export function App() {
     setEditingQuizId(null);
   };
 
+  // Če je uporabnik na pogledu prezentacije (/present/:sessionId), prikaži čisto platno za projektor
+  if (route.view === 'present' && route.sessionId) {
+    return (
+      <PresentationView
+        sessionId={route.sessionId}
+        onExit={() => navigateTo('/')}
+      />
+    );
+  }
+
+  // Če je uporabnik na pogledu daljinca za telefon (/host/:sessionId)
+  if (route.view === 'host_remote' && route.sessionId) {
+    return (
+      <HostRemoteController
+        sessionId={route.sessionId}
+        onExit={() => navigateTo('/')}
+        onOpenPresentation={() => {
+          window.open(`/present/${route.sessionId}`, '_blank');
+        }}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 relative overflow-x-hidden">
       {/* Ambientni neon sij v ozadju (Indigo & Emerald) */}
@@ -92,11 +162,11 @@ export function App() {
                   QuizPulse <span className="text-emerald-400">Live</span>
                 </span>
                 <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                  Faza 1 &bull; Host Studio
+                  Faza 2 &bull; Glavni zaslon &amp; Daljinec
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 hidden sm:block">
-                Vodenje pub kviza v živo &bull; PDF Slajdi &amp; Joker Sistem
+                Vodenje pub kviza v živo &bull; Predstavitveni zaslon &amp; Realtime
               </p>
             </div>
           </div>
@@ -169,6 +239,12 @@ export function App() {
             hostEmail={hostUser.email}
             onEditQuiz={(quizId) => setEditingQuizId(quizId)}
             onOpenSqlModal={() => setShowSupabaseModal(true)}
+            onOpenPresentation={(sessionId) => {
+              window.open(`/present/${sessionId}`, '_blank');
+            }}
+            onOpenRemote={(sessionId) => {
+              window.open(`/host/${sessionId}`, '_blank');
+            }}
           />
         )}
       </main>

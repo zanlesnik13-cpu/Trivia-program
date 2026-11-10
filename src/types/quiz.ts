@@ -68,6 +68,7 @@ export interface Player {
   reconnect_token: string;
   total_score: number;
   jokers_remaining: number;
+  created_at?: string;
 }
 
 export interface PlayerJoker {
@@ -75,6 +76,7 @@ export interface PlayerJoker {
   session_id: string;
   player_id: string;
   theme_id: string;
+  created_at?: string;
 }
 
 export interface Answer {
@@ -87,9 +89,22 @@ export interface Answer {
   is_correct: boolean;
   awarded_points: number;
   graded: boolean;
+  created_at?: string;
 }
 
 export interface QuizWithStats extends Quiz {
   theme_count: number;
   slide_count: number;
+}
+
+export interface PresentationData {
+  session: GameSession;
+  quiz: Quiz;
+  themes: Theme[];
+  slidesByTheme: Record<string, Slide[]>;
+  currentTheme: Theme | null;
+  currentSlide: Slide | null;
+  players: Player[];
+  playerJokers: PlayerJoker[];
+  answers: Answer[];
 }

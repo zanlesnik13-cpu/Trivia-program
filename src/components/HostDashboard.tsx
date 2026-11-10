@@ -1,16 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import {
   Calendar,
-  Copy,
   Check,
+  Copy,
   Edit3,
+  ExternalLink,
   FolderKanban,
   Layers,
   Play,
   Plus,
   Radio,
+  Smartphone,
   Sparkles,
   Trash2,
+  Tv,
   X,
 } from 'lucide-react';
 import {
@@ -26,6 +29,8 @@ interface HostDashboardProps {
   hostEmail: string;
   onEditQuiz: (quizId: string) => void;
   onOpenSqlModal: () => void;
+  onOpenPresentation: (sessionId: string) => void;
+  onOpenRemote: (sessionId: string) => void;
 }
 
 export const HostDashboard: React.FC<HostDashboardProps> = ({
@@ -33,6 +38,8 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   hostEmail,
   onEditQuiz,
   onOpenSqlModal,
+  onOpenPresentation,
+  onOpenRemote,
 }) => {
   const [quizzes, setQuizzes] = useState<QuizWithStats[]>([]);
   const [loading, setLoading] = useState(true);
@@ -50,6 +57,7 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
     quizTitle: string;
   } | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const loadQuizzes = async () => {
     setLoading(true);
@@ -120,6 +128,13 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
     await navigator.clipboard.writeText(code);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const handleCopyPlayerLink = async (code: string) => {
+    const link = typeof window !== 'undefined' ? `${window.location.origin}/play?code=${code}` : `https://quizpulse.si/play?code=${code}`;
+    await navigator.clipboard.writeText(link);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2000);
   };
 
   return (
@@ -373,30 +388,36 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
       {/* Modal ob kliku na "Zaženi kviz v živo" */}
       {activeLiveSession && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
-          <div className="w-full max-w-lg bg-slate-900/95 backdrop-blur-xl border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-6 text-center">
-            <div className="w-14 h-14 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 mx-auto">
-              <Radio className="w-7 h-7 animate-pulse" />
+          <div className="w-full max-w-xl bg-slate-900/95 backdrop-blur-xl border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                  <Radio className="w-5 h-5 animate-pulse" />
+                </div>
+                <div>
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
+                    Kviz v živo pripravljen • Status: {activeLiveSession.session.status}
+                  </span>
+                  <h3 className="text-lg font-bold text-slate-100">
+                    {activeLiveSession.quizTitle}
+                  </h3>
+                </div>
+              </div>
+              <button
+                onClick={() => setActiveLiveSession(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="space-y-1.5">
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                Seja v živo ustvarjena (Status: {activeLiveSession.session.status})
-              </span>
-              <h3 className="text-2xl font-bold text-slate-100">
-                {activeLiveSession.quizTitle}
-              </h3>
-              <p className="text-xs text-slate-400">
-                Zapis v tabeli <code className="text-indigo-300">game_sessions</code> je pripravljen
-                s 4-mestno kodo sobe:
-              </p>
-            </div>
-
-            <div className="p-6 rounded-2xl bg-slate-950 border border-slate-800 flex flex-col items-center gap-3">
-              <span className="text-xs uppercase tracking-widest text-slate-400 font-semibold">
+            {/* 4-mestna številčna koda sobe */}
+            <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 flex flex-col items-center gap-2 text-center">
+              <span className="text-[11px] uppercase tracking-widest text-slate-400 font-bold">
                 4-MESTNA KODA SOBE (ROOM CODE)
               </span>
               <div className="flex items-center gap-3">
-                <span className="text-4xl sm:text-5xl font-bold font-mono-code tracking-widest text-emerald-400">
+                <span className="text-5xl font-bold font-mono-code tracking-widest text-emerald-400 drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">
                   {activeLiveSession.session.room_code}
                 </span>
                 <button
@@ -413,17 +434,64 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
                   )}
                 </button>
               </div>
-              <p className="text-xs text-slate-400">
-                ID seje: <code className="text-slate-400">{activeLiveSession.session.id}</code>
-              </p>
+              <button
+                onClick={() => handleCopyPlayerLink(activeLiveSession.session.room_code)}
+                className="text-xs text-indigo-400 hover:text-indigo-300 underline mt-1 cursor-pointer flex items-center gap-1"
+              >
+                {copiedLink ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Povezava za igralce skopirana!</span>
+                  </>
+                ) : (
+                  <>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Kopiraj direktno povezavo za tekmovalce (/play?code=...)</span>
+                  </>
+                )}
+              </button>
             </div>
 
-            <div className="flex items-center justify-center gap-3">
+            {/* DVA GLAVNA GUMBA: 1. Glavni zaslon (Prezentacija) & 2. Daljinec (Telefon) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <button
-                onClick={() => setActiveLiveSession(null)}
-                className="px-6 py-2.5 rounded-xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/25 cursor-pointer"
+                id="open-presentation-screen-btn"
+                onClick={() => {
+                  const sId = activeLiveSession.session.id;
+                  setActiveLiveSession(null);
+                  onOpenPresentation(sId);
+                }}
+                className="flex flex-col items-center justify-center gap-2 p-5 rounded-2xl bg-gradient-to-br from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white shadow-xl shadow-indigo-600/25 border border-indigo-400/30 transition-all cursor-pointer group"
               >
-                V redu, zapri
+                <div className="w-12 h-12 rounded-xl bg-white/10 flex items-center justify-center group-hover:scale-110 transition-transform">
+                  <Tv className="w-6 h-6 text-white" />
+                </div>
+                <div className="text-center">
+                  <span className="block font-bold text-sm">Odpri glavni zaslon</span>
+                  <span className="block text-[11px] text-indigo-200 opacity-80">
+                    Prezentacija za projektor / TV
+                  </span>
+                </div>
+              </button>
+
+              <button
+                id="open-host-remote-btn"
+                onClick={() => {
+                  const sId = activeLiveSession.session.id;
+                  setActiveLiveSession(null);
+                  onOpenRemote(sId);
+                }}
+                className="flex flex-col items-center justify-center gap-2 p-5 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-700 hover:from-emerald-500 hover:to-teal-600 text-white shadow-xl shadow-emerald-600/25 border border-emerald-400/30 transition-all cursor-pointer group"
+              >
+                <div className="w-12 h-12 rounded-xl bg-white/10 flex items-center justify-center group-hover:scale-110 transition-transform">
+                  <Smartphone className="w-6 h-6 text-white" />
+                </div>
+                <div className="text-center">
+                  <span className="block font-bold text-sm">Odpri daljinec za gostitelja</span>
+                  <span className="block text-[11px] text-emerald-200 opacity-80">
+                    Nadzor slajdov in časovnika (Telefon)
+                  </span>
+                </div>
               </button>
             </div>
           </div>
