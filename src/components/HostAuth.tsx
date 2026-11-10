@@ -58,7 +58,27 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           email: email.trim(),
           password,
         });
-        if (signInErr) throw signInErr;
+
+        if (signInErr) {
+          const lower = signInErr.message?.toLowerCase() || '';
+          if (lower.includes('invalid path')) {
+            throw new Error(
+              'Napačen URL Supabase baze (vsebuje neveljavno pot). Preverite, da je URL oblike https://<projekt>.supabase.co in ne povezava do nadzorne plošče.'
+            );
+          }
+          if (lower.includes('email not confirmed')) {
+            throw new Error(
+              'E-poštni naslov še ni potrjen. Preverite svoj nabiralnik ali kliknite spodnji gumb "⚡ Hiter vstop brez prijave" za takojšnji vstop.'
+            );
+          }
+          if (lower.includes('invalid login credentials')) {
+            throw new Error(
+              'Napačen e-poštni naslov ali geslo. Če še nimate računa, izberite zavihek "Registracija" ali kliknite "⚡ Hiter vstop brez prijave".'
+            );
+          }
+          throw signInErr;
+        }
+
         if (data.user) {
           onAuthenticated({
             id: data.user.id,
@@ -66,11 +86,21 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           });
         }
       } else {
+        // Registracija brez neveljavnega options.emailRedirectTo
         const { data, error: signUpErr } = await supabase.auth.signUp({
           email: email.trim(),
           password,
         });
-        if (signUpErr) throw signUpErr;
+
+        if (signUpErr) {
+          const lower = signUpErr.message?.toLowerCase() || '';
+          if (lower.includes('invalid path')) {
+            throw new Error(
+              'Napačen URL Supabase baze (vsebuje neveljavno pot). Preverite, da je URL oblike https://<projekt>.supabase.co in ne povezava do nadzorne plošče.'
+            );
+          }
+          throw signUpErr;
+        }
 
         if (data.user && data.session) {
           onAuthenticated({
@@ -79,7 +109,7 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           });
         } else {
           setSuccessMsg(
-            'Registracija uspešna! Če imate v Supabase vklopljeno potrditev e-pošte, preverite svoj nabiralnik, sicer se lahko prijavite.'
+            'Registracija uspešna! Če imate v Supabase vklopljeno potrditev e-pošte, preverite svoj nabiralnik ali kliknite spodnji gumb "⚡ Hiter vstop brez prijave" za takojšnji vstop.'
           );
           setMode('login');
         }
@@ -96,8 +126,8 @@ export const HostAuth: React.FC<HostAuthProps> = ({
   const handleQuickDemoLogin = () => {
     onAuthenticated({
       id: 'demo-host',
-      email: 'gostitelj@quizpulse.si',
-      isDemo: !isConfigured,
+      email: email.trim() || 'gostitelj@quizpulse.si',
+      isDemo: true,
     });
   };
 
@@ -237,32 +267,46 @@ export const HostAuth: React.FC<HostAuthProps> = ({
             </button>
           </form>
 
-          {/* Status Supabase povezave & Hiter preizkus */}
+          {/* Ločilna črta z "ALI" */}
+          <div className="relative flex items-center justify-center my-1">
+            <div className="border-t border-slate-800 w-full" />
+            <span className="bg-slate-900 px-3 text-[11px] uppercase tracking-wider text-slate-500 font-bold shrink-0">
+              ali
+            </span>
+            <div className="border-t border-slate-800 w-full" />
+          </div>
+
+          {/* Gumb za hiter vstop brez prijave (vedno na voljo) */}
+          <div className="space-y-2">
+            <button
+              id="quick-demo-login-btn"
+              type="button"
+              onClick={handleQuickDemoLogin}
+              className="w-full py-3 px-4 rounded-xl text-xs sm:text-sm font-bold bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/35 text-emerald-300 hover:text-emerald-200 flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/10 transition-all cursor-pointer group"
+            >
+              <Zap className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
+              <span>⚡ Hiter vstop brez prijave (Demo / Lokalni gostitelj)</span>
+            </button>
+            <p className="text-[11px] text-center text-slate-400 leading-tight">
+              Takojšen vstop v nadzorno ploščo za ustvarjanje kvizov in vodenje seje tudi brez registracije.
+            </p>
+          </div>
+
+          {/* Status Supabase povezave & Nastavitve */}
           <div className="pt-4 border-t border-slate-800/80 space-y-3">
             {!isConfigured ? (
-              <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-amber-300 flex items-center gap-1.5">
-                    <Database className="w-3.5 h-3.5" />
-                    Supabase ključa še nista nastavljena
-                  </span>
-                  <button
-                    id="open-supabase-setup-from-auth-btn"
-                    type="button"
-                    onClick={onOpenSupabaseModal}
-                    className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
-                  >
-                    Nastavi &amp; SQL
-                  </button>
-                </div>
+              <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 flex items-center justify-between">
+                <span className="text-xs font-medium text-amber-300 flex items-center gap-1.5">
+                  <Database className="w-3.5 h-3.5" />
+                  Supabase ključa še nista nastavljena
+                </span>
                 <button
-                  id="quick-demo-login-btn"
+                  id="open-supabase-setup-from-auth-btn"
                   type="button"
-                  onClick={handleQuickDemoLogin}
-                  className="w-full py-2.5 px-3 rounded-xl text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 flex items-center justify-center gap-2 transition-all cursor-pointer"
+                  onClick={onOpenSupabaseModal}
+                  className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
                 >
-                  <Zap className="w-3.5 h-3.5" />
-                  <span>Vstopi takoj (Demo gostitelj + preizkus PDF urejevalnika)</span>
+                  Nastavi &amp; SQL
                 </button>
               </div>
             ) : (

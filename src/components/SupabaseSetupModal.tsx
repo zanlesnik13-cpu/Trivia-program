@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import {
+  cleanSupabaseUrl,
   clearSupabaseConfig,
   getSupabaseConfig,
   saveSupabaseConfig,
@@ -45,7 +46,11 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    saveSupabaseConfig(url, anonKey);
+    const cleanedUrl = cleanSupabaseUrl(url);
+    saveSupabaseConfig(cleanedUrl, anonKey);
+    const cleaned = getSupabaseConfig();
+    setUrl(cleaned.url);
+    setAnonKey(cleaned.anonKey);
     setSavedNotice(true);
     setTimeout(() => {
       setSavedNotice(false);
@@ -188,9 +193,13 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
                     type="url"
                     value={url}
                     onChange={(e) => setUrl(e.target.value)}
+                    onBlur={() => url && setUrl(cleanSupabaseUrl(url))}
                     placeholder="https://xyzcompany.supabase.co"
                     className="w-full px-4 py-3 rounded-xl bg-slate-950/90 border border-slate-800 text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 text-sm font-mono-code"
                   />
+                  <p className="text-[11px] text-slate-400 mt-1.5">
+                    ✨ <strong>Samodejno čiščenje:</strong> Če skopirate povezavo iz Supabase Dashboarda ali URL s potjo <code className="text-indigo-300">/rest/v1</code>, bo aplikacija samodejno izluščila čisti <code className="text-emerald-300">https://&lt;id&gt;.supabase.co</code>.
+                  </p>
                 </div>
 
                 <div>
