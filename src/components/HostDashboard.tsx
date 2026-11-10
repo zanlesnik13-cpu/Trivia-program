@@ -33,7 +33,7 @@ import {
   fetchHostActiveSessions,
   fetchHostQuizzes,
 } from '../lib/quizService';
-import { getSupabaseConfig } from '../lib/supabase';
+import { appendSupabaseConfigToUrl, getSupabaseConfig } from '../lib/supabase';
 import type { GameSession, QuizWithStats } from '../types/quiz';
 
 interface HostDashboardProps {
@@ -210,29 +210,30 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   };
 
   const handleCopyPlayerLink = async (code: string) => {
-    const link =
+    const base =
       typeof window !== 'undefined'
         ? `${window.location.origin}/play?code=${code}`
         : `https://trivia-program.vercel.app/play?code=${code}`;
+    const link = appendSupabaseConfigToUrl(base);
     await navigator.clipboard.writeText(link);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
   };
 
   const handleCopyRemoteLink = async (sessionId: string) => {
-    const link =
-      typeof window !== 'undefined'
-        ? `${window.location.origin}/host-remote/${sessionId}`
-        : `https://trivia-program.vercel.app/host-remote/${sessionId}`;
+    const link = getHostRemoteUrl(sessionId);
     await navigator.clipboard.writeText(link);
     setCopiedRemoteLink(true);
     setTimeout(() => setCopiedRemoteLink(false), 2000);
   };
 
-  const getHostRemoteUrl = (sessionId: string) =>
-    typeof window !== 'undefined'
-      ? `${window.location.origin}/host-remote/${sessionId}`
-      : `https://trivia-program.vercel.app/host-remote/${sessionId}`;
+  const getHostRemoteUrl = (sessionId: string) => {
+    const base =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/host-remote/${sessionId}`
+        : `https://trivia-program.vercel.app/host-remote/${sessionId}`;
+    return appendSupabaseConfigToUrl(base);
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -295,38 +296,58 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
         </div>
       </div>
 
-      {/* Opozorilo, če Supabase ni povezan (Demo način) */}
+      {/* Opozorilo, če Supabase ni povezan */}
       {!supabaseConfig.isConfigured && (
-        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs sm:text-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+        <div className="p-5 rounded-2xl bg-rose-500/15 border-2 border-rose-500/50 text-rose-200 text-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xl">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <AlertTriangle className="w-6 h-6 text-rose-400 shrink-0 mt-0.5" />
             <div>
-              <strong className="font-bold text-amber-300">Demo način (lokalni pomnilnik):</strong>{' '}
-              Če želite igro voditi s telefonom prek QR kode na drugi napravi, povežite svojo{' '}
-              <strong>Supabase bazo</strong> (gumb &ldquo;SQL Skripta &amp; Supabase&rdquo;), saj lokalni pomnilnik brskalnika ne prenaša podatkov med računalnikom in telefonom.
+              <strong className="font-bold text-rose-300 block text-base mb-1">
+                ⚠️ Supabase baza NI povezana!
+              </strong>
+              Večnapravna igra (računalnik + telefon) zahteva delujočo Supabase bazo, saj je lokalni pomnilnik izklopljen. Kliknite na{' '}
+              <strong>&ldquo;Nastavi Supabase&rdquo;</strong> in vnesite URL ter Anon Key svoje Supabase baze.
             </div>
           </div>
           <button
             onClick={onOpenSqlModal}
-            className="px-3.5 py-2 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-semibold text-xs shrink-0 cursor-pointer"
+            className="px-4 py-2.5 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer shadow-lg"
           >
             Nastavi Supabase
           </button>
         </div>
       )}
 
+      {/* Velik rdeč okvir za prikaz točne Supabase napake (message + details + hint) */}
       {error && (
-        <div className="p-4 rounded-2xl bg-rose-500/15 border border-rose-500/40 text-rose-200 text-sm flex items-center justify-between gap-4 shadow-lg">
-          <div className="flex items-center gap-3">
-            <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
-            <span>{error}</span>
+        <div className="p-6 rounded-2xl bg-rose-950/90 border-2 border-rose-500 text-rose-100 shadow-2xl shadow-rose-950/60 space-y-3">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-7 h-7 text-rose-400 shrink-0 mt-0.5" />
+              <div className="space-y-2">
+                <h3 className="text-base sm:text-lg font-black text-rose-300 uppercase tracking-wide">
+                  🚨 Napaka pri komunikaciji s Supabase bazo (Postopek ustavljen)
+                </h3>
+                <pre className="text-xs sm:text-sm font-mono-code whitespace-pre-wrap text-rose-100 bg-slate-950/80 border border-rose-500/40 rounded-xl p-4 leading-relaxed">
+                  {error}
+                </pre>
+              </div>
+            </div>
+            <button
+              onClick={() => setError(null)}
+              className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-xs font-bold text-rose-200 shrink-0 cursor-pointer"
+            >
+              Zapri
+            </button>
           </div>
-          <button
-            onClick={() => setError(null)}
-            className="text-xs font-semibold underline hover:text-white shrink-0 cursor-pointer"
-          >
-            Skrij
-          </button>
+          <div className="flex flex-wrap items-center gap-3 pt-1 pl-10">
+            <button
+              onClick={onOpenSqlModal}
+              className="px-4 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs cursor-pointer shadow-md"
+            >
+              Odpri SQL Skripto &amp; Supabase Nastavitve
+            </button>
+          </div>
         </div>
       )}
 
@@ -665,6 +686,14 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
               >
                 <X className="w-5 h-5" />
               </button>
+            </div>
+
+            {/* Zelen indikator o uspešnem zapisu v Supabase oblak */}
+            <div className="px-4 py-3 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs sm:text-sm font-bold flex items-center gap-2.5 shadow-inner">
+              <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>
+                ✅ Seja uspešno zapisana v Supabase oblak (Dosegljiva na vseh napravah)
+              </span>
             </div>
 
             {/* Koda sobe za tekmovalce */}

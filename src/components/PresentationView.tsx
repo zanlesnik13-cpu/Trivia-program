@@ -28,7 +28,7 @@ import {
   fetchPresentationData,
   subscribeToDemoUpdates,
 } from '../lib/quizService';
-import { getSupabaseClient } from '../lib/supabase';
+import { appendSupabaseConfigToUrl, getSupabaseClient } from '../lib/supabase';
 import type { PresentationData } from '../types/quiz';
 
 interface PresentationViewProps {
@@ -317,18 +317,20 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
   if (error || !data) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center space-y-4">
-        <div className="w-14 h-14 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center text-rose-400">
-          <AlertCircle className="w-7 h-7" />
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center space-y-5">
+        <div className="w-16 h-16 rounded-2xl bg-rose-500/20 border-2 border-rose-500/40 flex items-center justify-center text-rose-400">
+          <AlertCircle className="w-8 h-8" />
         </div>
-        <h2 className="text-xl font-bold text-slate-100">Seje ni bilo mogoče naložiti</h2>
-        <p className="text-sm text-slate-400 max-w-md">{error || 'Seja ni bila najdena.'}</p>
+        <h2 className="text-2xl font-black text-rose-300">Seje v Supabase ni bilo mogoče naložiti</h2>
+        <pre className="text-xs sm:text-sm font-mono-code text-rose-100 bg-rose-950/70 border-2 border-rose-500/50 rounded-2xl p-5 max-w-2xl whitespace-pre-wrap text-left">
+          {error || 'Seja ni bila najdena v tabeli game_sessions.'}
+        </pre>
         {onExit && (
           <button
             onClick={onExit}
             className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-semibold cursor-pointer"
           >
-            Nazaj
+            Nazaj na nadzorno ploščo
           </button>
         )}
       </div>
@@ -336,14 +338,18 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   }
 
   const { session, quiz, currentTheme, currentSlide, players } = data;
-  const playerJoinUrl =
+  const rawPlayerJoinUrl =
     typeof window !== 'undefined'
       ? `${window.location.origin}/play?code=${session.room_code}`
       : `https://trivia-program.vercel.app/play?code=${session.room_code}`;
-  const hostRemoteUrl =
+  const playerJoinUrl = appendSupabaseConfigToUrl(rawPlayerJoinUrl);
+
+  const rawHostRemoteUrl =
     typeof window !== 'undefined'
       ? `${window.location.origin}/host-remote/${session.id}`
       : `https://trivia-program.vercel.app/host-remote/${session.id}`;
+  const hostRemoteUrl = appendSupabaseConfigToUrl(rawHostRemoteUrl);
+
   const displayUrl =
     typeof window !== 'undefined' ? `${window.location.host}/play` : 'trivia-program.vercel.app/play';
 
@@ -376,13 +382,16 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             <Radio className="w-5 h-5 animate-pulse text-emerald-400" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-sm sm:text-base font-bold text-slate-100 font-display truncate max-w-[260px] sm:max-w-md">
                 {quiz.title}
               </h1>
               <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
                 V ŽIVO
+              </span>
+              <span className="hidden lg:inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                ✅ Seja uspešno zapisana v Supabase oblak (Dosegljiva na vseh napravah)
               </span>
             </div>
             {currentTheme && session.status !== 'lobby' && (
@@ -461,7 +470,15 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             1. STANJE: LOBBY (Čakalnica pred začetkom)
             =================================================================== */}
         {session.status === 'lobby' && (
-          <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-8 animate-fadeIn">
+          <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 animate-fadeIn">
+            {/* Zelen indikator o uspešnem zapisu v Supabase oblak */}
+            <div className="px-4 py-2.5 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs sm:text-sm font-bold flex items-center gap-2 shadow-lg">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>
+                ✅ Seja uspešno zapisana v Supabase oblak (Dosegljiva na vseh napravah)
+              </span>
+            </div>
+
             {/* Naslov in navodila */}
             <div className="text-center space-y-2">
               <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">

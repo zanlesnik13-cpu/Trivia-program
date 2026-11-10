@@ -312,10 +312,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     e.preventDefault();
     setJoinError(null);
 
-    const cleanCode = roomCodeInput.trim().toUpperCase();
+    const code = roomCodeInput.trim();
     const cleanNick = nicknameInput.trim();
 
-    if (!cleanCode || cleanCode.length < 4) {
+    if (!code || code.length < 4) {
       setJoinError('Prosimo, vnesite veljavno 4-mestno kodo sobe.');
       return;
     }
@@ -327,9 +327,29 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
     setJoining(true);
     try {
-      const session = await findSessionByRoomCode(cleanCode);
-      if (!session) {
-        setJoinError(`Soba s kodo "${cleanCode}" ni bila najdena. Preverite kodo na glavnem zaslonu.`);
+      const supabase = getSupabaseClient();
+      if (!supabase) {
+        setJoinError(
+          'Supabase baza ni povezana na tej napravi! Skenirajte QR kodo z glavnega zaslona, ki samodejno prenese povezavo.'
+        );
+        return;
+      }
+
+      // Eksplicitno poišči sejo v Supabase po 4-mestni kodi
+      const { data: sessionData, error: sessionErr } = await supabase
+        .from('game_sessions')
+        .select('*')
+        .eq('room_code', code.trim())
+        .single();
+
+      const session = sessionData || (await findSessionByRoomCode(code));
+      if (sessionErr || !session) {
+        const errDetails = sessionErr
+          ? ` (${sessionErr.message}${sessionErr.details ? ` — ${sessionErr.details}` : ''})`
+          : '';
+        setJoinError(
+          `Soba s kodo "${code}" ni bila najdena v Supabase tabeli game_sessions${errDetails}. Preverite kodo na glavnem zaslonu.`
+        );
         return;
       }
 

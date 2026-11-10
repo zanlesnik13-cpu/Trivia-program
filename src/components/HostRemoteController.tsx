@@ -69,11 +69,32 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
   const loadData = async () => {
     try {
+      const supabase = getSupabaseClient();
+      if (!supabase) {
+        throw new Error(
+          'Supabase baza ni povezana na tej napravi! Skenirajte QR kodo za daljinec z nadzorne plošče ali iz glavnega zaslona.'
+        );
+      }
+
+      // Eksplicitno preberi sejo direktno iz Supabase baze
+      const { data: sessionRow, error: sessionErr } = await supabase
+        .from('game_sessions')
+        .select('*')
+        .eq('id', sessionId)
+        .single();
+
+      if (sessionErr || !sessionRow) {
+        const msg = sessionErr
+          ? `${sessionErr.message}${sessionErr.details ? ` (${sessionErr.details})` : ''}${sessionErr.hint ? ` — ${sessionErr.hint}` : ''}`
+          : 'Seja v tabeli game_sessions ne obstaja.';
+        throw new Error(`Seja v Supabase bazi ni bila najdena (ID: ${sessionId}):\n${msg}`);
+      }
+
       const presData = await fetchPresentationData(sessionId);
       setData(presData);
       setError(null);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Napaka pri nalaganju seje.');
+      setError(err instanceof Error ? err.message : 'Napaka pri nalaganju seje iz Supabase.');
     } finally {
       setLoading(false);
     }
@@ -529,17 +550,30 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
   if (!data) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center space-y-4">
-        <AlertCircle className="w-10 h-10 text-rose-400" />
-        <p className="text-sm text-rose-300">{error || 'Seje ni bilo mogoče naložiti.'}</p>
-        {onExit && (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center space-y-5">
+        <div className="w-16 h-16 rounded-2xl bg-rose-500/20 border-2 border-rose-500/50 flex items-center justify-center text-rose-400">
+          <AlertCircle className="w-9 h-9" />
+        </div>
+        <h2 className="text-xl font-black text-rose-300">Seje v Supabase ni bilo mogoče naložiti</h2>
+        <pre className="text-xs sm:text-sm font-mono-code text-rose-100 bg-rose-950/80 border-2 border-rose-500/50 rounded-2xl p-4 max-w-lg whitespace-pre-wrap text-left leading-relaxed">
+          {error || 'Seje ni bilo mogoče naložiti iz tabele game_sessions.'}
+        </pre>
+        <div className="flex flex-wrap items-center justify-center gap-3">
           <button
-            onClick={onExit}
-            className="px-5 py-2.5 rounded-xl bg-slate-800 text-slate-200 text-sm font-semibold"
+            onClick={handleManualRefresh}
+            className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold cursor-pointer"
           >
-            Nazaj na nadzorno ploščo
+            Poskusi znova
           </button>
-        )}
+          {onExit && (
+            <button
+              onClick={onExit}
+              className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-semibold cursor-pointer"
+            >
+              Nazaj na nadzorno ploščo
+            </button>
+          )}
+        </div>
       </div>
     );
   }

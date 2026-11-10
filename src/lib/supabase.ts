@@ -53,8 +53,38 @@ export function getSupabaseConfig() {
   const envUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
   const envKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
-  const localUrl = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_URL_KEY) : null;
-  const localKey = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_ANON_KEY) : null;
+  let localUrl = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_URL_KEY) : null;
+  let localKey = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_ANON_KEY) : null;
+
+  // Če uporabnik odpre povezavo prek QR kode na drugi napravi (npr. telefon),
+  // ki ima v URL-ju parametra ?su_url=...&su_key=..., ju samodejno preberi in shrani v localStorage!
+  if (typeof window !== 'undefined') {
+    try {
+      const searchParams = new URLSearchParams(window.location.search);
+      let urlParam = searchParams.get('su_url');
+      let keyParam = searchParams.get('su_key');
+
+      if ((!urlParam || !keyParam) && window.location.hash.includes('?')) {
+        const hashQuery = window.location.hash.split('?')[1];
+        const hashParams = new URLSearchParams(hashQuery);
+        urlParam = urlParam || hashParams.get('su_url');
+        keyParam = keyParam || hashParams.get('su_key');
+      }
+
+      if (urlParam && keyParam) {
+        const cleanedU = cleanSupabaseUrl(urlParam);
+        const cleanedK = cleanSupabaseAnonKey(keyParam);
+        if (cleanedU && cleanedK) {
+          localStorage.setItem(STORAGE_URL_KEY, cleanedU);
+          localStorage.setItem(STORAGE_ANON_KEY, cleanedK);
+          localUrl = cleanedU;
+          localKey = cleanedK;
+        }
+      }
+    } catch {
+      // ignore URL parsing errors
+    }
+  }
 
   const rawUrl = localUrl || envUrl || '';
   const rawKey = localKey || envKey || '';
@@ -70,6 +100,31 @@ export function getSupabaseConfig() {
   );
 
   return { url, anonKey, isConfigured };
+}
+
+/**
+ * Doda su_url in su_key v URL, če na napravi uporabljamo ročno vpisano Supabase povezavo
+ * (da bo telefon ob skeniranju QR kode takoj povezan na isto Supabase bazo!).
+ */
+export function appendSupabaseConfigToUrl(baseUrl: string): string {
+  const { url, anonKey, isConfigured } = getSupabaseConfig();
+  const envUrl = cleanSupabaseUrl(import.meta.env.VITE_SUPABASE_URL as string | undefined);
+  const envKey = cleanSupabaseAnonKey(import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined);
+
+  // Če že obstajata identična envUrl in envKey iz Vercela, URL-ja ne podaljšujemo po nepotrebnem,
+  // sicer pa varno pripnemo su_url in su_key, da 100% deluje na vseh napravah!
+  if (!isConfigured) return baseUrl;
+  if (envUrl === url && envKey === anonKey) return baseUrl;
+
+  try {
+    const parsed = new URL(baseUrl);
+    parsed.searchParams.set('su_url', url);
+    parsed.searchParams.set('su_key', anonKey);
+    return parsed.toString();
+  } catch {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    return `${baseUrl}${sep}su_url=${encodeURIComponent(url)}&su_key=${encodeURIComponent(anonKey)}`;
+  }
 }
 
 export function saveSupabaseConfig(url: string, anonKey: string) {
@@ -112,4 +167,15 @@ export function getSupabaseClient(): SupabaseClient | null {
   }
   return cachedClient;
 }
+
+export function requireSupabaseClient(): SupabaseClient {
+  const client = getSupabaseClient();
+  if (!client) {
+    throw new Error(
+      'Supabase baza ni povezana! Večnapravna igra zahteva aktivno Supabase povezavo (VITE_SUPABASE_URL in VITE_SUPABASE_ANON_KEY). Kliknite na gumb "Supabase SQL & Nastavitve" v zgornjem meniju in vnesite URL ter Anon Key svoje Supabase baze.'
+    );
+  }
+  return client;
+}
+
 

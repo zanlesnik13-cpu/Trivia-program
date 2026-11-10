@@ -1,6 +1,6 @@
 import { compressImageBlobToDataUrl } from './pdfConverter';
 import { generateSlideSvgDataUrl } from './demoQuiz';
-import { getSupabaseClient } from './supabase';
+import { requireSupabaseClient } from './supabase';
 import type {
   Answer,
   GameSession,
@@ -16,182 +16,40 @@ import type {
   Theme,
 } from '../types/quiz';
 
-const DEMO_STORAGE_KEY = 'trivia_demo_data_v2';
-const DEMO_CHANNEL_NAME = 'trivia_demo_broadcast_channel';
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-// BroadcastChannel za medsebojno komunikacijo med zavihki v Demo načinu
-let demoBroadcastChannel: BroadcastChannel | null = null;
-if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-  demoBroadcastChannel = new BroadcastChannel(DEMO_CHANNEL_NAME);
+export function isValidUuid(val: string | undefined | null): boolean {
+  if (!val || typeof val !== 'string') return false;
+  return UUID_REGEX.test(val.trim());
 }
 
-export function subscribeToDemoUpdates(callback: (event: { type: string; sessionId?: string }) => void) {
-  if (!demoBroadcastChannel) return () => {};
-  const handler = (e: MessageEvent) => {
-    if (e.data) callback(e.data);
-  };
-  demoBroadcastChannel.addEventListener('message', handler);
-  return () => {
-    demoBroadcastChannel?.removeEventListener('message', handler);
-  };
+export function ensureValidUuid(val?: string | null): string {
+  if (val && isValidUuid(val)) {
+    return val.trim();
+  }
+  return crypto.randomUUID();
 }
 
-function notifyDemoUpdate(type: string, sessionId?: string) {
-  if (demoBroadcastChannel) {
-    demoBroadcastChannel.postMessage({ type, sessionId });
+export function getValidUuidHostId(rawHostId?: string): string {
+  if (rawHostId && isValidUuid(rawHostId)) {
+    return rawHostId.trim();
   }
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('trivia_demo_local_update', { detail: { type, sessionId } }));
-  }
-}
-
-interface DemoDatabase {
-  quizzes: Quiz[];
-  themes: Theme[];
-  slides: Slide[];
-  game_sessions: GameSession[];
-  players: Player[];
-  player_jokers: PlayerJoker[];
-  answers: Answer[];
-}
-
-function getInitialDemoDb(): DemoDatabase {
-  if (typeof window === 'undefined') {
-    return {
-      quizzes: [],
-      themes: [],
-      slides: [],
-      game_sessions: [],
-      players: [],
-      player_jokers: [],
-      answers: [],
-    };
-  }
-  const raw = localStorage.getItem(DEMO_STORAGE_KEY);
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw) as Partial<DemoDatabase>;
-      return {
-        quizzes: parsed.quizzes || [],
-        themes: parsed.themes || [],
-        slides: parsed.slides || [],
-        game_sessions: parsed.game_sessions || [],
-        players: parsed.players || [],
-        player_jokers: parsed.player_jokers || [],
-        answers: parsed.answers || [],
-      };
-    } catch {
-      // ignore
+    const stored = localStorage.getItem('guest_host_id');
+    if (stored && isValidUuid(stored)) {
+      return stored.trim();
     }
   }
-
-  const quizId = crypto.randomUUID();
-  const theme1Id = crypto.randomUUID();
-  const theme2Id = crypto.randomUUID();
-
-  const initial: DemoDatabase = {
-    quizzes: [
-      {
-        id: quizId,
-        host_id: 'demo-host',
-        title: 'Veliki Petkov Pub Kviz #14',
-        max_jokers_per_player: 1,
-        created_at: new Date().toISOString(),
-      },
-    ],
-    themes: [
-      {
-        id: theme1Id,
-        quiz_id: quizId,
-        title: '1. sklop: Film in Pop Kultura',
-        order_index: 0,
-      },
-      {
-        id: theme2Id,
-        quiz_id: quizId,
-        title: '2. sklop: Zgodovina in Geografija',
-        order_index: 1,
-      },
-    ],
-    slides: [
-      {
-        id: crypto.randomUUID(),
-        theme_id: theme1Id,
-        order_index: 0,
-        slide_image_url: null,
-        slide_type: 'theme_intro',
-        question_text: '1. sklop: Film in Pop Kultura — Čas za aktivacijo Jokerja na vaših telefonih!',
-        options: { A: '', B: '', C: '', D: '' },
-        correct_answer: '',
-        points: 0,
-        timer_seconds: 0,
-      },
-      {
-        id: crypto.randomUUID(),
-        theme_id: theme1Id,
-        order_index: 1,
-        slide_image_url: null,
-        slide_type: 'multiple_choice',
-        question_text: 'Kateri režiser je posnel filmsko trilogijo Gospodar prstanov?',
-        options: {
-          A: 'Christopher Nolan',
-          B: 'Peter Jackson',
-          C: 'Steven Spielberg',
-          D: 'Denis Villeneuve',
-        },
-        correct_answer: 'B',
-        points: 1,
-        timer_seconds: 30,
-      },
-      {
-        id: crypto.randomUUID(),
-        theme_id: theme1Id,
-        order_index: 2,
-        slide_image_url: null,
-        slide_type: 'closest_number',
-        question_text: 'Katerega leta je bil v kinematografih prvič predvajan film Matrix?',
-        options: { A: '', B: '', C: '', D: '' },
-        correct_answer: '1999',
-        points: 2,
-        timer_seconds: 25,
-      },
-      {
-        id: crypto.randomUUID(),
-        theme_id: theme2Id,
-        order_index: 0,
-        slide_image_url: null,
-        slide_type: 'theme_intro',
-        question_text: '2. sklop: Zgodovina in Geografija — Čas za aktivacijo Jokerja!',
-        options: { A: '', B: '', C: '', D: '' },
-        correct_answer: '',
-        points: 0,
-        timer_seconds: 0,
-      },
-      {
-        id: crypto.randomUUID(),
-        theme_id: theme2Id,
-        order_index: 1,
-        slide_image_url: null,
-        slide_type: 'open_text',
-        question_text: 'Katero glavno mesto leži ob reki Ljubljanici?',
-        options: { A: '', B: '', C: '', D: '' },
-        correct_answer: 'Ljubljana',
-        points: 1,
-        timer_seconds: 30,
-      },
-    ],
-    game_sessions: [],
-    players: [],
-    player_jokers: [],
-    answers: [],
-  };
-
-  localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(initial));
-  return initial;
+  const newUuid = crypto.randomUUID();
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('guest_host_id', newUuid);
+  }
+  return newUuid;
 }
 
-function saveDemoDb(db: DemoDatabase) {
-  localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(db));
+// Ohranjamo prazno naročnino zaradi kompatibilnosti uvozov v komponentah
+export function subscribeToDemoUpdates(_callback: (event: { type: string; sessionId?: string }) => void) {
+  return () => {};
 }
 
 function normalizeOptions(raw: unknown): SlideOptions {
@@ -207,313 +65,280 @@ function normalizeOptions(raw: unknown): SlideOptions {
   return { A: '', B: '', C: '', D: '' };
 }
 
-// -----------------------------------------------------------------------------
-// KVIZI & TEMATIKE
-// -----------------------------------------------------------------------------
-
-function formatSupabaseError(err: unknown, context: string): Error {
+/**
+ * Izpiše podrobno Supabase napako z vsemi zahtevanimi polji:
+ * error.message + error.details + error.hint + error.code
+ */
+export function formatSupabaseError(err: unknown, context: string): Error {
   if (err && typeof err === 'object') {
     const obj = err as { code?: string; message?: string; details?: string; hint?: string };
-    const code = obj.code ? ` [${obj.code}]` : '';
-    const msg = obj.message || 'Neznana napaka.';
-    const details = obj.details ? ` (${obj.details})` : '';
+    const codeStr = obj.code ? `[Koda: ${obj.code}] ` : '';
+    const msgStr = obj.message || 'Neznana Supabase napaka.';
+    const detailsStr = obj.details ? `\n• Podrobnosti (details): ${obj.details}` : '';
+    const hintStr = obj.hint ? `\n• Namig (hint): ${obj.hint}` : '';
 
-    // Če gre za napako foreign key na quizzes_host_id_fkey ali RLS (42501 / 23503)
-    if (obj.code === '23503' && msg.includes('quizzes_host_id_fkey')) {
-      return new Error(
-        `${context}: Tabela "quizzes" ima še vedno staro omejitev na auth.users. Odprite "SQL Skripta & Supabase" in v Supabase SQL Editorju poženite kratko popravljalno SQL skripto! (${msg})`
-      );
+    let extraHelp = '';
+    if (obj.code === '23503' && msgStr.includes('quizzes_host_id_fkey')) {
+      extraHelp =
+        '\n• REŠITEV: Tabela "quizzes" ima še vedno staro omejitev FOREIGN KEY na auth.users. Odprite "SQL Skripta & Supabase" v zgornjem meniju in v Supabase SQL Editorju poženite kratko popravljalno SQL skripto!';
+    } else if (obj.code === '42501') {
+      extraHelp =
+        '\n• REŠITEV: Dostop zavrnjen zaradi RLS politik (Row Level Security). Odprite "SQL Skripta & Supabase" in v Supabase SQL Editorju poženite kratko popravljalno SQL skripto za izklop RLS!';
+    } else if (obj.code === '22P02') {
+      extraHelp =
+        '\n• REŠITEV: Neveljaven UUID format v enem izmed ID polj (invalid input syntax for type uuid).';
     }
-    if (obj.code === '42501') {
-      return new Error(
-        `${context}: Zavrnjen dostop zaradi RLS politik${code}. Odprite "SQL Skripta & Supabase" in v Supabase SQL Editorju poženite kratko popravljalno SQL skripto za izklop RLS! (${msg})`
-      );
-    }
-    return new Error(`${context}${code}: ${msg}${details}`);
+
+    return new Error(`${context}\n• Napaka (message): ${codeStr}${msgStr}${detailsStr}${hintStr}${extraHelp}`);
   }
   if (err instanceof Error) return err;
-  return new Error(`${context}: Neznana napaka.`);
+  return new Error(`${context}: Neznana napaka pri komunikaciji s Supabase.`);
 }
 
-function getValidUuidHostId(rawHostId?: string): string {
-  if (rawHostId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawHostId)) {
-    return rawHostId;
-  }
-  if (typeof window !== 'undefined') {
-    const stored = localStorage.getItem('guest_host_id');
-    if (stored && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stored)) {
-      return stored;
-    }
-  }
-  const newUuid = crypto.randomUUID();
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('guest_host_id', newUuid);
-  }
-  return newUuid;
-}
+// -----------------------------------------------------------------------------
+// KVIZI, TEMATIKE IN SLAJDI (100% SUPABASE BREZ LOCALSTORAGE FALLBACKA)
+// -----------------------------------------------------------------------------
 
 /**
  * Shrani celoten kviz (quizzes), njegove tematike (themes) in vse slajde (slides)
- * z operacijo UPSERT neposredno v Supabase bazo (in posodobi lokalni pomnilnik).
+ * z operacijo UPSERT neposredno v Supabase bazo.
+ * Vsi ID-ji so zagotovljeno veljavni UUID-ji, poslani so samo stolpci iz SQL sheme.
  */
 export async function upsertFullQuiz(
   quiz: Quiz,
   themes: Theme[],
   slidesByTheme: Record<string, Slide[]>,
   hostId?: string
-): Promise<void> {
-  // 1. Posodobi lokalni pomnilnik (localStorage demo bazo)
-  try {
-    const db = getInitialDemoDb();
-    const qIdx = db.quizzes.findIndex((q) => q.id === quiz.id);
-    if (qIdx >= 0) {
-      db.quizzes[qIdx] = { ...quiz };
-    } else {
-      db.quizzes.unshift({ ...quiz });
-    }
+): Promise<Quiz> {
+  const supabase = requireSupabaseClient();
 
-    const remainingThemes = db.themes.filter((t) => t.quiz_id !== quiz.id);
-    db.themes = [...remainingThemes, ...themes];
-
-    const themeIds = new Set(themes.map((t) => t.id));
-    const remainingSlides = db.slides.filter((s) => !themeIds.has(s.theme_id));
-    const allSlides: Slide[] = [];
-    for (const theme of themes) {
-      const tSlides = slidesByTheme[theme.id] || [];
-      tSlides.forEach((s, idx) => {
-        allSlides.push({
-          ...s,
-          theme_id: theme.id,
-          order_index: s.order_index ?? idx,
-        });
-      });
-    }
-    db.slides = [...remainingSlides, ...allSlides];
-    saveDemoDb(db);
-  } catch {
-    // ignoriraj morebitne napake pri dostopu do localStorage
-  }
-
-  // 2. Če je Supabase konfiguriran, izvedi celovit UPSERT vseh tabel
-  const supabase = getSupabaseClient();
-  if (!supabase) return;
-
+  const validQuizId = ensureValidUuid(quiz.id);
   const effectiveHostId = getValidUuidHostId(hostId || quiz.host_id);
 
-  // a) Upsert kviza v tabelo quizzes (id, host_id, title, max_jokers_per_player)
-  const { error: quizErr } = await supabase.from('quizzes').upsert(
-    {
-      id: quiz.id,
-      host_id: effectiveHostId,
-      title: quiz.title,
-      max_jokers_per_player: quiz.max_jokers_per_player ?? 1,
-    },
-    { onConflict: 'id' }
-  );
+  // 1. Upsert v tabelo quizzes — SAMO stolpci iz SQL sheme: id, host_id, title, max_jokers_per_player
+  const { data: savedQuiz, error: quizErr } = await supabase
+    .from('quizzes')
+    .upsert(
+      {
+        id: validQuizId,
+        host_id: effectiveHostId,
+        title: (quiz.title || 'Moj Pub Kviz').trim(),
+        max_jokers_per_player: Number(quiz.max_jokers_per_player ?? 1),
+      },
+      { onConflict: 'id' }
+    )
+    .select('*')
+    .single();
 
-  if (quizErr) {
-    throw formatSupabaseError(quizErr, 'Napaka pri shranjevanju kviza v Supabase tabelo quizzes');
+  if (quizErr || !savedQuiz) {
+    throw formatSupabaseError(quizErr, 'KORAK 1 SPODLETEL — Zapis v tabelo "quizzes"');
   }
 
-  // b) Upsert tematik v tabelo themes (id, quiz_id, title, order_index)
-  if (themes.length > 0) {
-    const { error: themesErr } = await supabase.from('themes').upsert(
-      themes.map((t, idx) => ({
-        id: t.id,
-        quiz_id: quiz.id,
-        title: t.title,
-        order_index: t.order_index ?? idx,
-      })),
-      { onConflict: 'id' }
-    );
+  // Pripravi preslikavo starih theme.id v veljavne UUID-je
+  const themeIdMap = new Map<string, string>();
+  const cleanThemesPayload = themes.map((t, idx) => {
+    const cleanThemeId = ensureValidUuid(t.id);
+    themeIdMap.set(t.id, cleanThemeId);
+    return {
+      id: cleanThemeId,
+      quiz_id: validQuizId,
+      title: (t.title || `${idx + 1}. sklop`).trim(),
+      order_index: typeof t.order_index === 'number' ? t.order_index : idx,
+    };
+  });
+
+  // 2. Upsert v tabelo themes — SAMO stolpci iz SQL sheme: id, quiz_id, title, order_index
+  if (cleanThemesPayload.length > 0) {
+    const { error: themesErr } = await supabase
+      .from('themes')
+      .upsert(cleanThemesPayload, { onConflict: 'id' });
 
     if (themesErr) {
-      throw formatSupabaseError(themesErr, 'Napaka pri shranjevanju tematik v Supabase tabelo themes');
+      throw formatSupabaseError(themesErr, 'KORAK 2 SPODLETEL — Zapis tematik v tabelo "themes"');
     }
   }
 
-  // c) Upsert vseh slajdov v tabelo slides (id, theme_id, order_index, slide_image_url, slide_type, question_text, options, correct_answer, points, timer_seconds)
-  const allSlidesToUpsert: Slide[] = [];
+  // 3. Upsert v tabelo slides — SAMO stolpci iz SQL sheme:
+  // id, theme_id, order_index, slide_image_url, slide_type, question_text, options, correct_answer, points, timer_seconds
+  const cleanSlidesPayload: Array<{
+    id: string;
+    theme_id: string;
+    order_index: number;
+    slide_image_url: string | null;
+    slide_type: SlideType;
+    question_text: string;
+    options: SlideOptions;
+    correct_answer: string;
+    points: number;
+    timer_seconds: number;
+  }> = [];
+
   for (const theme of themes) {
+    const cleanThemeId = themeIdMap.get(theme.id) || ensureValidUuid(theme.id);
     const tSlides = slidesByTheme[theme.id] || [];
     tSlides.forEach((s, idx) => {
-      allSlidesToUpsert.push({
-        ...s,
-        theme_id: theme.id,
-        order_index: s.order_index ?? idx,
+      const cleanSlideId = ensureValidUuid(s.id);
+      const slideType: SlideType = s.slide_type || 'multiple_choice';
+      cleanSlidesPayload.push({
+        id: cleanSlideId,
+        theme_id: cleanThemeId,
+        order_index: typeof s.order_index === 'number' ? s.order_index : idx,
+        slide_image_url: s.slide_image_url ?? null,
+        slide_type: slideType,
+        question_text: s.question_text ?? '',
+        options: normalizeOptions(s.options),
+        correct_answer: s.correct_answer ?? '',
+        points: Number(
+          s.points ?? (slideType === 'theme_intro' || slideType === 'info_only' ? 0 : 1)
+        ),
+        timer_seconds: Number(s.timer_seconds ?? 0),
       });
     });
   }
 
-  if (allSlidesToUpsert.length > 0) {
-    const { error: slidesErr } = await supabase.from('slides').upsert(
-      allSlidesToUpsert.map((s) => ({
-        id: s.id,
-        theme_id: s.theme_id,
-        order_index: s.order_index,
-        slide_image_url: s.slide_image_url ?? null,
-        slide_type: s.slide_type,
-        question_text: s.question_text ?? '',
-        options: s.options ?? { A: '', B: '', C: '', D: '' },
-        correct_answer: s.correct_answer ?? '',
-        points: Number(s.points ?? (s.slide_type === 'theme_intro' || s.slide_type === 'info_only' ? 0 : 1)),
-        timer_seconds: Number(s.timer_seconds ?? 0),
-      })),
-      { onConflict: 'id' }
-    );
+  if (cleanSlidesPayload.length > 0) {
+    const { error: slidesErr } = await supabase
+      .from('slides')
+      .upsert(cleanSlidesPayload, { onConflict: 'id' });
 
     if (slidesErr) {
-      throw formatSupabaseError(slidesErr, 'Napaka pri shranjevanju slajdov v Supabase tabelo slides');
+      throw formatSupabaseError(slidesErr, 'KORAK 3 SPODLETEL — Zapis slajdov v tabelo "slides"');
     }
   }
+
+  return savedQuiz as Quiz;
 }
 
 /**
- * Zagotovi, da je celoten kviz (s tematikami in slajdi) prisoten v Supabase bazi,
+ * Preveri, da je kviz s tematikami in slajdi dejansko zapisan v Supabase bazi,
  * preden se v tabeli game_sessions ustvari nova seja.
  */
-export async function ensureQuizSyncedToSupabase(quizId: string, hostId?: string): Promise<void> {
-  const supabase = getSupabaseClient();
-  if (!supabase) return;
+export async function ensureQuizSyncedToSupabase(quizId: string, _hostId?: string): Promise<void> {
+  const supabase = requireSupabaseClient();
 
-  // 1. Preveri lokalni pomnilnik (kjer je npr. privzeti demo kviz "Veliki Petkov Pub Kviz #14" ali lokalno ustvarjen kviz)
-  const db = getInitialDemoDb();
-  const localQuiz = db.quizzes.find((q) => q.id === quizId);
-  const localThemes = db.themes
-    .filter((t) => t.quiz_id === quizId)
-    .sort((a, b) => a.order_index - b.order_index);
-  const localThemeIds = new Set(localThemes.map((t) => t.id));
-  const localSlides = db.slides
-    .filter((s) => localThemeIds.has(s.theme_id))
-    .sort((a, b) => a.order_index - b.order_index);
-
-  if (localQuiz) {
-    const slidesByTheme: Record<string, Slide[]> = {};
-    for (const t of localThemes) {
-      slidesByTheme[t.id] = localSlides
-        .filter((s) => s.theme_id === t.id)
-        .map((s) => {
-          if (!s.slide_image_url) {
-            const isIntro = s.slide_type === 'theme_intro';
-            const imgUrl = generateSlideSvgDataUrl({
-              badge: isIntro ? `${t.title.toUpperCase()} • JOKER` : `VPRAŠANJE #${s.order_index + 1}`,
-              title: s.question_text || (isIntro ? t.title : `Vprašanje #${s.order_index + 1}`),
-              type: s.slide_type,
-              options: s.slide_type === 'multiple_choice' ? s.options : undefined,
-              points: s.points,
-              timerSeconds: s.timer_seconds,
-              accentColor: isIntro ? '#f59e0b' : '#6366f1',
-            });
-            return { ...s, slide_image_url: imgUrl };
-          }
-          return s;
-        });
-    }
-    // Brezpogojno izvedi upsert kviza, tematik in slajdov v Supabase
-    await upsertFullQuiz(localQuiz, localThemes, slidesByTheme, hostId);
-    return;
+  if (!isValidUuid(quizId)) {
+    throw new Error(
+      `Neveljaven UUID format za quiz_id ("${quizId}"). Prosimo, ustvarite nov kviz ali kliknite "🎲 Ustvari Demo Kviz za testiranje".`
+    );
   }
 
-  // 2. Če kviz ni v lokalnem pomnilniku, preveri, ali je že v Supabase bazi
-  const { data: existingInDb, error: checkErr } = await supabase
+  const { data: existingQuiz, error: checkErr } = await supabase
     .from('quizzes')
     .select('id, title')
     .eq('id', quizId)
     .maybeSingle();
 
   if (checkErr) {
-    throw formatSupabaseError(checkErr, 'Napaka pri preverjanju obstoja kviza v Supabase');
+    throw formatSupabaseError(checkErr, 'KORAK 1 SPODLETEL — Preverjanje kviza v tabeli "quizzes"');
   }
 
-  if (!existingInDb) {
+  if (!existingQuiz) {
     throw new Error(
-      `Kviz z ID "${quizId}" ne obstaja v bazi niti v lokalnem pomnilniku. Pred zagonom prosimo shranite kviz.`
+      `Kviz z ID-jem "${quizId}" ne obstaja v Supabase tabeli "quizzes"! Kliknite "🎲 Ustvari Demo Kviz za testiranje" ali ustvarite nov kviz, da se zapiše v Supabase.`
     );
   }
-}
 
-export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    return db.quizzes.map((q) => {
-      const qThemes = db.themes.filter((t) => t.quiz_id === q.id);
-      const themeIds = new Set(qThemes.map((t) => t.id));
-      const qSlides = db.slides.filter((s) => themeIds.has(s.theme_id));
-      return {
-        ...q,
-        theme_count: qThemes.length,
-        slide_count: qSlides.length,
-      };
-    });
+  // Poskrbi tudi, da imajo vsi slajdi tega kviza v Supabase lepo generirano SVG sliko, če še nimajo svoje slike
+  const { data: themesData, error: themesErr } = await supabase
+    .from('themes')
+    .select('*')
+    .eq('quiz_id', quizId)
+    .order('order_index', { ascending: true });
+
+  if (themesErr) {
+    throw formatSupabaseError(themesErr, 'KORAK 2 SPODLETEL — Preverjanje tematik v tabeli "themes"');
   }
 
-  // Poskusi prebrati kvize za tega gostitelja (in morebitne z demo-host)
-  const { data: quizzes, error } = await supabase
-    .from('quizzes')
+  const themes = (themesData || []) as Theme[];
+  if (themes.length === 0) {
+    throw new Error(
+      `Kviz "${existingQuiz.title}" nima nobene tematike v tabeli "themes". Odprite "Uredi kviz" in dodajte vsaj eno tematiko.`
+    );
+  }
+
+  const themeIds = themes.map((t) => t.id);
+  const { data: slidesData, error: slidesErr } = await supabase
+    .from('slides')
     .select('*')
-    .or(`host_id.eq.${hostId},host_id.eq.demo-host`)
-    .order('created_at', { ascending: false });
+    .in('theme_id', themeIds)
+    .order('order_index', { ascending: true });
 
-  if (error) throw formatSupabaseError(error, 'Napaka pri nalaganju kvizov');
+  if (slidesErr) {
+    throw formatSupabaseError(slidesErr, 'KORAK 3 SPODLETEL — Preverjanje slajdov v tabeli "slides"');
+  }
 
-  // Preveri lokalno bazo in sinhroniziraj kvize, ki še niso v Supabase bazi
-  const db = getInitialDemoDb();
-  const existingIds = new Set((quizzes || []).map((q) => q.id));
+  const slides = (slidesData || []) as Slide[];
+  const slidesMissingImages = slides.filter((s) => !s.slide_image_url);
+  if (slidesMissingImages.length > 0) {
+    const themeMap = new Map(themes.map((t) => [t.id, t]));
+    for (const s of slidesMissingImages) {
+      const t = themeMap.get(s.theme_id);
+      const isIntro = s.slide_type === 'theme_intro';
+      const imgUrl = generateSlideSvgDataUrl({
+        badge: isIntro
+          ? `${(t?.title || 'TEMATIKA').toUpperCase()} • JOKER`
+          : `VPRAŠANJE #${s.order_index + 1}`,
+        title: s.question_text || (isIntro ? t?.title || 'Uvod v sklop' : `Vprašanje #${s.order_index + 1}`),
+        type: s.slide_type,
+        options: s.slide_type === 'multiple_choice' ? normalizeOptions(s.options) : undefined,
+        points: Number(s.points ?? 1),
+        timerSeconds: Number(s.timer_seconds ?? 0),
+        accentColor: isIntro ? '#f59e0b' : '#6366f1',
+      });
 
-  for (const lq of db.quizzes) {
-    if (!existingIds.has(lq.id)) {
-      const lThemes = db.themes.filter((t) => t.quiz_id === lq.id);
-      const lSlides = db.slides.filter((s) => lThemes.some((t) => t.id === s.theme_id));
-      const sByTheme: Record<string, Slide[]> = {};
-      for (const t of lThemes) {
-        sByTheme[t.id] = lSlides.filter((s) => s.theme_id === t.id);
-      }
-      try {
-        await upsertFullQuiz(lq, lThemes, sByTheme, hostId);
-      } catch (e) {
-        console.warn('Samodejna sinhronizacija lokalnega kviza v Supabase ni uspela:', e);
+      const { error: updErr } = await supabase
+        .from('slides')
+        .update({ slide_image_url: imgUrl })
+        .eq('id', s.id);
+
+      if (updErr) {
+        throw formatSupabaseError(updErr, 'Napaka pri posodabljanju grafike slajda v tabeli "slides"');
       }
     }
   }
+}
 
-  // Preberi osvežene kvize iz Supabase
-  const { data: refreshedQuizzes } = await supabase
+export async function fetchHostQuizzes(_hostId: string): Promise<QuizWithStats[]> {
+  const supabase = requireSupabaseClient();
+
+  // Preberi vse kvize v Supabase bazi (tako za trenutnega gostitelja kot za gostujoči/demo način)
+  const { data: quizzes, error } = await supabase
     .from('quizzes')
     .select('*')
-    .or(`host_id.eq.${hostId},host_id.eq.demo-host`)
     .order('created_at', { ascending: false });
 
-  const finalQuizzes = (refreshedQuizzes && refreshedQuizzes.length > 0) ? refreshedQuizzes : (quizzes || []);
+  if (error) {
+    throw formatSupabaseError(error, 'Napaka pri branju tabele "quizzes" iz Supabase');
+  }
 
+  const finalQuizzes = (quizzes || []) as Quiz[];
   if (finalQuizzes.length === 0) {
-    return db.quizzes.map((q) => {
-      const qThemes = db.themes.filter((t) => t.quiz_id === q.id);
-      const themeIds = new Set(qThemes.map((t) => t.id));
-      const qSlides = db.slides.filter((s) => themeIds.has(s.theme_id));
-      return {
-        ...q,
-        theme_count: qThemes.length,
-        slide_count: qSlides.length,
-      };
-    });
+    return [];
   }
 
   const quizIds = finalQuizzes.map((q) => q.id);
-  const { data: themes } = await supabase
+  const { data: themes, error: tErr } = await supabase
     .from('themes')
     .select('id, quiz_id')
     .in('quiz_id', quizIds);
+
+  if (tErr) {
+    throw formatSupabaseError(tErr, 'Napaka pri branju tabele "themes" iz Supabase');
+  }
 
   const themeList = themes || [];
   const themeIds = themeList.map((t) => t.id);
 
   let slideList: { id: string; theme_id: string }[] = [];
   if (themeIds.length > 0) {
-    const { data: slides } = await supabase
+    const { data: slides, error: sErr } = await supabase
       .from('slides')
       .select('id, theme_id')
       .in('theme_id', themeIds);
+
+    if (sErr) {
+      throw formatSupabaseError(sErr, 'Napaka pri branju tabele "slides" iz Supabase');
+    }
     slideList = slides || [];
   }
 
@@ -522,7 +347,7 @@ export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]>
     const qThemeIds = new Set(qThemes.map((t) => t.id));
     const qSlides = slideList.filter((s) => qThemeIds.has(s.theme_id));
     return {
-      ...(q as Quiz),
+      ...q,
       theme_count: qThemes.length,
       slide_count: qSlides.length,
     };
@@ -534,57 +359,33 @@ export async function createQuiz(
   title: string,
   maxJokersPerPlayer: number
 ): Promise<Quiz> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const newQuiz: Quiz = {
-      id: crypto.randomUUID(),
-      host_id: hostId,
-      title,
-      max_jokers_per_player: maxJokersPerPlayer,
-      created_at: new Date().toISOString(),
-    };
-    const defaultThemeId = crypto.randomUUID();
-    const defaultTheme: Theme = {
-      id: defaultThemeId,
-      quiz_id: newQuiz.id,
-      title: '1. sklop: Splošno znanje',
-      order_index: 0,
-    };
-    const introSlide: Slide = {
-      id: crypto.randomUUID(),
-      theme_id: defaultThemeId,
-      order_index: 0,
-      slide_image_url: null,
-      slide_type: 'theme_intro',
-      question_text: '1. sklop: Splošno znanje (Predstavitveni slajd teme - Igralci lahko vklopijo Jokerja)',
-      options: { A: '', B: '', C: '', D: '' },
-      correct_answer: '',
-      points: 0,
-      timer_seconds: 0,
-    };
-    db.quizzes.unshift(newQuiz);
-    db.themes.push(defaultTheme);
-    db.slides.push(introSlide);
-    saveDemoDb(db);
-    return newQuiz;
-  }
+  const supabase = requireSupabaseClient();
+  const effectiveHostId = getValidUuidHostId(hostId);
+  const quizId = crypto.randomUUID();
+  const themeId = crypto.randomUUID();
+  const slideId = crypto.randomUUID();
 
+  // 1. Zapis v quizzes (samo veljavni stolpci)
   const { data: quiz, error } = await supabase
     .from('quizzes')
     .insert({
-      host_id: hostId,
-      title,
-      max_jokers_per_player: maxJokersPerPlayer,
+      id: quizId,
+      host_id: effectiveHostId,
+      title: title.trim(),
+      max_jokers_per_player: Number(maxJokersPerPlayer ?? 1),
     })
     .select('*')
     .single();
 
-  if (error) throw formatSupabaseError(error, 'Napaka pri ustvarjanju kviza v Supabase');
+  if (error || !quiz) {
+    throw formatSupabaseError(error, 'Napaka pri ustvarjanju kviza v tabeli "quizzes"');
+  }
 
+  // 2. Zapis uvodne tematike v themes (samo veljavni stolpci)
   const { data: theme, error: themeErr } = await supabase
     .from('themes')
     .insert({
+      id: themeId,
       quiz_id: quiz.id,
       title: '1. sklop: Uvodna tema',
       order_index: 0,
@@ -592,20 +393,34 @@ export async function createQuiz(
     .select('*')
     .single();
 
-  if (themeErr) throw formatSupabaseError(themeErr, 'Napaka pri ustvarjanju uvodne tematike');
+  if (themeErr || !theme) {
+    throw formatSupabaseError(themeErr, 'Napaka pri ustvarjanju uvodne tematike v tabeli "themes"');
+  }
 
-  if (theme) {
-    const { error: slideErr } = await supabase.from('slides').insert({
-      theme_id: theme.id,
-      order_index: 0,
-      slide_type: 'theme_intro',
-      question_text: '1. sklop: Uvodna tema — Pred začetkom sklopa lahko aktivirate Jokerja za dvojne točke!',
-      options: { A: '', B: '', C: '', D: '' },
-      correct_answer: '',
-      points: 0,
-      timer_seconds: 0,
-    });
-    if (slideErr) throw formatSupabaseError(slideErr, 'Napaka pri ustvarjanju uvodnega slajda');
+  // 3. Zapis uvodnega slajda v slides (samo veljavni stolpci)
+  const introSvg = generateSlideSvgDataUrl({
+    badge: '1. SKLOP • JOKER KORAK',
+    title: '1. SKLOP: UVODNA TEMA',
+    subtitle: 'Pred začetkom sklopa lahko na telefonu aktivirate Jokerja za 2x točke!',
+    type: 'theme_intro',
+    accentColor: '#f59e0b',
+  });
+
+  const { error: slideErr } = await supabase.from('slides').insert({
+    id: slideId,
+    theme_id: theme.id,
+    order_index: 0,
+    slide_image_url: introSvg,
+    slide_type: 'theme_intro',
+    question_text: '1. sklop: Uvodna tema — Pred začetkom sklopa lahko aktivirate Jokerja za dvojne točke!',
+    options: { A: '', B: '', C: '', D: '' },
+    correct_answer: '',
+    points: 0,
+    timer_seconds: 0,
+  });
+
+  if (slideErr) {
+    throw formatSupabaseError(slideErr, 'Napaka pri ustvarjanju uvodnega slajda v tabeli "slides"');
   }
 
   return quiz as Quiz;
@@ -615,41 +430,33 @@ export async function updateQuizMeta(
   quizId: string,
   updates: { title?: string; max_jokers_per_player?: number }
 ): Promise<Quiz> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const idx = db.quizzes.findIndex((q) => q.id === quizId);
-    if (idx === -1) throw new Error('Kviz ne obstaja.');
-    db.quizzes[idx] = { ...db.quizzes[idx], ...updates };
-    saveDemoDb(db);
-    return db.quizzes[idx];
+  const supabase = requireSupabaseClient();
+
+  const cleanUpdates: Record<string, unknown> = {};
+  if (updates.title !== undefined) cleanUpdates.title = updates.title.trim();
+  if (updates.max_jokers_per_player !== undefined) {
+    cleanUpdates.max_jokers_per_player = Number(updates.max_jokers_per_player);
   }
 
   const { data, error } = await supabase
     .from('quizzes')
-    .update(updates)
+    .update(cleanUpdates)
     .eq('id', quizId)
     .select('*')
     .single();
 
-  if (error) throw formatSupabaseError(error, 'Napaka pri shranjevanju nastavitev kviza');
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri posodabljanju kviza v tabeli "quizzes"');
+  }
   return data as Quiz;
 }
 
 export async function deleteQuiz(quizId: string): Promise<void> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const themeIds = new Set(db.themes.filter((t) => t.quiz_id === quizId).map((t) => t.id));
-    db.slides = db.slides.filter((s) => !themeIds.has(s.theme_id));
-    db.themes = db.themes.filter((t) => t.quiz_id !== quizId);
-    db.quizzes = db.quizzes.filter((q) => q.id !== quizId);
-    saveDemoDb(db);
-    return;
-  }
-
+  const supabase = requireSupabaseClient();
   const { error } = await supabase.from('quizzes').delete().eq('id', quizId);
-  if (error) throw formatSupabaseError(error, 'Napaka pri brisanju kviza');
+  if (error) {
+    throw formatSupabaseError(error, 'Napaka pri brisanju kviza iz tabele "quizzes"');
+  }
 }
 
 export async function fetchQuizDetails(quizId: string): Promise<{
@@ -657,62 +464,16 @@ export async function fetchQuizDetails(quizId: string): Promise<{
   themes: Theme[];
   slidesByTheme: Record<string, Slide[]>;
 }> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const quiz = db.quizzes.find((q) => q.id === quizId);
-    if (!quiz) throw new Error('Kviz ni bil najden.');
-    const themes = db.themes
-      .filter((t) => t.quiz_id === quizId)
-      .sort((a, b) => a.order_index - b.order_index);
-    const slidesByTheme: Record<string, Slide[]> = {};
-    for (const theme of themes) {
-      slidesByTheme[theme.id] = db.slides
-        .filter((s) => s.theme_id === theme.id)
-        .sort((a, b) => a.order_index - b.order_index)
-        .map((s) => ({
-          ...s,
-          options: normalizeOptions(s.options),
-          points: Number(s.points ?? 1),
-          timer_seconds: Number(s.timer_seconds ?? 0),
-        }));
-    }
-    return { quiz, themes, slidesByTheme };
-  }
+  const supabase = requireSupabaseClient();
 
   const { data: quiz, error: quizErr } = await supabase
     .from('quizzes')
     .select('*')
     .eq('id', quizId)
-    .maybeSingle();
+    .single();
 
   if (quizErr || !quiz) {
-    const db = getInitialDemoDb();
-    const localQuiz = db.quizzes.find((q) => q.id === quizId);
-    if (localQuiz) {
-      const themes = db.themes
-        .filter((t) => t.quiz_id === quizId)
-        .sort((a, b) => a.order_index - b.order_index);
-      const slidesByTheme: Record<string, Slide[]> = {};
-      for (const theme of themes) {
-        slidesByTheme[theme.id] = db.slides
-          .filter((s) => s.theme_id === theme.id)
-          .sort((a, b) => a.order_index - b.order_index)
-          .map((s) => ({
-            ...s,
-            options: normalizeOptions(s.options),
-            points: Number(s.points ?? 1),
-            timer_seconds: Number(s.timer_seconds ?? 0),
-          }));
-      }
-      try {
-        await upsertFullQuiz(localQuiz, themes, slidesByTheme);
-      } catch (e) {
-        console.warn('Sinhronizacija lokalnega kviza v Supabase ni uspela:', e);
-      }
-      return { quiz: localQuiz, themes, slidesByTheme };
-    }
-    throw formatSupabaseError(quizErr || new Error('Kviz ni bil najden.'), 'Napaka pri branju kviza');
+    throw formatSupabaseError(quizErr, `Kviz z ID "${quizId}" ni bil najden v Supabase tabeli "quizzes"`);
   }
 
   const { data: themesData, error: themesErr } = await supabase
@@ -721,7 +482,9 @@ export async function fetchQuizDetails(quizId: string): Promise<{
     .eq('quiz_id', quizId)
     .order('order_index', { ascending: true });
 
-  if (themesErr) throw formatSupabaseError(themesErr, 'Napaka pri branju tematik');
+  if (themesErr) {
+    throw formatSupabaseError(themesErr, 'Napaka pri branju tematik iz tabele "themes"');
+  }
   const themes = (themesData || []) as Theme[];
 
   const slidesByTheme: Record<string, Slide[]> = {};
@@ -737,7 +500,9 @@ export async function fetchQuizDetails(quizId: string): Promise<{
       .in('theme_id', themeIds)
       .order('order_index', { ascending: true });
 
-    if (slidesErr) throw formatSupabaseError(slidesErr, 'Napaka pri branju slajdov');
+    if (slidesErr) {
+      throw formatSupabaseError(slidesErr, 'Napaka pri branju slajdov iz tabele "slides"');
+    }
 
     for (const rawSlide of slidesData || []) {
       const slide: Slide = {
@@ -767,50 +532,40 @@ export async function createTheme(
   title: string,
   orderIndex: number
 ): Promise<{ theme: Theme; introSlide: Slide }> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const theme: Theme = {
-      id: crypto.randomUUID(),
-      quiz_id: quizId,
-      title,
-      order_index: orderIndex,
-    };
-    const introSlide: Slide = {
-      id: crypto.randomUUID(),
-      theme_id: theme.id,
-      order_index: 0,
-      slide_image_url: null,
-      slide_type: 'theme_intro',
-      question_text: `${title} — Tukaj lahko igralci aktivirajo Jokerja za dvojne točke v tej temi!`,
-      options: { A: '', B: '', C: '', D: '' },
-      correct_answer: '',
-      points: 0,
-      timer_seconds: 0,
-    };
-    db.themes.push(theme);
-    db.slides.push(introSlide);
-    saveDemoDb(db);
-    return { theme, introSlide };
-  }
+  const supabase = requireSupabaseClient();
+  const themeId = crypto.randomUUID();
+  const slideId = crypto.randomUUID();
 
   const { data: themeData, error: themeErr } = await supabase
     .from('themes')
     .insert({
+      id: themeId,
       quiz_id: quizId,
-      title,
+      title: title.trim(),
       order_index: orderIndex,
     })
     .select('*')
     .single();
 
-  if (themeErr) throw formatSupabaseError(themeErr, 'Napaka pri dodajanju tematike');
+  if (themeErr || !themeData) {
+    throw formatSupabaseError(themeErr, 'Napaka pri dodajanju tematike v tabelo "themes"');
+  }
+
+  const introSvg = generateSlideSvgDataUrl({
+    badge: `${title.toUpperCase()} • JOKER`,
+    title: title.toUpperCase(),
+    subtitle: 'Pred začetkom sklopa lahko aktivirate Jokerja za dvojne točke!',
+    type: 'theme_intro',
+    accentColor: '#f59e0b',
+  });
 
   const { data: slideData, error: slideErr } = await supabase
     .from('slides')
     .insert({
+      id: slideId,
       theme_id: themeData.id,
       order_index: 0,
+      slide_image_url: introSvg,
       slide_type: 'theme_intro',
       question_text: `${title} — Pred začetkom sklopa lahko aktivirate Jokerja za dvojne točke!`,
       options: { A: '', B: '', C: '', D: '' },
@@ -821,7 +576,9 @@ export async function createTheme(
     .select('*')
     .single();
 
-  if (slideErr) throw formatSupabaseError(slideErr, 'Napaka pri dodajanju uvodnega slajda teme');
+  if (slideErr || !slideData) {
+    throw formatSupabaseError(slideErr, 'Napaka pri dodajanju uvodnega slajda v tabelo "slides"');
+  }
 
   return {
     theme: themeData as Theme,
@@ -836,68 +593,55 @@ export async function updateTheme(
   themeId: string,
   updates: { title?: string; order_index?: number }
 ): Promise<Theme> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const idx = db.themes.findIndex((t) => t.id === themeId);
-    if (idx === -1) throw new Error('Tematika ne obstaja.');
-    db.themes[idx] = { ...db.themes[idx], ...updates };
-    saveDemoDb(db);
-    return db.themes[idx];
-  }
+  const supabase = requireSupabaseClient();
+
+  const cleanUpdates: Record<string, unknown> = {};
+  if (updates.title !== undefined) cleanUpdates.title = updates.title.trim();
+  if (updates.order_index !== undefined) cleanUpdates.order_index = Number(updates.order_index);
 
   const { data, error } = await supabase
     .from('themes')
-    .update(updates)
+    .update(cleanUpdates)
     .eq('id', themeId)
     .select('*')
     .single();
 
-  if (error) throw formatSupabaseError(error, 'Napaka pri shranjevanju tematike');
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri posodabljanju tematike v tabeli "themes"');
+  }
   return data as Theme;
 }
 
 export async function deleteTheme(themeId: string): Promise<void> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    db.slides = db.slides.filter((s) => s.theme_id !== themeId);
-    db.themes = db.themes.filter((t) => t.id !== themeId);
-    saveDemoDb(db);
-    return;
-  }
-
+  const supabase = requireSupabaseClient();
   const { error } = await supabase.from('themes').delete().eq('id', themeId);
-  if (error) throw formatSupabaseError(error, 'Napaka pri brisanju tematike');
+  if (error) {
+    throw formatSupabaseError(error, 'Napaka pri brisanju tematike iz tabele "themes"');
+  }
 }
 
 export async function createSlide(
   themeId: string,
   payload: Partial<Omit<Slide, 'id' | 'theme_id'>> & { order_index: number }
 ): Promise<Slide> {
-  const defaultSlide: Omit<Slide, 'id'> = {
-    theme_id: themeId,
-    order_index: payload.order_index,
-    slide_image_url: payload.slide_image_url ?? null,
-    slide_type: payload.slide_type ?? 'multiple_choice',
-    question_text: payload.question_text ?? '',
-    options: payload.options ?? { A: '', B: '', C: '', D: '' },
-    correct_answer: payload.correct_answer ?? '',
-    points: payload.points ?? (payload.slide_type === 'theme_intro' || payload.slide_type === 'info_only' ? 0 : 1),
-    timer_seconds: payload.timer_seconds ?? 0,
-  };
+  const supabase = requireSupabaseClient();
+  const slideId = crypto.randomUUID();
+  const slideType: SlideType = payload.slide_type ?? 'multiple_choice';
 
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const newSlide: Slide = {
-      id: crypto.randomUUID(),
-      ...defaultSlide,
-    };
-    db.slides.push(newSlide);
-    saveDemoDb(db);
-    return newSlide;
-  }
+  const defaultSlide = {
+    id: slideId,
+    theme_id: themeId,
+    order_index: Number(payload.order_index ?? 0),
+    slide_image_url: payload.slide_image_url ?? null,
+    slide_type: slideType,
+    question_text: payload.question_text ?? '',
+    options: normalizeOptions(payload.options),
+    correct_answer: payload.correct_answer ?? '',
+    points: Number(
+      payload.points ?? (slideType === 'theme_intro' || slideType === 'info_only' ? 0 : 1)
+    ),
+    timer_seconds: Number(payload.timer_seconds ?? 0),
+  };
 
   const { data, error } = await supabase
     .from('slides')
@@ -905,7 +649,9 @@ export async function createSlide(
     .select('*')
     .single();
 
-  if (error) throw formatSupabaseError(error, 'Napaka pri ustvarjanju slajda');
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri ustvarjanju slajda v tabeli "slides"');
+  }
   return {
     ...(data as Slide),
     options: normalizeOptions(data.options),
@@ -918,24 +664,29 @@ export async function updateSlide(
   slideId: string,
   updates: Partial<Omit<Slide, 'id' | 'theme_id'>>
 ): Promise<Slide> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const idx = db.slides.findIndex((s) => s.id === slideId);
-    if (idx === -1) throw new Error('Slajd ne obstaja.');
-    db.slides[idx] = { ...db.slides[idx], ...updates };
-    saveDemoDb(db);
-    return db.slides[idx];
-  }
+  const supabase = requireSupabaseClient();
+
+  // Pošlji SAMO stolpce, ki dejansko obstajajo v tabeli slides
+  const cleanUpdates: Record<string, unknown> = {};
+  if (updates.order_index !== undefined) cleanUpdates.order_index = Number(updates.order_index);
+  if (updates.slide_image_url !== undefined) cleanUpdates.slide_image_url = updates.slide_image_url;
+  if (updates.slide_type !== undefined) cleanUpdates.slide_type = updates.slide_type;
+  if (updates.question_text !== undefined) cleanUpdates.question_text = updates.question_text;
+  if (updates.options !== undefined) cleanUpdates.options = normalizeOptions(updates.options);
+  if (updates.correct_answer !== undefined) cleanUpdates.correct_answer = updates.correct_answer;
+  if (updates.points !== undefined) cleanUpdates.points = Number(updates.points);
+  if (updates.timer_seconds !== undefined) cleanUpdates.timer_seconds = Number(updates.timer_seconds);
 
   const { data, error } = await supabase
     .from('slides')
-    .update(updates)
+    .update(cleanUpdates)
     .eq('id', slideId)
     .select('*')
     .single();
 
-  if (error) throw formatSupabaseError(error, 'Napaka pri shranjevanju slajda');
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri shranjevanju slajda v tabelo "slides"');
+  }
   return {
     ...(data as Slide),
     options: normalizeOptions(data.options),
@@ -945,23 +696,16 @@ export async function updateSlide(
 }
 
 export async function deleteSlide(slideId: string): Promise<void> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    db.slides = db.slides.filter((s) => s.id !== slideId);
-    saveDemoDb(db);
-    return;
-  }
-
+  const supabase = requireSupabaseClient();
   const { error } = await supabase.from('slides').delete().eq('id', slideId);
-  if (error) throw formatSupabaseError(error, 'Napaka pri brisanju slajda');
+  if (error) {
+    throw formatSupabaseError(error, 'Napaka pri brisanju slajda iz tabele "slides"');
+  }
 }
 
 /**
  * Naloži sliko slajda v Supabase Storage bucket 'slides'.
- * Če Supabase ni povezan ali če nalaganje v Storage bucket spodleti (npr. zaradi manjkajočega bucketa ali RLS politik),
- * sliko samodejno stisne v optimiziran JPEG Base64 data URL (kvaliteta 0.7, max širina 1280px)
- * in jo vrne za neposredno shranjevanje v polje `slide_image_url`, da nalaganje 100% deluje!
+ * Če nalaganje v Storage bucket spodleti, sliko stisne v JPEG Data URL, ki se shrani v `slide_image_url` v Supabase bazi!
  */
 export async function uploadSlideImage(
   quizId: string,
@@ -969,10 +713,7 @@ export async function uploadSlideImage(
   blob: Blob,
   fileName: string
 ): Promise<string> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    return await compressImageBlobToDataUrl(blob, 1280, 0.7);
-  }
+  const supabase = requireSupabaseClient();
 
   try {
     const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -986,7 +727,6 @@ export async function uploadSlideImage(
       });
 
     if (uploadError) {
-      // Če nalaganje v Storage bucket 'slides' spodleti, uporabi stisnjen Base64 data URL fallback
       return await compressImageBlobToDataUrl(blob, 1280, 0.7);
     }
 
@@ -1001,7 +741,7 @@ export async function uploadSlideImage(
 }
 
 // -----------------------------------------------------------------------------
-// LIVE GAME SESSIONS, PRESENTATION & CONTROLLER
+// LIVE GAME SESSIONS, PRESENTATION & CONTROLLER (100% SUPABASE)
 // -----------------------------------------------------------------------------
 
 export interface ActiveGameSessionWithQuiz {
@@ -1011,57 +751,20 @@ export interface ActiveGameSessionWithQuiz {
 }
 
 /**
- * Ustvari novo živo sejo s 4-mestno številčno kodo ('room_code') in statusom 'lobby'.
+ * Ustvari novo živo sejo v Supabase tabeli `game_sessions` s 4-mestno številčno kodo ('room_code') in statusom 'lobby'.
+ * Če katerikoli korak vrne napako, se postopek USTAVI in vrže podrobno Supabase napako (message + details + hint).
  */
 export async function createLiveGameSession(quizId: string, hostId?: string): Promise<GameSession> {
+  const supabase = requireSupabaseClient();
+
   const generateNumericRoomCode = () => {
-    // 4-mestna številčna koda med 1000 in 9999
     return String(Math.floor(1000 + Math.random() * 9000));
   };
 
-  const supabase = getSupabaseClient();
-
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const themes = db.themes
-      .filter((t) => t.quiz_id === quizId)
-      .sort((a, b) => a.order_index - b.order_index);
-    const firstTheme = themes[0] || null;
-    const firstSlide = firstTheme
-      ? db.slides
-          .filter((s) => s.theme_id === firstTheme.id)
-          .sort((a, b) => a.order_index - b.order_index)[0] || null
-      : null;
-
-    let roomCode = generateNumericRoomCode();
-    const existingCodes = new Set(db.game_sessions.map((s) => s.room_code));
-    for (let i = 0; i < 10; i++) {
-      if (!existingCodes.has(roomCode)) break;
-      roomCode = generateNumericRoomCode();
-    }
-
-    const session: GameSession = {
-      id: crypto.randomUUID(),
-      quiz_id: quizId,
-      room_code: roomCode,
-      status: 'lobby',
-      current_theme_id: firstTheme?.id || null,
-      current_slide_id: firstSlide?.id || null,
-      max_slide_index_reached: 0,
-      timer_started_at: null,
-      timer_duration: 0,
-      created_at: new Date().toISOString(),
-    };
-    db.game_sessions.unshift(session);
-    saveDemoDb(db);
-    notifyDemoUpdate('SESSION_CREATED', session.id);
-    return session;
-  }
-
-  // 1. ZAGOTOVI, DA JE CELOTEN KVIZ (S TEMATIKAMI IN SLAJDI) ZAPISAN V SUPABASE (UPSERT)
-  // Tako se napaka 23503 foreign key constraint nikoli ne more zgoditi!
+  // KORAK 1: Preveri, da so kviz, tematike in slajdi 100% zapisani v Supabase
   await ensureQuizSyncedToSupabase(quizId, hostId);
 
+  // KORAK 2: Preberi 1. tematiko kviza iz Supabase
   const { data: themes, error: themeError } = await supabase
     .from('themes')
     .select('id, order_index')
@@ -1070,14 +773,13 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
     .limit(1);
 
   if (themeError) {
-    throw new Error(
-      `Supabase napaka pri branju tematik (${themeError.code || 'UNKNOWN'}): ${themeError.message}`
-    );
+    throw formatSupabaseError(themeError, 'KORAK 2 SPODLETEL — Branje 1. tematike iz tabele "themes"');
   }
 
   const firstThemeId = themes && themes.length > 0 ? themes[0].id : null;
   let firstSlideId: string | null = null;
 
+  // KORAK 3: Preberi 1. slajd prve tematike iz Supabase
   if (firstThemeId) {
     const { data: slides, error: slideError } = await supabase
       .from('slides')
@@ -1087,9 +789,7 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
       .limit(1);
 
     if (slideError) {
-      throw new Error(
-        `Supabase napaka pri branju slajdov (${slideError.code || 'UNKNOWN'}): ${slideError.message}`
-      );
+      throw formatSupabaseError(slideError, 'KORAK 3 SPODLETEL — Branje 1. slajda iz tabele "slides"');
     }
 
     if (slides && slides.length > 0) {
@@ -1097,12 +797,17 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
     }
   }
 
-  let lastError: { code?: string; message?: string; details?: string } | null = null;
+  // KORAK 4: Vstavi novo sejo v tabelo game_sessions z unikatnim UUID in 4-mestnim room_code
+  // Pošljemo SAMO stolpce iz SQL sheme: id, quiz_id, room_code, status, current_theme_id, current_slide_id, max_slide_index_reached, timer_started_at, timer_duration
+  let lastError: unknown = null;
   for (let attempt = 0; attempt < 5; attempt++) {
+    const sessionId = crypto.randomUUID();
     const roomCode = generateNumericRoomCode();
+
     const { data, error } = await supabase
       .from('game_sessions')
       .insert({
+        id: sessionId,
         quiz_id: quizId,
         room_code: roomCode,
         status: 'lobby',
@@ -1120,50 +825,34 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
     }
 
     lastError = error;
+    const errCode = (error as { code?: string } | null)?.code;
     // Če gre za podvojeno room_code (23505), poskusi znova z novo naključno 4-mestno kodo
-    if (error && error.code === '23505') {
+    if (errCode === '23505') {
       continue;
     }
     break;
   }
 
-  const errMsg = lastError
-    ? `Supabase napaka pri ustvarjanju seje (${lastError.code || 'ERROR'}): ${lastError.message}${
-        lastError.details ? ` — ${lastError.details}` : ''
-      }`
-    : 'Neznana napaka pri ustvarjanju seje v tabeli game_sessions.';
-  throw new Error(errMsg);
+  throw formatSupabaseError(lastError, 'KORAK 4 SPODLETEL — Ustvarjanje seje v tabeli "game_sessions"');
 }
 
 /**
- * Vrne vse aktivne (še nezaključene) seje gostitelja skupaj z imenom kviza in številom igralcev.
+ * Vrne vse aktivne (še nezaključene) seje iz Supabase skupaj z imenom kviza in številom igralcev.
  */
 export async function fetchHostActiveSessions(
-  hostId: string
+  _hostId: string
 ): Promise<ActiveGameSessionWithQuiz[]> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const hostQuizMap = new Map<string, string>();
-    for (const q of db.quizzes) {
-      hostQuizMap.set(q.id, q.title);
-    }
-
-    return db.game_sessions
-      .filter((s) => s.status !== 'finished' && hostQuizMap.has(s.quiz_id))
-      .map((session) => ({
-        session,
-        quizTitle: hostQuizMap.get(session.quiz_id) || 'Kviz v živo',
-        playerCount: db.players.filter((p) => p.session_id === session.id).length,
-      }));
-  }
+  const supabase = requireSupabaseClient();
 
   const { data: quizzes, error: qErr } = await supabase
     .from('quizzes')
-    .select('id, title')
-    .eq('host_id', hostId);
+    .select('id, title');
 
-  if (qErr || !quizzes || quizzes.length === 0) {
+  if (qErr) {
+    throw formatSupabaseError(qErr, 'Napaka pri branju kvizov za aktivne seje');
+  }
+
+  if (!quizzes || quizzes.length === 0) {
     return [];
   }
 
@@ -1182,7 +871,11 @@ export async function fetchHostActiveSessions(
     .order('created_at', { ascending: false })
     .limit(12);
 
-  if (sErr || !sessions || sessions.length === 0) {
+  if (sErr) {
+    throw formatSupabaseError(sErr, 'Napaka pri branju aktivnih sej iz tabele "game_sessions"');
+  }
+
+  if (!sessions || sessions.length === 0) {
     return [];
   }
 
@@ -1208,17 +901,7 @@ export async function fetchHostActiveSessions(
  * Zaključi aktivno sejo (postavi status na 'finished').
  */
 export async function closeGameSession(sessionId: string): Promise<void> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const idx = db.game_sessions.findIndex((s) => s.id === sessionId);
-    if (idx !== -1) {
-      db.game_sessions[idx] = { ...db.game_sessions[idx], status: 'finished' };
-      saveDemoDb(db);
-      notifyDemoUpdate('SESSION_FINISHED', sessionId);
-    }
-    return;
-  }
+  const supabase = requireSupabaseClient();
 
   const { error } = await supabase
     .from('game_sessions')
@@ -1226,16 +909,12 @@ export async function closeGameSession(sessionId: string): Promise<void> {
     .eq('id', sessionId);
 
   if (error) {
-    throw new Error(`Napaka pri zaključevanju seje: ${error.message}`);
+    throw formatSupabaseError(error, 'Napaka pri zaključevanju seje v tabeli "game_sessions"');
   }
 }
 
 export async function fetchGameSession(sessionId: string): Promise<GameSession | null> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    return db.game_sessions.find((s) => s.id === sessionId) || null;
-  }
+  const supabase = requireSupabaseClient();
 
   const { data, error } = await supabase
     .from('game_sessions')
@@ -1243,88 +922,54 @@ export async function fetchGameSession(sessionId: string): Promise<GameSession |
     .eq('id', sessionId)
     .single();
 
-  if (error) return null;
+  if (error || !data) return null;
   return data as GameSession;
 }
 
+/**
+ * Naloži vse podatke o seji direktno iz Supabase baze za `/present/:sessionId` in `/host-remote/:sessionId`.
+ */
 export async function fetchPresentationData(sessionId: string): Promise<PresentationData> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const session = db.game_sessions.find((s) => s.id === sessionId);
-    if (!session) throw new Error('Seja ne obstaja.');
+  const supabase = requireSupabaseClient();
 
-    const quiz = db.quizzes.find((q) => q.id === session.quiz_id);
-    if (!quiz) throw new Error('Kviz te seje ne obstaja.');
-
-    const themes = db.themes
-      .filter((t) => t.quiz_id === quiz.id)
-      .sort((a, b) => a.order_index - b.order_index);
-
-    const slidesByTheme: Record<string, Slide[]> = {};
-    for (const t of themes) {
-      slidesByTheme[t.id] = db.slides
-        .filter((s) => s.theme_id === t.id)
-        .sort((a, b) => a.order_index - b.order_index)
-        .map((s) => ({
-          ...s,
-          options: normalizeOptions(s.options),
-          points: Number(s.points ?? 1),
-          timer_seconds: Number(s.timer_seconds ?? 0),
-        }));
-    }
-
-    const currentTheme = themes.find((t) => t.id === session.current_theme_id) || themes[0] || null;
-    const currentThemeSlides = currentTheme ? slidesByTheme[currentTheme.id] || [] : [];
-    const currentSlide =
-      currentThemeSlides.find((s) => s.id === session.current_slide_id) ||
-      currentThemeSlides[0] ||
-      null;
-
-    const players = db.players
-      .filter((p) => p.session_id === sessionId)
-      .sort((a, b) => b.total_score - a.total_score);
-
-    const playerJokers = db.player_jokers.filter((pj) => pj.session_id === sessionId);
-    const answers = db.answers.filter((a) => a.session_id === sessionId);
-
-    return {
-      session,
-      quiz,
-      themes,
-      slidesByTheme,
-      currentTheme,
-      currentSlide,
-      players,
-      playerJokers,
-      answers,
-    };
-  }
-
-  // Supabase klic
+  // 1. Preberi sejo direktno iz Supabase: supabase.from('game_sessions').select('*').eq('id', sessionId).single()
   const { data: session, error: sErr } = await supabase
     .from('game_sessions')
     .select('*')
     .eq('id', sessionId)
     .single();
 
-  if (sErr || !session) throw sErr || new Error('Seja ni bila najdena.');
+  if (sErr || !session) {
+    throw formatSupabaseError(
+      sErr || new Error(`Seja z ID "${sessionId}" ne obstaja v Supabase tabeli game_sessions.`),
+      'Seja v Supabase bazi ni bila najdena'
+    );
+  }
 
+  // 2. Preberi kviz
   const { data: quiz, error: qErr } = await supabase
     .from('quizzes')
     .select('*')
     .eq('id', session.quiz_id)
     .single();
 
-  if (qErr || !quiz) throw qErr || new Error('Kviz ni bil najden.');
+  if (qErr || !quiz) {
+    throw formatSupabaseError(
+      qErr || new Error(`Kviz z ID "${session.quiz_id}" ne obstaja v tabeli quizzes.`),
+      'Kviz te seje v Supabase bazi ni bil najden'
+    );
+  }
 
+  // 3. Preberi tematike
   const { data: themesData, error: tErr } = await supabase
     .from('themes')
     .select('*')
     .eq('quiz_id', quiz.id)
     .order('order_index', { ascending: true });
 
-  if (tErr) throw tErr;
+  if (tErr) {
+    throw formatSupabaseError(tErr, 'Napaka pri branju tematik seje iz Supabase');
+  }
   const themes = (themesData || []) as Theme[];
 
   const slidesByTheme: Record<string, Slide[]> = {};
@@ -1334,11 +979,15 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
 
   if (themes.length > 0) {
     const themeIds = themes.map((t) => t.id);
-    const { data: slidesData } = await supabase
+    const { data: slidesData, error: slidesErr } = await supabase
       .from('slides')
       .select('*')
       .in('theme_id', themeIds)
       .order('order_index', { ascending: true });
+
+    if (slidesErr) {
+      throw formatSupabaseError(slidesErr, 'Napaka pri branju slajdov seje iz Supabase');
+    }
 
     for (const raw of slidesData || []) {
       const slide: Slide = {
@@ -1398,16 +1047,7 @@ export async function updateGameSession(
   sessionId: string,
   updates: Partial<Omit<GameSession, 'id' | 'room_code' | 'quiz_id'>>
 ): Promise<GameSession> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const idx = db.game_sessions.findIndex((s) => s.id === sessionId);
-    if (idx === -1) throw new Error('Seja ne obstaja.');
-    db.game_sessions[idx] = { ...db.game_sessions[idx], ...updates };
-    saveDemoDb(db);
-    notifyDemoUpdate('SESSION_UPDATED', sessionId);
-    return db.game_sessions[idx];
-  }
+  const supabase = requireSupabaseClient();
 
   const { data, error } = await supabase
     .from('game_sessions')
@@ -1416,7 +1056,9 @@ export async function updateGameSession(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri posodabljanju seje v tabeli "game_sessions"');
+  }
   return data as GameSession;
 }
 
@@ -1424,36 +1066,24 @@ export async function addDemoPlayer(
   sessionId: string,
   nickname: string
 ): Promise<Player> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const newPlayer: Player = {
-      id: crypto.randomUUID(),
-      session_id: sessionId,
-      nickname,
-      reconnect_token: crypto.randomUUID(),
-      total_score: 0,
-      jokers_remaining: 1,
-      created_at: new Date().toISOString(),
-    };
-    db.players.push(newPlayer);
-    saveDemoDb(db);
-    notifyDemoUpdate('PLAYERS_UPDATED', sessionId);
-    return newPlayer;
-  }
+  const supabase = requireSupabaseClient();
 
   const { data, error } = await supabase
     .from('players')
     .insert({
+      id: crypto.randomUUID(),
       session_id: sessionId,
-      nickname,
+      nickname: nickname.trim(),
+      reconnect_token: crypto.randomUUID(),
       total_score: 0,
       jokers_remaining: 1,
     })
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri dodajanju igralca v tabelo "players"');
+  }
   return data as Player;
 }
 
@@ -1462,30 +1092,7 @@ export async function togglePlayerJoker(
   playerId: string,
   themeId: string
 ): Promise<boolean> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const idx = db.player_jokers.findIndex(
-      (pj) => pj.session_id === sessionId && pj.player_id === playerId && pj.theme_id === themeId
-    );
-    let active = false;
-    if (idx >= 0) {
-      db.player_jokers.splice(idx, 1);
-      active = false;
-    } else {
-      db.player_jokers.push({
-        id: crypto.randomUUID(),
-        session_id: sessionId,
-        player_id: playerId,
-        theme_id: themeId,
-        created_at: new Date().toISOString(),
-      });
-      active = true;
-    }
-    saveDemoDb(db);
-    notifyDemoUpdate('JOKER_UPDATED', sessionId);
-    return active;
-  }
+  const supabase = requireSupabaseClient();
 
   const { data: existing } = await supabase
     .from('player_jokers')
@@ -1499,11 +1106,15 @@ export async function togglePlayerJoker(
     await supabase.from('player_jokers').delete().eq('id', existing.id);
     return false;
   } else {
-    await supabase.from('player_jokers').insert({
+    const { error } = await supabase.from('player_jokers').insert({
+      id: crypto.randomUUID(),
       session_id: sessionId,
       player_id: playerId,
       theme_id: themeId,
     });
+    if (error) {
+      throw formatSupabaseError(error, 'Napaka pri vklopu Jokerja v tabeli "player_jokers"');
+    }
     return true;
   }
 }
@@ -1517,33 +1128,7 @@ export async function submitDemoAnswer(
   isCorrect: boolean = false,
   awardedPoints: number = 0
 ): Promise<Answer> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const existingIdx = db.answers.findIndex(
-      (a) => a.session_id === sessionId && a.player_id === playerId && a.slide_id === slideId
-    );
-    const ans: Answer = {
-      id: existingIdx >= 0 ? db.answers[existingIdx].id : crypto.randomUUID(),
-      session_id: sessionId,
-      player_id: playerId,
-      theme_id: themeId,
-      slide_id: slideId,
-      answer_text: answerText,
-      is_correct: isCorrect,
-      awarded_points: awardedPoints,
-      graded: false,
-      created_at: new Date().toISOString(),
-    };
-    if (existingIdx >= 0) {
-      db.answers[existingIdx] = ans;
-    } else {
-      db.answers.push(ans);
-    }
-    saveDemoDb(db);
-    notifyDemoUpdate('ANSWERS_UPDATED', sessionId);
-    return ans;
-  }
+  const supabase = requireSupabaseClient();
 
   const { data, error } = await supabase
     .from('answers')
@@ -1555,7 +1140,7 @@ export async function submitDemoAnswer(
         slide_id: slideId,
         answer_text: answerText,
         is_correct: isCorrect,
-        awarded_points: awardedPoints,
+        awarded_points: Number(awardedPoints),
         graded: false,
       },
       { onConflict: 'session_id,player_id,slide_id' }
@@ -1563,7 +1148,9 @@ export async function submitDemoAnswer(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri oddaji odgovora v tabelo "answers"');
+  }
   return data as Answer;
 }
 
@@ -1579,33 +1166,7 @@ export async function upsertGradedAnswer(
   isCorrect: boolean,
   awardedPoints: number
 ): Promise<Answer> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const existingIdx = db.answers.findIndex(
-      (a) => a.session_id === sessionId && a.player_id === playerId && a.slide_id === slideId
-    );
-    const ans: Answer = {
-      id: existingIdx >= 0 ? db.answers[existingIdx].id : crypto.randomUUID(),
-      session_id: sessionId,
-      player_id: playerId,
-      theme_id: themeId,
-      slide_id: slideId,
-      answer_text: answerText,
-      is_correct: isCorrect,
-      awarded_points: Number(awardedPoints),
-      graded: true,
-      created_at: new Date().toISOString(),
-    };
-    if (existingIdx >= 0) {
-      db.answers[existingIdx] = ans;
-    } else {
-      db.answers.push(ans);
-    }
-    saveDemoDb(db);
-    notifyDemoUpdate('ANSWERS_UPDATED', sessionId);
-    return ans;
-  }
+  const supabase = requireSupabaseClient();
 
   const { data, error } = await supabase
     .from('answers')
@@ -1625,7 +1186,9 @@ export async function upsertGradedAnswer(
     .select('*')
     .single();
 
-  if (error) throw error;
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri ocenjevanju odgovora v tabeli "answers"');
+  }
   return data as Answer;
 }
 
@@ -1680,7 +1243,6 @@ export async function autoPreGradeTheme(
     } else if (slide.slide_type === 'closest_number') {
       const targetNum = parseFloat(correctRaw.replace(',', '.'));
       if (!Number.isNaN(targetNum)) {
-        // Izračunaj absolutno razliko |odgovor_igralca - correct_answer| za vse veljavne številske odgovore
         const diffs: Array<{ ans: Answer; diff: number }> = [];
         for (const ans of slideAnswers) {
           const val = parseFloat(ans.answer_text.trim().replace(',', '.'));
@@ -1749,22 +1311,19 @@ export async function autoPreGradeTheme(
 export async function confirmThemeGradesAndShowLeaderboard(
   sessionId: string
 ): Promise<void> {
+  const supabase = requireSupabaseClient();
   const presData = await fetchPresentationData(sessionId);
   const { players, answers, playerJokers } = presData;
 
-  // Zgradi množico Jokerjev: ključ `${player_id}_${theme_id}`
   const jokerSet = new Set(
     playerJokers.map((pj) => `${pj.player_id}_${pj.theme_id}`)
   );
 
-  // Za vsakega igralca izračunamo točke po vseh tematikah:
-  // Če je v določeni temi uporabil Jokerja, se vsota točk tiste teme pomnoži z 2!
   const newScoresByPlayer: Record<string, number> = {};
   for (const p of players) {
     newScoresByPlayer[p.id] = 0;
   }
 
-  // Grupiraj odgovore po igralcu in temi
   const playerThemeSums: Record<string, Record<string, number>> = {};
   for (const ans of answers) {
     const pts = Number(ans.awarded_points ?? 0);
@@ -1785,30 +1344,6 @@ export async function confirmThemeGradesAndShowLeaderboard(
     newScoresByPlayer[player.id] = Math.round(total * 100) / 100;
   }
 
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    for (const p of db.players) {
-      if (p.session_id === sessionId && newScoresByPlayer[p.id] !== undefined) {
-        p.total_score = newScoresByPlayer[p.id];
-      }
-    }
-    for (const a of db.answers) {
-      if (a.session_id === sessionId) {
-        a.graded = true;
-      }
-    }
-    const sIdx = db.game_sessions.findIndex((s) => s.id === sessionId);
-    if (sIdx >= 0) {
-      db.game_sessions[sIdx].status = 'leaderboard';
-      db.game_sessions[sIdx].timer_started_at = null;
-      db.game_sessions[sIdx].timer_duration = 0;
-    }
-    saveDemoDb(db);
-    notifyDemoUpdate('LEADERBOARD_UPDATED', sessionId);
-    return;
-  }
-
   // Posodobi total_score za vsakega igralca v Supabase
   await Promise.all(
     players.map((p) =>
@@ -1820,7 +1355,7 @@ export async function confirmThemeGradesAndShowLeaderboard(
   );
 
   // Prestavi status seje v 'leaderboard'
-  await supabase
+  const { error } = await supabase
     .from('game_sessions')
     .update({
       status: 'leaderboard',
@@ -1828,63 +1363,43 @@ export async function confirmThemeGradesAndShowLeaderboard(
       timer_duration: 0,
     })
     .eq('id', sessionId);
+
+  if (error) {
+    throw formatSupabaseError(error, 'Napaka pri preklopu seje na lestvico v tabeli "game_sessions"');
+  }
 }
 
 // -----------------------------------------------------------------------------
-// FAZA 4: PLAYER VIEW FUNCTIONS (/play)
+// PLAYER VIEW FUNCTIONS (/play) - 100% SUPABASE
 // -----------------------------------------------------------------------------
 
 /**
- * Poišče aktivno sejo glede na 4-mestno kodo sobe.
+ * Poišče aktivno sejo v Supabase glede na 4-mestno kodo sobe:
+ * supabase.from('game_sessions').select('*').eq('room_code', code.trim()).single()
  */
 export async function findSessionByRoomCode(roomCode: string): Promise<GameSession | null> {
-  const cleanCode = roomCode.trim().toUpperCase();
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    return db.game_sessions.find((s) => s.room_code.toUpperCase() === cleanCode) || null;
-  }
+  const supabase = requireSupabaseClient();
+  const cleanCode = roomCode.trim();
 
   const { data, error } = await supabase
     .from('game_sessions')
     .select('*')
     .eq('room_code', cleanCode)
-    .maybeSingle();
+    .single();
 
   if (error || !data) return null;
   return data as GameSession;
 }
 
 /**
- * Registracija/vstop tekmovalca v sejo. Ustvari nov `reconnect_token` in nastavi `jokers_remaining` glede na kviz.
+ * Registracija/vstop tekmovalca v sejo. Ustvari nov `reconnect_token` (UUID) in `id` (UUID).
  */
 export async function joinSessionAsPlayer(sessionId: string, nickname: string): Promise<Player> {
+  const supabase = requireSupabaseClient();
   const cleanNick = nickname.trim() || 'Neznani tekmovalec';
+  const playerId = crypto.randomUUID();
   const reconnectToken = crypto.randomUUID();
-  const supabase = getSupabaseClient();
 
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const session = db.game_sessions.find((s) => s.id === sessionId);
-    const quiz = session ? db.quizzes.find((q) => q.id === session.quiz_id) : null;
-    const initialJokers = quiz ? quiz.max_jokers_per_player : 1;
-
-    const newPlayer: Player = {
-      id: crypto.randomUUID(),
-      session_id: sessionId,
-      nickname: cleanNick,
-      reconnect_token: reconnectToken,
-      total_score: 0,
-      jokers_remaining: initialJokers,
-      created_at: new Date().toISOString(),
-    };
-    db.players.push(newPlayer);
-    saveDemoDb(db);
-    notifyDemoUpdate('PLAYERS_UPDATED', sessionId);
-    return newPlayer;
-  }
-
-  // Preberi začetno število Jokerjev iz kviza
   let initialJokers = 1;
   const { data: sData } = await supabase
     .from('game_sessions')
@@ -1899,13 +1414,14 @@ export async function joinSessionAsPlayer(sessionId: string, nickname: string): 
       .eq('id', sData.quiz_id)
       .single();
     if (qData?.max_jokers_per_player !== undefined) {
-      initialJokers = qData.max_jokers_per_player;
+      initialJokers = Number(qData.max_jokers_per_player);
     }
   }
 
   const { data: created, error } = await supabase
     .from('players')
     .insert({
+      id: playerId,
       session_id: sessionId,
       nickname: cleanNick,
       reconnect_token: reconnectToken,
@@ -1915,28 +1431,24 @@ export async function joinSessionAsPlayer(sessionId: string, nickname: string): 
     .select('*')
     .single();
 
-  if (error || !created) throw error || new Error('Napaka pri vstopu v igro.');
+  if (error || !created) {
+    throw formatSupabaseError(error, 'Napaka pri vpisu igralca v Supabase tabelo "players"');
+  }
   return created as Player;
 }
 
 /**
- * Reconnect mehanizem: Preveri obstoječi token v localStorage in vrne igralca brez ponovnega vpisa.
+ * Reconnect mehanizem: Preveri obstoječi token v localStorage in prebere igralca iz Supabase.
  */
 export async function reconnectPlayer(
   sessionId: string,
   playerId: string,
   reconnectToken: string
 ): Promise<Player | null> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const p = db.players.find(
-      (pl) =>
-        pl.id === playerId &&
-        pl.session_id === sessionId &&
-        pl.reconnect_token === reconnectToken
-    );
-    return p || null;
+  const supabase = requireSupabaseClient();
+
+  if (!isValidUuid(sessionId) || !isValidUuid(playerId) || !isValidUuid(reconnectToken)) {
+    return null;
   }
 
   const { data, error } = await supabase
@@ -1954,91 +1466,23 @@ export async function reconnectPlayer(
 export type { PlayerFullData };
 
 /**
- * Naloži vse podatke za igralca (trenutni slajd, dovoljeni odprti slajdi znotraj teme, odgovori in lestvica).
+ * Naloži vse podatke za igralca iz Supabase.
  */
 export async function fetchPlayerGameData(
   sessionId: string,
   playerId: string
 ): Promise<PlayerFullData> {
-  const supabase = getSupabaseClient();
+  const supabase = requireSupabaseClient();
 
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const player = db.players.find((p) => p.id === playerId);
-    const session = db.game_sessions.find((s) => s.id === sessionId);
-    if (!player || !session) throw new Error('Seja ali igralec ne obstaja.');
-
-    const quiz = db.quizzes.find((q) => q.id === session.quiz_id);
-    if (!quiz) throw new Error('Kviz ne obstaja.');
-
-    const themes = db.themes
-      .filter((t) => t.quiz_id === quiz.id)
-      .sort((a, b) => a.order_index - b.order_index);
-
-    const slidesByTheme: Record<string, Slide[]> = {};
-    for (const t of themes) {
-      slidesByTheme[t.id] = db.slides
-        .filter((s) => s.theme_id === t.id)
-        .sort((a, b) => a.order_index - b.order_index)
-        .map((s) => ({
-          ...s,
-          options: normalizeOptions(s.options),
-          points: Number(s.points ?? 1),
-          timer_seconds: Number(s.timer_seconds ?? 0),
-        }));
-    }
-
-    const currentTheme = themes.find((t) => t.id === session.current_theme_id) || themes[0] || null;
-    const currentThemeSlides = currentTheme ? slidesByTheme[currentTheme.id] || [] : [];
-    const currentSlide =
-      currentThemeSlides.find((s) => s.id === session.current_slide_id) ||
-      currentThemeSlides[0] ||
-      null;
-
-    const playerJokers = db.player_jokers.filter(
-      (pj) => pj.session_id === sessionId && pj.player_id === playerId
-    );
-
-    const myAnswersList = db.answers.filter(
-      (a) => a.session_id === sessionId && a.player_id === playerId
-    );
-    const myAnswers: Record<string, Answer> = {};
-    for (const a of myAnswersList) {
-      myAnswers[a.slide_id] = a;
-    }
-
-    const sortedPlayers = [...db.players.filter((p) => p.session_id === sessionId)].sort(
-      (a, b) => b.total_score - a.total_score
-    );
-    const leaderboard = sortedPlayers.map((p, idx) => ({
-      id: p.id,
-      nickname: p.nickname,
-      total_score: p.total_score,
-      rank: idx + 1,
-    }));
-
-    return {
-      player,
-      session,
-      quiz,
-      themes,
-      slidesByTheme,
-      currentTheme,
-      currentSlide,
-      playerJokers,
-      myAnswers,
-      leaderboard,
-    };
-  }
-
-  // Supabase klici
   const { data: player, error: pErr } = await supabase
     .from('players')
     .select('*')
     .eq('id', playerId)
     .single();
 
-  if (pErr || !player) throw pErr || new Error('Igralec ni bil najden.');
+  if (pErr || !player) {
+    throw formatSupabaseError(pErr, 'Igralec v Supabase bazi ni bil najden');
+  }
 
   const { data: session, error: sErr } = await supabase
     .from('game_sessions')
@@ -2046,7 +1490,9 @@ export async function fetchPlayerGameData(
     .eq('id', sessionId)
     .single();
 
-  if (sErr || !session) throw sErr || new Error('Seja ni bila najdena.');
+  if (sErr || !session) {
+    throw formatSupabaseError(sErr, 'Seja v Supabase bazi ni bila najdena');
+  }
 
   const { data: quiz, error: qErr } = await supabase
     .from('quizzes')
@@ -2054,7 +1500,9 @@ export async function fetchPlayerGameData(
     .eq('id', session.quiz_id)
     .single();
 
-  if (qErr || !quiz) throw qErr || new Error('Kviz ni bil najden.');
+  if (qErr || !quiz) {
+    throw formatSupabaseError(qErr, 'Kviz v Supabase bazi ni bil najden');
+  }
 
   const { data: themesData } = await supabase
     .from('themes')
@@ -2147,44 +1595,14 @@ export async function fetchPlayerGameData(
 
 /**
  * Aktivacija Jokerja s strani tekmovalca (samo v stanju 'theme_intro').
- * Zmanjša jokers_remaining za 1 in doda zapis v player_jokers.
  */
 export async function playerActivateJoker(
   sessionId: string,
   playerId: string,
   themeId: string
 ): Promise<{ success: boolean; jokersRemaining: number }> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const player = db.players.find((p) => p.id === playerId);
-    if (!player) return { success: false, jokersRemaining: 0 };
+  const supabase = requireSupabaseClient();
 
-    const alreadyUsed = db.player_jokers.some(
-      (pj) => pj.session_id === sessionId && pj.player_id === playerId && pj.theme_id === themeId
-    );
-    if (alreadyUsed) {
-      return { success: true, jokersRemaining: player.jokers_remaining };
-    }
-
-    if (player.jokers_remaining <= 0) {
-      return { success: false, jokersRemaining: 0 };
-    }
-
-    player.jokers_remaining -= 1;
-    db.player_jokers.push({
-      id: crypto.randomUUID(),
-      session_id: sessionId,
-      player_id: playerId,
-      theme_id: themeId,
-      created_at: new Date().toISOString(),
-    });
-    saveDemoDb(db);
-    notifyDemoUpdate('JOKER_UPDATED', sessionId);
-    return { success: true, jokersRemaining: player.jokers_remaining };
-  }
-
-  // Preveri obstoj Jokerja za to temo
   const { data: existing } = await supabase
     .from('player_jokers')
     .select('id')
@@ -2202,7 +1620,6 @@ export async function playerActivateJoker(
     return { success: true, jokersRemaining: pData?.jokers_remaining ?? 0 };
   }
 
-  // Pridobi preostalo število Jokerjev
   const { data: p } = await supabase
     .from('players')
     .select('jokers_remaining')
@@ -2214,12 +1631,16 @@ export async function playerActivateJoker(
     return { success: false, jokersRemaining: 0 };
   }
 
-  // Ustvari zapis v player_jokers in zmanjšaj jokers_remaining
-  await supabase.from('player_jokers').insert({
+  const { error: insErr } = await supabase.from('player_jokers').insert({
+    id: crypto.randomUUID(),
     session_id: sessionId,
     player_id: playerId,
     theme_id: themeId,
   });
+
+  if (insErr) {
+    throw formatSupabaseError(insErr, 'Napaka pri aktivaciji Jokerja v tabeli "player_jokers"');
+  }
 
   const nextRemaining = remaining - 1;
   await supabase
@@ -2240,35 +1661,8 @@ export async function savePlayerAnswer(
   slideId: string,
   answerText: string
 ): Promise<Answer> {
+  const supabase = requireSupabaseClient();
   const cleanAns = answerText.trim();
-  const supabase = getSupabaseClient();
-
-  if (!supabase) {
-    const db = getInitialDemoDb();
-    const existingIdx = db.answers.findIndex(
-      (a) => a.session_id === sessionId && a.player_id === playerId && a.slide_id === slideId
-    );
-    const ans: Answer = {
-      id: existingIdx >= 0 ? db.answers[existingIdx].id : crypto.randomUUID(),
-      session_id: sessionId,
-      player_id: playerId,
-      theme_id: themeId,
-      slide_id: slideId,
-      answer_text: cleanAns,
-      is_correct: false,
-      awarded_points: 0,
-      graded: false,
-      created_at: new Date().toISOString(),
-    };
-    if (existingIdx >= 0) {
-      db.answers[existingIdx] = ans;
-    } else {
-      db.answers.push(ans);
-    }
-    saveDemoDb(db);
-    notifyDemoUpdate('ANSWERS_UPDATED', sessionId);
-    return ans;
-  }
 
   const { data, error } = await supabase
     .from('answers')
@@ -2286,10 +1680,10 @@ export async function savePlayerAnswer(
     .select('*')
     .single();
 
-  if (error || !data) throw error || new Error('Napaka pri shranjevanju odgovora.');
+  if (error || !data) {
+    throw formatSupabaseError(error, 'Napaka pri shranjevanju odgovora v tabelo "answers"');
+  }
   return data as Answer;
 }
 
 export { createMegaDemoQuiz, generateSlideSvgDataUrl } from './demoQuiz';
-
-
