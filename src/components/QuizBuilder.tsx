@@ -1287,7 +1287,9 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     {(['A', 'B', 'C', 'D'] as const).map((letter) => {
-                      const isCorrect = currentSlide.correct_answer === letter;
+                      const isCorrect =
+                        currentSlide.correct_answer === letter ||
+                        Boolean(currentSlide.correct_answer?.trim().toUpperCase().startsWith(letter));
                       return (
                         <div
                           key={letter}

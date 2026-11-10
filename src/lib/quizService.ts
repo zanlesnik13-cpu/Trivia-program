@@ -1229,9 +1229,13 @@ export async function autoPreGradeTheme(
     if (slide.slide_type === 'multiple_choice') {
       for (const ans of slideAnswers) {
         if (ans.graded) continue;
+        const normAns = ans.answer_text.trim().toUpperCase();
+        const normCorrect = correctRaw.toUpperCase();
         const isMatch =
           correctRaw !== '' &&
-          ans.answer_text.trim().toUpperCase() === correctRaw.toUpperCase();
+          (normAns === normCorrect ||
+            normCorrect.startsWith(normAns) ||
+            normAns.startsWith(normCorrect));
         updatesToSave.push({
           playerId: ans.player_id,
           slideId: slide.id,

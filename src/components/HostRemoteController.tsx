@@ -878,7 +878,9 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
               {currentSlide.slide_type === 'multiple_choice' && (
                 <div className="grid grid-cols-2 gap-1.5 text-xs">
                   {(['A', 'B', 'C', 'D'] as const).map((optKey) => {
-                    const isRight = currentSlide.correct_answer === optKey;
+                    const isRight =
+                      currentSlide.correct_answer === optKey ||
+                      Boolean(currentSlide.correct_answer?.trim().toUpperCase().startsWith(optKey));
                     return (
                       <div
                         key={optKey}

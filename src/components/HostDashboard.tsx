@@ -135,7 +135,7 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
       const demoQuiz = await createMegaDemoQuiz(hostId);
       await loadDashboardData();
       window.alert(
-        `🎉 Demo kviz "${demoQuiz.title}" je bil uspešno ustvarjen in naložen v Supabase bazo!\n\nVsebuje 2 tematiki in 8 profesionalno oblikovanih SVG slajdov (z Joker uvodom, izbirnimi vprašanji A-B-C-D, odprtimi vprašanji in ugibanjem številk).\n\nLahko ga takoj zaženete v živo s klikom na "Zaženi v živo" ali pa si ga ogledate z "Uredi kviz".`
+        `🎉 Demo kviz "${demoQuiz.title}" je bil uspešno ustvarjen in naložen v Supabase bazo!\n\nVsebuje 5 tematik in 20 profesionalno oblikovanih neon SVG slajdov z vsemi pravilnimi odgovori (Vesoljski poleti, Geodezija, Tehnologija, 2. svetovna vojna, Glasba v filmih in serijah).\n\nLahko ga takoj zaženete v živo s klikom na "Zaženi v živo" ali pa si ga ogledate z "Uredi kviz".`
       );
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri ustvarjanju demo kviza.';
@@ -276,14 +276,14 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
             onClick={handleCreateDemoQuiz}
             disabled={creatingDemo}
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 hover:border-emerald-500/60 transition-all cursor-pointer disabled:opacity-60"
-            title="Ustvari pripravljen Mega Demo Kviz z 2 tematikama in 8 vprašanji za testiranje vseh funkcij"
+            title="Ustvari pripravljen testni kviz s 5 tematikami in 20 slajdi za testiranje vseh funkcij"
           >
             {creatingDemo ? (
               <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
             ) : (
               <Sparkles className="w-4 h-4 text-emerald-400" />
             )}
-            <span>{creatingDemo ? 'Nalagam demo...' : '🎲 Ustvari Demo Kviz za testiranje'}</span>
+            <span>{creatingDemo ? 'Nalagam demo...' : '🎲 Ustvari Demo Kviz (5 tematik - 20 slajdov)'}</span>
           </button>
 
           <button

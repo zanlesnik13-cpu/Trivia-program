@@ -1,5 +1,5 @@
 import { upsertFullQuiz } from './quizService';
-import type { Quiz, Slide, SlideType, Theme } from '../types/quiz';
+import type { Quiz, Slide, SlideOptions, SlideType, Theme } from '../types/quiz';
 
 function escapeXml(unsafe: string): string {
   return unsafe
@@ -32,7 +32,7 @@ export interface SlideSvgConfig {
   title: string;
   subtitle?: string;
   type: SlideType;
-  options?: { A: string; B: string; C: string; D: string };
+  options?: SlideOptions;
   accentColor?: string;
   points?: number;
   timerSeconds?: number;
@@ -41,6 +41,7 @@ export interface SlideSvgConfig {
 /**
  * Ustvari čudovit 16:9 (1920x1080) SVG Data URL za slajd kviza,
  * optimiziran za TV prezentacije in mobilne naprave (PowerPoint / TV stil).
+ * Pomembno: Na slajdu NIKOLI ni označen ali izpisan pravilen odgovor!
  */
 export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
   const {
@@ -65,10 +66,10 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
     ? 380 - (titleLines.length - 1) * 32
     : isIntro
     ? 440 - (titleLines.length - 1) * 40
-    : 420 - (titleLines.length - 1) * 36;
+    : 400 - (titleLines.length - 1) * 36;
 
-  const titleFontSize = isIntro ? 68 : isMultipleChoice ? 50 : 56;
-  const titleLineHeight = isIntro ? 84 : isMultipleChoice ? 66 : 74;
+  const titleFontSize = isIntro ? 64 : isMultipleChoice ? 50 : 54;
+  const titleLineHeight = isIntro ? 80 : isMultipleChoice ? 66 : 72;
 
   let optionsSvg = '';
   if (isMultipleChoice && options) {
@@ -80,8 +81,9 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
     ];
 
     optionsSvg = choices
-      .map(
-        (c) => `
+      .map((c) => {
+        const cleanText = c.text.replace(/^[A-D][.):]\s*/i, '');
+        return `
       <g transform="translate(${c.x}, ${c.y})">
         <!-- Okvir možnosti -->
         <rect width="730" height="118" rx="22" fill="#1e293b" fill-opacity="0.85" stroke="#334155" stroke-width="2.5"/>
@@ -92,18 +94,43 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
         <text x="57" y="70" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, sans-serif" font-size="34" font-weight="900">${c.key}</text>
         
         <!-- Besedilo možnosti -->
-        <text x="114" y="69" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="30" font-weight="700">${escapeXml(c.text)}</text>
+        <text x="114" y="69" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="30" font-weight="700">${escapeXml(cleanText)}</text>
       </g>
-    `
-      )
+    `;
+      })
       .join('');
+  }
+
+  // Sredinski interaktivni element glede na tip slajda
+  let centerElementSvg = '';
+  if (type === 'theme_intro') {
+    centerElementSvg = `
+      <g transform="translate(610, 680)">
+        <rect width="700" height="110" rx="24" fill="${accentColor}" fill-opacity="0.18" stroke="${accentColor}" stroke-width="2.5"/>
+        <text x="350" y="67" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, sans-serif" font-size="32" font-weight="900" letter-spacing="2">🃏 VKLOP JOKERJA: 2x TOČKE</text>
+      </g>
+    `;
+  } else if (type === 'open_text') {
+    centerElementSvg = `
+      <g transform="translate(460, 680)">
+        <rect width="1000" height="96" rx="20" fill="#1e293b" fill-opacity="0.85" stroke="${accentColor}" stroke-width="2" stroke-dasharray="8 6"/>
+        <text x="500" y="58" text-anchor="middle" fill="#94a3b8" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="600">✍️ Vpis odgovora na telefonu tekmovalca...</text>
+      </g>
+    `;
+  } else if (type === 'closest_number') {
+    centerElementSvg = `
+      <g transform="translate(560, 680)">
+        <rect width="800" height="96" rx="20" fill="#1e293b" fill-opacity="0.85" stroke="${accentColor}" stroke-width="2" stroke-dasharray="8 6"/>
+        <text x="400" y="58" text-anchor="middle" fill="#c4b5fd" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="700">🔢 Vpis številke (najbližji ugib zmaga!)</text>
+      </g>
+    `;
   }
 
   // Podnaslov ali vnosna navodila
   let subtitleSvg = '';
   if (subtitleLines.length > 0) {
     const subStartY = isIntro
-      ? 600
+      ? 590
       : isMultipleChoice
       ? 540
       : titleStartY + titleLines.length * titleLineHeight + 40;
@@ -163,7 +190,7 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
 
   <!-- Zgornja značka sklopa / vprašanja -->
   <g transform="translate(960, 130)">
-    <rect x="-310" y="-30" width="620" height="60" rx="30" fill="${accentColor}" fill-opacity="0.18" stroke="${accentColor}" stroke-width="2" stroke-opacity="0.6"/>
+    <rect x="-350" y="-30" width="700" height="60" rx="30" fill="${accentColor}" fill-opacity="0.18" stroke="${accentColor}" stroke-width="2" stroke-opacity="0.6"/>
     <text text-anchor="middle" y="9" fill="${accentColor}" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="900" letter-spacing="3">${escapeXml(
     badge
   )}</text>
@@ -184,7 +211,10 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
   <!-- Podnaslov -->
   ${subtitleSvg}
 
-  <!-- Možnosti A / B / C / D -->
+  <!-- Osrednji interaktivni element (vpis odgovora ali joker) -->
+  ${centerElementSvg}
+
+  <!-- Možnosti A / B / C / D (za multiple_choice) -->
   ${optionsSvg}
 
   <!-- Spodnja vrstica z informacijami -->
@@ -200,19 +230,22 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
 }
 
 /**
- * Ustvari celoten preizkusni kviz z vsemi tipi vprašanj (multiple_choice, open_text, closest_number, theme_intro, info_only)
- * in privlačnimi SVG grafičnimi slajdi ter ga z UPSERT shrani neposredno v Supabase bazo.
+ * Ustvari celoten preizkusni kviz s 5 tematikami in 20 slajdi ter vsemi pravilnimi odgovori
+ * in privlačnimi temnimi neon SVG slajdi ter ga z UPSERT shrani neposredno v Supabase bazo.
  */
 export async function createMegaDemoQuiz(hostId: string): Promise<Quiz> {
   const quizId = crypto.randomUUID();
   const theme1Id = crypto.randomUUID();
   const theme2Id = crypto.randomUUID();
+  const theme3Id = crypto.randomUUID();
+  const theme4Id = crypto.randomUUID();
+  const theme5Id = crypto.randomUUID();
 
   const quiz: Quiz = {
     id: quizId,
     host_id: hostId,
-    title: 'Mega Demo Pub Kviz (Test vseh funkcij)',
-    max_jokers_per_player: 1,
+    title: 'Veliki Trivia Kviz (5 Sklopov)',
+    max_jokers_per_player: 2,
     created_at: new Date().toISOString(),
   };
 
@@ -220,209 +253,535 @@ export async function createMegaDemoQuiz(hostId: string): Promise<Quiz> {
     {
       id: theme1Id,
       quiz_id: quizId,
-      title: '1. sklop: Splošno znanje & Geografija',
+      title: '1. Sklop: Vesoljski poleti',
       order_index: 0,
     },
     {
       id: theme2Id,
       quiz_id: quizId,
-      title: '2. sklop: Film, Glasba in Šport',
+      title: '2. Sklop: Geodezija',
       order_index: 1,
+    },
+    {
+      id: theme3Id,
+      quiz_id: quizId,
+      title: '3. Sklop: Tehnologija',
+      order_index: 2,
+    },
+    {
+      id: theme4Id,
+      quiz_id: quizId,
+      title: '4. Sklop: 2. svetovna vojna',
+      order_index: 3,
+    },
+    {
+      id: theme5Id,
+      quiz_id: quizId,
+      title: '5. Sklop: Glasba v filmih in serijah',
+      order_index: 4,
     },
   ];
 
-  // 1. Tematika: Splošno znanje & Geografija
+  // 1. TEMATIKA: 1. Sklop: Vesoljski poleti
   const theme1Slides: Slide[] = [
-    // Slajd 1: theme_intro
+    // Slajd 0: theme_intro
     {
       id: crypto.randomUUID(),
       theme_id: theme1Id,
       order_index: 0,
       slide_type: 'theme_intro',
-      question_text: '1. SKLOP: SPLOŠNO ZNANJE - Čas za vklop Jokerja!',
+      question_text: '1. SKLOP: VESOLJSKI POLETI — Čas za aktivacijo Jokerja!',
       options: { A: '', B: '', C: '', D: '' },
       correct_answer: '',
       points: 0,
       timer_seconds: 0,
       slide_image_url: generateSlideSvgDataUrl({
-        badge: '1. TEMATIKA • JOKER KORAK',
-        title: 'SPLOŠNO ZNANJE & GEOGRAFIJA',
-        subtitle: 'Čas za vklop JOKERJA na vaših telefonih za 2x točke!',
+        badge: '1. SKLOP • JOKER KORAK',
+        title: 'VESOLJSKI POLETI',
+        subtitle: 'Čas za aktivacijo JOKERJA na vaših telefonih za 2x točke!',
         type: 'theme_intro',
-        accentColor: '#f59e0b',
+        accentColor: '#38bdf8',
       }),
     },
-    // Slajd 2: multiple_choice
+    // Slajd 1: multiple_choice
     {
       id: crypto.randomUUID(),
       theme_id: theme1Id,
       order_index: 1,
       slide_type: 'multiple_choice',
       question_text:
-        'Katera država ima največ časovnih pasov na svetu (vključno s čezmorskimi ozemlji)?',
+        'Kako se je imenoval lunarni modul misije Apollo 11, s katerim sta Neil Armstrong in Buzz Aldrin leta 1969 pristala na Luni?',
       options: {
-        A: 'Rusija',
-        B: 'ZDA',
-        C: 'Francija',
-        D: 'Kitajska',
+        A: 'Columbia',
+        B: 'Eagle (Orel)',
+        C: 'Challenger',
+        D: 'Odyssey',
       },
-      correct_answer: 'C',
+      correct_answer: 'B) Eagle (Orel)',
       points: 1,
       timer_seconds: 30,
       slide_image_url: generateSlideSvgDataUrl({
         badge: '1. SKLOP • VPRAŠANJE 1/3 (IZBIRNI ODGOVOR)',
         title:
-          'Katera država ima največ časovnih pasov na svetu (vključno s čezmorskimi ozemlji)?',
+          'Kako se je imenoval lunarni modul misije Apollo 11, s katerim sta Neil Armstrong in Buzz Aldrin leta 1969 pristala na Luni?',
         options: {
-          A: 'Rusija',
-          B: 'ZDA',
-          C: 'Francija',
-          D: 'Kitajska',
+          A: 'Columbia',
+          B: 'Eagle (Orel)',
+          C: 'Challenger',
+          D: 'Odyssey',
         },
         type: 'multiple_choice',
-        accentColor: '#6366f1',
+        accentColor: '#38bdf8',
         points: 1,
         timerSeconds: 30,
       }),
     },
-    // Slajd 3: open_text
+    // Slajd 2: open_text
     {
       id: crypto.randomUUID(),
       theme_id: theme1Id,
       order_index: 2,
       slide_type: 'open_text',
-      question_text: 'Kako se imenuje najvišji slap v Sloveniji (106 m)?',
+      question_text:
+        'Katera vesoljska sonda, izstreljena leta 1977, je danes najbolj oddaljen človeški predmet v vesolju?',
       options: { A: '', B: '', C: '', D: '' },
-      correct_answer: 'Slap Boka',
+      correct_answer: 'Voyager 1',
       points: 1,
       timer_seconds: 0,
       slide_image_url: generateSlideSvgDataUrl({
         badge: '1. SKLOP • VPRAŠANJE 2/3 (ODPRTI VNOS)',
-        title: 'Kako se imenuje najvišji slap v Sloveniji (106 m)?',
+        title:
+          'Katera vesoljska sonda, izstreljena leta 1977, je danes najbolj oddaljen človeški predmet v vesolju?',
         subtitle: 'Vpišite besedilo odgovora na svojem telefonu',
         type: 'open_text',
-        accentColor: '#10b981',
+        accentColor: '#0ea5e9',
         points: 1,
       }),
     },
-    // Slajd 4: closest_number
+    // Slajd 3: closest_number
     {
       id: crypto.randomUUID(),
       theme_id: theme1Id,
       order_index: 3,
       slide_type: 'closest_number',
-      question_text: 'Koliko metrov meri obseg Zemlje ob ekvatorju (v km)?',
+      question_text:
+        'Koliko minut je trajal zgodovinski prvi polet Jurija Gagarina v vesolje leta 1961?',
       options: { A: '', B: '', C: '', D: '' },
-      correct_answer: '40075',
+      correct_answer: '108',
       points: 2,
       timer_seconds: 30,
       slide_image_url: generateSlideSvgDataUrl({
         badge: '1. SKLOP • VPRAŠANJE 3/3 (UGANI ŠTEVILKO)',
-        title: 'Koliko kilometrov meri obseg Zemlje ob ekvatorju (v km)?',
+        title:
+          'Koliko minut je trajal zgodovinski prvi polet Jurija Gagarina v vesolje leta 1961?',
         subtitle: 'Vpišite številko na svojem telefonu — najbližji približek prejme 2 točki!',
         type: 'closest_number',
-        accentColor: '#8b5cf6',
+        accentColor: '#818cf8',
         points: 2,
         timerSeconds: 30,
       }),
     },
   ];
 
-  // 2. Tematika: Film, Glasba in Šport
+  // 2. TEMATIKA: 2. Sklop: Geodezija
   const theme2Slides: Slide[] = [
-    // Slajd 1: theme_intro
+    // Slajd 0: theme_intro
     {
       id: crypto.randomUUID(),
       theme_id: theme2Id,
       order_index: 0,
       slide_type: 'theme_intro',
-      question_text: '2. SKLOP: FILM, GLASBA IN ŠPORT - Čas za vklop Jokerja!',
+      question_text: '2. SKLOP: GEODEZIJA — Čas za aktivacijo Jokerja!',
       options: { A: '', B: '', C: '', D: '' },
       correct_answer: '',
       points: 0,
       timer_seconds: 0,
       slide_image_url: generateSlideSvgDataUrl({
-        badge: '2. TEMATIKA • JOKER KORAK',
-        title: 'FILM, GLASBA IN ŠPORT',
-        subtitle: 'Čas za vklop JOKERJA na vaših telefonih za 2x točke!',
+        badge: '2. SKLOP • JOKER KORAK',
+        title: 'GEODEZIJA',
+        subtitle: 'Čas za aktivacijo JOKERJA na vaših telefonih za 2x točke!',
         type: 'theme_intro',
-        accentColor: '#f59e0b',
+        accentColor: '#10b981',
       }),
     },
-    // Slajd 2: info_only
+    // Slajd 1: multiple_choice
     {
       id: crypto.randomUUID(),
       theme_id: theme2Id,
       order_index: 1,
-      slide_type: 'info_only',
+      slide_type: 'multiple_choice',
       question_text:
-        'Pozorno si oglejte naslednja vprašanja - v tem krogu odločajo malenkosti!',
+        'Kako imenujemo fizikalno obliko Zemlje, ki jo določa srednja morska gladina mirujočih oceanov, podaljšana pod celinami?',
+      options: {
+        A: 'Elipsoid',
+        B: 'Geoid',
+        C: 'Sferoid',
+        D: 'Kartoza',
+      },
+      correct_answer: 'B) Geoid',
+      points: 1,
+      timer_seconds: 30,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '2. SKLOP • VPRAŠANJE 1/3 (IZBIRNI ODGOVOR)',
+        title:
+          'Kako imenujemo fizikalno obliko Zemlje, ki jo določa srednja morska gladina mirujočih oceanov, podaljšana pod celinami?',
+        options: {
+          A: 'Elipsoid',
+          B: 'Geoid',
+          C: 'Sferoid',
+          D: 'Kartoza',
+        },
+        type: 'multiple_choice',
+        accentColor: '#10b981',
+        points: 1,
+        timerSeconds: 30,
+      }),
+    },
+    // Slajd 2: open_text
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme2Id,
+      order_index: 2,
+      slide_type: 'open_text',
+      question_text:
+        'Kako se imenuje uradni državni koordinatni sistem v Sloveniji (kratica), ki je zamenjal starejši Gauss-Krügerjev sistem D48/GK?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: 'D96/TM',
+      points: 2,
+      timer_seconds: 0,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '2. SKLOP • VPRAŠANJE 2/3 (ODPRTI VNOS)',
+        title:
+          'Kako se imenuje uradni državni koordinatni sistem v Sloveniji (kratica), ki je zamenjal starejši Gauss-Krügerjev sistem D48/GK?',
+        subtitle: 'Vpišite besedilo odgovora na svojem telefonu',
+        type: 'open_text',
+        accentColor: '#059669',
+        points: 2,
+      }),
+    },
+    // Slajd 3: closest_number
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme2Id,
+      order_index: 3,
+      slide_type: 'closest_number',
+      question_text:
+        'Na kakšni višini nad Zemljo (v kilometrih) krožijo sateliti sistema GPS?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: '20200',
+      points: 2,
+      timer_seconds: 30,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '2. SKLOP • VPRAŠANJE 3/3 (UGANI ŠTEVILKO)',
+        title:
+          'Na kakšni višini nad Zemljo (v kilometrih) krožijo sateliti sistema GPS?',
+        subtitle: 'Vpišite številko na svojem telefonu — najbližji približek prejme 2 točki!',
+        type: 'closest_number',
+        accentColor: '#14b8a6',
+        points: 2,
+        timerSeconds: 30,
+      }),
+    },
+  ];
+
+  // 3. TEMATIKA: 3. Sklop: Tehnologija
+  const theme3Slides: Slide[] = [
+    // Slajd 0: theme_intro
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme3Id,
+      order_index: 0,
+      slide_type: 'theme_intro',
+      question_text: '3. SKLOP: TEHNOLOGIJA — Čas za aktivacijo Jokerja!',
       options: { A: '', B: '', C: '', D: '' },
       correct_answer: '',
       points: 0,
       timer_seconds: 0,
       slide_image_url: generateSlideSvgDataUrl({
-        badge: '2. SKLOP • VMESNA NAVODILA',
-        title: 'POZORNOST IN ZBRANOST!',
-        subtitle:
-          'Pozorno si oglejte naslednja vprašanja — v tem krogu odločajo malenkosti!',
-        type: 'info_only',
-        accentColor: '#38bdf8',
+        badge: '3. SKLOP • JOKER KORAK',
+        title: 'TEHNOLOGIJA',
+        subtitle: 'Čas za aktivacijo JOKERJA na vaših telefonih za 2x točke!',
+        type: 'theme_intro',
+        accentColor: '#6366f1',
       }),
     },
-    // Slajd 3: multiple_choice
+    // Slajd 1: multiple_choice
     {
       id: crypto.randomUUID(),
-      theme_id: theme2Id,
-      order_index: 2,
+      theme_id: theme3Id,
+      order_index: 1,
       slide_type: 'multiple_choice',
       question_text:
-        'Kateri slovenski kolesar je prvi osvojil dirko Tour de France?',
+        'Kdo je leta 1991 ustvaril jedro operacijskega sistema Linux in kasneje še sistem za nadzor različic Git?',
       options: {
-        A: 'Primož Roglič',
-        B: 'Tadej Pogačar',
-        C: 'Matej Mohorič',
-        D: 'Jan Tratnik',
+        A: 'Richard Stallman',
+        B: 'Ken Thompson',
+        C: 'Linus Torvalds',
+        D: 'Dennis Ritchie',
       },
-      correct_answer: 'B',
+      correct_answer: 'C) Linus Torvalds',
       points: 1,
-      timer_seconds: 20,
+      timer_seconds: 30,
       slide_image_url: generateSlideSvgDataUrl({
-        badge: '2. SKLOP • VPRAŠANJE 1/2 (IZBIRNI ODGOVOR)',
+        badge: '3. SKLOP • VPRAŠANJE 1/3 (IZBIRNI ODGOVOR)',
         title:
-          'Kateri slovenski kolesar je prvi osvojil dirko Tour de France?',
+          'Kdo je leta 1991 ustvaril jedro operacijskega sistema Linux in kasneje še sistem za nadzor različic Git?',
         options: {
-          A: 'Primož Roglič',
-          B: 'Tadej Pogačar',
-          C: 'Matej Mohorič',
-          D: 'Jan Tratnik',
+          A: 'Richard Stallman',
+          B: 'Ken Thompson',
+          C: 'Linus Torvalds',
+          D: 'Dennis Ritchie',
         },
         type: 'multiple_choice',
         accentColor: '#6366f1',
         points: 1,
+        timerSeconds: 30,
+      }),
+    },
+    // Slajd 2: open_text
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme3Id,
+      order_index: 2,
+      slide_type: 'open_text',
+      question_text:
+        'Kaj pomeni kratica HTTP na začetku spletnih naslovov (polno angleško ime)?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: 'HyperText Transfer Protocol',
+      points: 1,
+      timer_seconds: 0,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '3. SKLOP • VPRAŠANJE 2/3 (ODPRTI VNOS)',
+        title:
+          'Kaj pomeni kratica HTTP na začetku spletnih naslovov (polno angleško ime)?',
+        subtitle: 'Vpišite besedilo odgovora na svojem telefonu',
+        type: 'open_text',
+        accentColor: '#4f46e5',
+        points: 1,
+      }),
+    },
+    // Slajd 3: closest_number
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme3Id,
+      order_index: 3,
+      slide_type: 'closest_number',
+      question_text: 'Katerega leta je Steve Jobs predstavil čisto prvi iPhone?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: '2007',
+      points: 1,
+      timer_seconds: 20,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '3. SKLOP • VPRAŠANJE 3/3 (UGANI ŠTEVILKO)',
+        title: 'Katerega leta je Steve Jobs predstavil čisto prvi iPhone?',
+        subtitle: 'Vpišite številko na svojem telefonu — najbližji približek prejme 1 točko!',
+        type: 'closest_number',
+        accentColor: '#7c3aed',
+        points: 1,
         timerSeconds: 20,
       }),
     },
-    // Slajd 4: open_text
+  ];
+
+  // 4. TEMATIKA: 4. Sklop: 2. svetovna vojna
+  const theme4Slides: Slide[] = [
+    // Slajd 0: theme_intro
     {
       id: crypto.randomUUID(),
-      theme_id: theme2Id,
-      order_index: 3,
-      slide_type: 'open_text',
-      question_text:
-        'Napišite naslov filma, ki je leta 2020 kot prvi tujejezični film osvojil oskarja za najboljši film.',
+      theme_id: theme4Id,
+      order_index: 0,
+      slide_type: 'theme_intro',
+      question_text: '4. SKLOP: 2. SVETOVNA VOJNA — Čas za aktivacijo Jokerja!',
       options: { A: '', B: '', C: '', D: '' },
-      correct_answer: 'Parazit',
-      points: 2,
+      correct_answer: '',
+      points: 0,
       timer_seconds: 0,
       slide_image_url: generateSlideSvgDataUrl({
-        badge: '2. SKLOP • VPRAŠANJE 2/2 (ODPRTI VNOS)',
+        badge: '4. SKLOP • JOKER KORAK',
+        title: '2. SVETOVNA VOJNA',
+        subtitle: 'Čas za aktivacijo JOKERJA na vaših telefonih za 2x točke!',
+        type: 'theme_intro',
+        accentColor: '#f43f5e',
+      }),
+    },
+    // Slajd 1: multiple_choice
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme4Id,
+      order_index: 1,
+      slide_type: 'multiple_choice',
+      question_text:
+        'Kako se je imenovala zavezniška vojaška operacija izkrcanja v Normandiji 6. junija 1944?',
+      options: {
+        A: 'Operacija Barbarossa',
+        B: 'Operacija Overlord',
+        C: 'Operacija Market Garden',
+        D: 'Operacija Torch',
+      },
+      correct_answer: 'B) Operacija Overlord',
+      points: 1,
+      timer_seconds: 30,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '4. SKLOP • VPRAŠANJE 1/3 (IZBIRNI ODGOVOR)',
         title:
-          'Napišite naslov filma, ki je leta 2020 kot prvi tujejezični film osvojil oskarja za najboljši film.',
+          'Kako se je imenovala zavezniška vojaška operacija izkrcanja v Normandiji 6. junija 1944?',
+        options: {
+          A: 'Operacija Barbarossa',
+          B: 'Operacija Overlord',
+          C: 'Operacija Market Garden',
+          D: 'Operacija Torch',
+        },
+        type: 'multiple_choice',
+        accentColor: '#f43f5e',
+        points: 1,
+        timerSeconds: 30,
+      }),
+    },
+    // Slajd 2: open_text
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme4Id,
+      order_index: 2,
+      slide_type: 'open_text',
+      question_text:
+        'Katero sovjetsko mesto (današnji Sankt Peterburg) je med vojno preživelo skoraj 900-dnevno nemško obleganje?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: 'Leningrad',
+      points: 1,
+      timer_seconds: 0,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '4. SKLOP • VPRAŠANJE 2/3 (ODPRTI VNOS)',
+        title:
+          'Katero sovjetsko mesto (današnji Sankt Peterburg) je med vojno preživelo skoraj 900-dnevno nemško obleganje?',
         subtitle: 'Vpišite besedilo odgovora na svojem telefonu',
         type: 'open_text',
-        accentColor: '#10b981',
+        accentColor: '#e11d48',
+        points: 1,
+      }),
+    },
+    // Slajd 3: closest_number
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme4Id,
+      order_index: 3,
+      slide_type: 'closest_number',
+      question_text:
+        'Koliko japonskih letalonosilk je sodelovalo v napadu na Pearl Harbor decembra 1941?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: '6',
+      points: 2,
+      timer_seconds: 30,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '4. SKLOP • VPRAŠANJE 3/3 (UGANI ŠTEVILKO)',
+        title:
+          'Koliko japonskih letalonosilk je sodelovalo v napadu na Pearl Harbor decembra 1941?',
+        subtitle: 'Vpišite številko na svojem telefonu — najbližji približek prejme 2 točki!',
+        type: 'closest_number',
+        accentColor: '#fb7185',
         points: 2,
+        timerSeconds: 30,
+      }),
+    },
+  ];
+
+  // 5. TEMATIKA: 5. Sklop: Glasba v filmih in serijah
+  const theme5Slides: Slide[] = [
+    // Slajd 0: theme_intro
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme5Id,
+      order_index: 0,
+      slide_type: 'theme_intro',
+      question_text:
+        '5. SKLOP: GLASBA V FILMIH IN SERIJAH — Čas za aktivacijo Jokerja!',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: '',
+      points: 0,
+      timer_seconds: 0,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '5. SKLOP • JOKER KORAK',
+        title: 'GLASBA V FILMIH IN SERIJAH',
+        subtitle: 'Čas za aktivacijo JOKERJA na vaših telefonih za 2x točke!',
+        type: 'theme_intro',
+        accentColor: '#ec4899',
+      }),
+    },
+    // Slajd 1: multiple_choice
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme5Id,
+      order_index: 1,
+      slide_type: 'multiple_choice',
+      question_text:
+        'Kateri skladatelj je ustvaril glasbo za filme Interstellar, Inception, Gladiator in Dune?',
+      options: {
+        A: 'John Williams',
+        B: 'Ennio Morricone',
+        C: 'Hans Zimmer',
+        D: 'Howard Shore',
+      },
+      correct_answer: 'C) Hans Zimmer',
+      points: 1,
+      timer_seconds: 20,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '5. SKLOP • VPRAŠANJE 1/3 (IZBIRNI ODGOVOR)',
+        title:
+          'Kateri skladatelj je ustvaril glasbo za filme Interstellar, Inception, Gladiator in Dune?',
+        options: {
+          A: 'John Williams',
+          B: 'Ennio Morricone',
+          C: 'Hans Zimmer',
+          D: 'Howard Shore',
+        },
+        type: 'multiple_choice',
+        accentColor: '#ec4899',
+        points: 1,
+        timerSeconds: 20,
+      }),
+    },
+    // Slajd 2: open_text
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme5Id,
+      order_index: 2,
+      slide_type: 'open_text',
+      question_text:
+        'Katera pesem pevke Kate Bush iz leta 1985 je ponovno postala svetovni hit zaradi 4. sezone serije Stranger Things?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: 'Running Up That Hill',
+      points: 1,
+      timer_seconds: 0,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '5. SKLOP • VPRAŠANJE 2/3 (ODPRTI VNOS)',
+        title:
+          'Katera pesem pevke Kate Bush iz leta 1985 je ponovno postala svetovni hit zaradi 4. sezone serije Stranger Things?',
+        subtitle: 'Vpišite besedilo odgovora na svojem telefonu',
+        type: 'open_text',
+        accentColor: '#db2777',
+        points: 1,
+      }),
+    },
+    // Slajd 3: closest_number
+    {
+      id: crypto.randomUUID(),
+      theme_id: theme5Id,
+      order_index: 3,
+      slide_type: 'closest_number',
+      question_text:
+        'Koliko nominacij za oskarja je v svoji karieri zbral legendarni filmski skladatelj John Williams?',
+      options: { A: '', B: '', C: '', D: '' },
+      correct_answer: '54',
+      points: 2,
+      timer_seconds: 30,
+      slide_image_url: generateSlideSvgDataUrl({
+        badge: '5. SKLOP • VPRAŠANJE 3/3 (UGANI ŠTEVILKO)',
+        title:
+          'Koliko nominacij za oskarja je v svoji karieri zbral legendarni filmski skladatelj John Williams?',
+        subtitle: 'Vpišite številko na svojem telefonu — najbližji približek prejme 2 točki!',
+        type: 'closest_number',
+        accentColor: '#f472b6',
+        points: 2,
+        timerSeconds: 30,
       }),
     },
   ];
@@ -430,6 +789,9 @@ export async function createMegaDemoQuiz(hostId: string): Promise<Quiz> {
   const slidesByTheme: Record<string, Slide[]> = {
     [theme1Id]: theme1Slides,
     [theme2Id]: theme2Slides,
+    [theme3Id]: theme3Slides,
+    [theme4Id]: theme4Slides,
+    [theme5Id]: theme5Slides,
   };
 
   // Shrani celoten kviz neposredno v Supabase bazo (quizzes, themes, slides) z UPSERT
