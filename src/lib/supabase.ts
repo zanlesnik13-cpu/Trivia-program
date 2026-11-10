@@ -1,14 +1,15 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const STORAGE_URL_KEY = 'https://nwpftuydshsguorxlkie.supabase.co';
-const STORAGE_ANON_KEY = 'sb_publishable_0We5ATxLgWOT3yuorwoUZQ_ICO-SY5N';
+const STORAGE_URL_KEY = 'trivia_supabase_url';
+const STORAGE_ANON_KEY = 'trivia_supabase_anon_key';
 
 /**
  * Privzeta Supabase baza za aplikacijo (hardcoded fallback, če .env ali localStorage nista nastavljena).
  */
 export const DEFAULT_SUPABASE_URL = 'https://nwpftuydshsguorxlkie.supabase.co';
 export const DEFAULT_SUPABASE_ANON_KEY =
-  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) || '';
+  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ||
+  'sb_publishable_0We5ATxLgWOT3yuorwoUZQ_ICO-SY5N';
 
 /**
  * Samodejno očisti Supabase URL:
