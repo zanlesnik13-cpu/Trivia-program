@@ -147,7 +147,7 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
     setLaunchingQuizId(quiz.id);
     setError(null);
     try {
-      const session = await createLiveGameSession(quiz.id);
+      const session = await createLiveGameSession(quiz.id, hostId);
       // Osveži seznam aktivnih sej in odpri pojavno okno (Modal) za izbiro naprave (BREZ samodejne preusmeritve)
       setActiveSessions((prev) => [
         { session, quizTitle: quiz.title, playerCount: 0 },

@@ -29,10 +29,10 @@ import {
   deleteSlide,
   deleteTheme,
   fetchQuizDetails,
-  updateQuizMeta,
   updateSlide,
   updateTheme,
   uploadSlideImage,
+  upsertFullQuiz,
 } from '../lib/quizService';
 import type { Quiz, Slide, SlideOptions, SlideType, Theme } from '../types/quiz';
 
@@ -164,42 +164,28 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
   const currentSlide =
     currentSlides.find((s) => s.id === selectedSlideId) || currentSlides[0] || null;
 
-  // Shrani osnovne podatke kviza (naslov + max_jokers_per_player) IN trenutno izbrani slajd
-  const handleSaveQuizHeader = async () => {
+  // Shrani celoten kviz, vse tematike in vse slajde z UPSERT neposredno v Supabase bazo (in lokalno)
+  const handleSaveFullQuiz = async () => {
     if (!quiz) return;
     setSavingQuizMeta(true);
     setError(null);
     try {
-      const updated = await updateQuizMeta(quiz.id, {
-        title: quiz.title,
-        max_jokers_per_player: quiz.max_jokers_per_player,
-      });
-      setQuiz(updated);
-
+      // 1. Pripravi ažurno stanje slajdov (vključno s trenutno urejanim slajdom v formi)
+      const currentSlidesMap: Record<string, Slide[]> = { ...slidesByTheme };
       if (currentTheme && currentSlide) {
-        const savedSlide = await updateSlide(currentSlide.id, {
-          slide_type: currentSlide.slide_type,
-          question_text: currentSlide.question_text,
-          options: currentSlide.options,
-          correct_answer: currentSlide.correct_answer,
-          points: currentSlide.points,
-          timer_seconds: currentSlide.timer_seconds,
-          slide_image_url: currentSlide.slide_image_url,
-          order_index: currentSlide.order_index,
-        });
-        setSlidesByTheme((prev) => ({
-          ...prev,
-          [currentTheme.id]: (prev[currentTheme.id] || []).map((s) =>
-            s.id === savedSlide.id ? savedSlide : s
-          ),
-        }));
+        currentSlidesMap[currentTheme.id] = (currentSlidesMap[currentTheme.id] || []).map((s) =>
+          s.id === currentSlide.id ? currentSlide : s
+        );
       }
 
-      showToast('Vse spremembe kviza in slajda so shranjene!');
+      // 2. Shrani kviz, vse tematike in vse slajde z UPSERT v Supabase bazo
+      await upsertFullQuiz(quiz, themes, currentSlidesMap);
+      setSlidesByTheme(currentSlidesMap);
+      showToast('Kviz, vse tematike in slajdi so uspešno shranjeni v bazo!');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri shranjevanju kviza.';
       setError(msg);
-      window.alert(`Napaka pri shranjevanju:\n${msg}`);
+      window.alert(`Napaka pri shranjevanju kviza:\n${msg}`);
     } finally {
       setSavingQuizMeta(false);
     }
@@ -220,14 +206,17 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
         defaultTitle,
         themes.length
       );
-      setThemes((prev) => [...prev, theme]);
-      setSlidesByTheme((prev) => ({
-        ...prev,
+      const nextThemes = [...themes, theme];
+      const nextSlidesMap = {
+        ...slidesByTheme,
         [theme.id]: [introSlide],
-      }));
+      };
+      setThemes(nextThemes);
+      setSlidesByTheme(nextSlidesMap);
       setSelectedThemeId(theme.id);
       setSelectedSlideId(introSlide.id);
       setNewThemeTitle('');
+      await upsertFullQuiz(quiz, nextThemes, nextSlidesMap);
       showToast(`Dodana tematika "${theme.title}" z začetnim Joker slajdom.`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri ustvarjanju tematike.';
@@ -289,7 +278,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
   // Dodaj nov prazen slajd v trenutno tematiko
   const handleAddBlankSlide = async (type: SlideType = 'multiple_choice') => {
-    if (!currentTheme || addingSlide) return;
+    if (!currentTheme || addingSlide || !quiz) return;
     setAddingSlide(true);
     setError(null);
     try {
@@ -319,11 +308,14 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
         timer_seconds: type === 'theme_intro' || type === 'info_only' ? 0 : 30,
       });
 
-      setSlidesByTheme((prev) => ({
-        ...prev,
-        [currentTheme.id]: [...(prev[currentTheme.id] || []), created],
-      }));
+      const nextSlides = [...(slidesByTheme[currentTheme.id] || []), created];
+      const nextSlidesMap = {
+        ...slidesByTheme,
+        [currentTheme.id]: nextSlides,
+      };
+      setSlidesByTheme(nextSlidesMap);
       setSelectedSlideId(created.id);
+      await upsertFullQuiz(quiz, themes, nextSlidesMap);
       showToast('Nov slajd dodan v tematiko.');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri dodajanju slajda.';
@@ -432,16 +424,19 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       }
 
       const finalSlides = [...existingSlides, ...createdSlides];
-      setSlidesByTheme((prev) => ({
-        ...prev,
+      const nextSlidesMap = {
+        ...slidesByTheme,
         [currentTheme.id]: finalSlides,
-      }));
+      };
+      setSlidesByTheme(nextSlidesMap);
 
       if (finalSlides.length > 0) {
         setSelectedSlideId(
           createdSlides[0]?.id || finalSlides[0].id
         );
       }
+
+      await upsertFullQuiz(quiz, themes, nextSlidesMap);
 
       showToast(
         `Uspešno uvoženih ${renderedPages.length} strani iz PDF datoteke!`
@@ -506,13 +501,16 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       }
 
       const finalSlides = [...existingSlides, ...createdSlides];
-      setSlidesByTheme((prev) => ({
-        ...prev,
+      const nextSlidesMap = {
+        ...slidesByTheme,
         [currentTheme.id]: finalSlides,
-      }));
+      };
+      setSlidesByTheme(nextSlidesMap);
       if (createdSlides.length > 0) {
         setSelectedSlideId(createdSlides[0].id);
       }
+
+      await upsertFullQuiz(quiz, themes, nextSlidesMap);
       showToast(`Uspešno dodanih ${createdSlides.length} slikovnih slajdov!`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri nalaganju slik.';
@@ -548,12 +546,14 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
       const updated = await updateSlide(currentSlide.id, {
         slide_image_url: publicUrl,
       });
-      setSlidesByTheme((prev) => ({
-        ...prev,
-        [currentTheme.id]: (prev[currentTheme.id] || []).map((s) =>
+      const nextSlidesMap = {
+        ...slidesByTheme,
+        [currentTheme.id]: (slidesByTheme[currentTheme.id] || []).map((s) =>
           s.id === updated.id ? updated : s
         ),
-      }));
+      };
+      setSlidesByTheme(nextSlidesMap);
+      await upsertFullQuiz(quiz, themes, nextSlidesMap);
       showToast('Slika slajda posodobljena.');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri menjavi slike slajda.';
@@ -587,31 +587,23 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
     updateLocalSlideField('options', nextOptions);
   };
 
-  // Shrani izbrani slajd v Supabase
+  // Shrani izbrani slajd in celoten kviz z UPSERT v Supabase bazo
   const handleSaveCurrentSlide = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!currentTheme || !currentSlide) return;
+    if (!currentTheme || !currentSlide || !quiz) return;
     setSavingSlide(true);
     setError(null);
     try {
-      const saved = await updateSlide(currentSlide.id, {
-        slide_type: currentSlide.slide_type,
-        question_text: currentSlide.question_text,
-        options: currentSlide.options,
-        correct_answer: currentSlide.correct_answer,
-        points: currentSlide.points,
-        timer_seconds: currentSlide.timer_seconds,
-        slide_image_url: currentSlide.slide_image_url,
-        order_index: currentSlide.order_index,
-      });
-
-      setSlidesByTheme((prev) => ({
-        ...prev,
-        [currentTheme.id]: (prev[currentTheme.id] || []).map((s) =>
-          s.id === saved.id ? saved : s
+      const nextSlidesMap: Record<string, Slide[]> = {
+        ...slidesByTheme,
+        [currentTheme.id]: (slidesByTheme[currentTheme.id] || []).map((s) =>
+          s.id === currentSlide.id ? currentSlide : s
         ),
-      }));
-      showToast('Slajd uspešno shranjen.');
+      };
+
+      await upsertFullQuiz(quiz, themes, nextSlidesMap);
+      setSlidesByTheme(nextSlidesMap);
+      showToast('Slajd in kviz uspešno shranjena v bazo.');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Napaka pri shranjevanju slajda.';
       setError(msg);
@@ -716,18 +708,15 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
           <button
             id="back-to-dashboard-btn"
             onClick={async () => {
-              if (currentSlide) {
+              if (quiz) {
                 try {
-                  await updateSlide(currentSlide.id, {
-                    slide_type: currentSlide.slide_type,
-                    question_text: currentSlide.question_text,
-                    options: currentSlide.options,
-                    correct_answer: currentSlide.correct_answer,
-                    points: currentSlide.points,
-                    timer_seconds: currentSlide.timer_seconds,
-                    slide_image_url: currentSlide.slide_image_url,
-                    order_index: currentSlide.order_index,
-                  });
+                  const currentSlidesMap: Record<string, Slide[]> = { ...slidesByTheme };
+                  if (currentTheme && currentSlide) {
+                    currentSlidesMap[currentTheme.id] = (currentSlidesMap[currentTheme.id] || []).map((s) =>
+                      s.id === currentSlide.id ? currentSlide : s
+                    );
+                  }
+                  await upsertFullQuiz(quiz, themes, currentSlidesMap);
                 } catch {
                   // nadaljuj nazaj
                 }
@@ -778,16 +767,16 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                 />
                 <button
                   id="save-quiz-meta-btn"
-                  onClick={handleSaveQuizHeader}
+                  onClick={handleSaveFullQuiz}
                   disabled={savingQuizMeta}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
                 >
                   {savingQuizMeta ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   ) : (
                     <Save className="w-3.5 h-3.5" />
                   )}
-                  <span>{savingQuizMeta ? 'Shranjevanje...' : 'Shrani vse'}</span>
+                  <span>{savingQuizMeta ? 'Shranjevanje v bazo...' : 'Shrani kviz'}</span>
                 </button>
               </div>
             </div>

@@ -234,6 +234,186 @@ function formatSupabaseError(err: unknown, context: string): Error {
   return new Error(`${context}: Neznana napaka.`);
 }
 
+function getValidUuidHostId(rawHostId?: string): string {
+  if (rawHostId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawHostId)) {
+    return rawHostId;
+  }
+  if (typeof window !== 'undefined') {
+    const stored = localStorage.getItem('guest_host_id');
+    if (stored && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stored)) {
+      return stored;
+    }
+  }
+  const newUuid = crypto.randomUUID();
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('guest_host_id', newUuid);
+  }
+  return newUuid;
+}
+
+/**
+ * Shrani celoten kviz (quizzes), njegove tematike (themes) in vse slajde (slides)
+ * z operacijo UPSERT neposredno v Supabase bazo (in posodobi lokalni pomnilnik).
+ */
+export async function upsertFullQuiz(
+  quiz: Quiz,
+  themes: Theme[],
+  slidesByTheme: Record<string, Slide[]>,
+  hostId?: string
+): Promise<void> {
+  // 1. Posodobi lokalni pomnilnik (localStorage demo bazo)
+  try {
+    const db = getInitialDemoDb();
+    const qIdx = db.quizzes.findIndex((q) => q.id === quiz.id);
+    if (qIdx >= 0) {
+      db.quizzes[qIdx] = { ...quiz };
+    } else {
+      db.quizzes.unshift({ ...quiz });
+    }
+
+    const remainingThemes = db.themes.filter((t) => t.quiz_id !== quiz.id);
+    db.themes = [...remainingThemes, ...themes];
+
+    const themeIds = new Set(themes.map((t) => t.id));
+    const remainingSlides = db.slides.filter((s) => !themeIds.has(s.theme_id));
+    const allSlides: Slide[] = [];
+    for (const theme of themes) {
+      const tSlides = slidesByTheme[theme.id] || [];
+      tSlides.forEach((s, idx) => {
+        allSlides.push({
+          ...s,
+          theme_id: theme.id,
+          order_index: s.order_index ?? idx,
+        });
+      });
+    }
+    db.slides = [...remainingSlides, ...allSlides];
+    saveDemoDb(db);
+  } catch {
+    // ignoriraj morebitne napake pri dostopu do localStorage
+  }
+
+  // 2. Če je Supabase konfiguriran, izvedi celovit UPSERT vseh tabel
+  const supabase = getSupabaseClient();
+  if (!supabase) return;
+
+  const effectiveHostId = getValidUuidHostId(hostId || quiz.host_id);
+
+  // a) Upsert kviza v tabelo quizzes (id, host_id, title, max_jokers_per_player)
+  const { error: quizErr } = await supabase.from('quizzes').upsert(
+    {
+      id: quiz.id,
+      host_id: effectiveHostId,
+      title: quiz.title,
+      max_jokers_per_player: quiz.max_jokers_per_player ?? 1,
+    },
+    { onConflict: 'id' }
+  );
+
+  if (quizErr) {
+    throw formatSupabaseError(quizErr, 'Napaka pri shranjevanju kviza v Supabase tabelo quizzes');
+  }
+
+  // b) Upsert tematik v tabelo themes (id, quiz_id, title, order_index)
+  if (themes.length > 0) {
+    const { error: themesErr } = await supabase.from('themes').upsert(
+      themes.map((t, idx) => ({
+        id: t.id,
+        quiz_id: quiz.id,
+        title: t.title,
+        order_index: t.order_index ?? idx,
+      })),
+      { onConflict: 'id' }
+    );
+
+    if (themesErr) {
+      throw formatSupabaseError(themesErr, 'Napaka pri shranjevanju tematik v Supabase tabelo themes');
+    }
+  }
+
+  // c) Upsert vseh slajdov v tabelo slides (id, theme_id, order_index, slide_image_url, slide_type, question_text, options, correct_answer, points, timer_seconds)
+  const allSlidesToUpsert: Slide[] = [];
+  for (const theme of themes) {
+    const tSlides = slidesByTheme[theme.id] || [];
+    tSlides.forEach((s, idx) => {
+      allSlidesToUpsert.push({
+        ...s,
+        theme_id: theme.id,
+        order_index: s.order_index ?? idx,
+      });
+    });
+  }
+
+  if (allSlidesToUpsert.length > 0) {
+    const { error: slidesErr } = await supabase.from('slides').upsert(
+      allSlidesToUpsert.map((s) => ({
+        id: s.id,
+        theme_id: s.theme_id,
+        order_index: s.order_index,
+        slide_image_url: s.slide_image_url ?? null,
+        slide_type: s.slide_type,
+        question_text: s.question_text ?? '',
+        options: s.options ?? { A: '', B: '', C: '', D: '' },
+        correct_answer: s.correct_answer ?? '',
+        points: Number(s.points ?? (s.slide_type === 'theme_intro' || s.slide_type === 'info_only' ? 0 : 1)),
+        timer_seconds: Number(s.timer_seconds ?? 0),
+      })),
+      { onConflict: 'id' }
+    );
+
+    if (slidesErr) {
+      throw formatSupabaseError(slidesErr, 'Napaka pri shranjevanju slajdov v Supabase tabelo slides');
+    }
+  }
+}
+
+/**
+ * Zagotovi, da je celoten kviz (s tematikami in slajdi) prisoten v Supabase bazi,
+ * preden se v tabeli game_sessions ustvari nova seja.
+ */
+export async function ensureQuizSyncedToSupabase(quizId: string, hostId?: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return;
+
+  // 1. Preveri lokalni pomnilnik (kjer je npr. privzeti demo kviz "Veliki Petkov Pub Kviz #14" ali lokalno ustvarjen kviz)
+  const db = getInitialDemoDb();
+  const localQuiz = db.quizzes.find((q) => q.id === quizId);
+  const localThemes = db.themes
+    .filter((t) => t.quiz_id === quizId)
+    .sort((a, b) => a.order_index - b.order_index);
+  const localThemeIds = new Set(localThemes.map((t) => t.id));
+  const localSlides = db.slides
+    .filter((s) => localThemeIds.has(s.theme_id))
+    .sort((a, b) => a.order_index - b.order_index);
+
+  if (localQuiz) {
+    const slidesByTheme: Record<string, Slide[]> = {};
+    for (const t of localThemes) {
+      slidesByTheme[t.id] = localSlides.filter((s) => s.theme_id === t.id);
+    }
+    // Brezpogojno izvedi upsert kviza, tematik in slajdov v Supabase
+    await upsertFullQuiz(localQuiz, localThemes, slidesByTheme, hostId);
+    return;
+  }
+
+  // 2. Če kviz ni v lokalnem pomnilniku, preveri, ali je že v Supabase bazi
+  const { data: existingInDb, error: checkErr } = await supabase
+    .from('quizzes')
+    .select('id, title')
+    .eq('id', quizId)
+    .maybeSingle();
+
+  if (checkErr) {
+    throw formatSupabaseError(checkErr, 'Napaka pri preverjanju obstoja kviza v Supabase');
+  }
+
+  if (!existingInDb) {
+    throw new Error(
+      `Kviz z ID "${quizId}" ne obstaja v bazi niti v lokalnem pomnilniku. Pred zagonom prosimo shranite kviz.`
+    );
+  }
+}
+
 export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]> {
   const supabase = getSupabaseClient();
   if (!supabase) {
@@ -250,16 +430,58 @@ export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]>
     });
   }
 
+  // Poskusi prebrati kvize za tega gostitelja (in morebitne z demo-host)
   const { data: quizzes, error } = await supabase
     .from('quizzes')
     .select('*')
-    .eq('host_id', hostId)
+    .or(`host_id.eq.${hostId},host_id.eq.demo-host`)
     .order('created_at', { ascending: false });
 
   if (error) throw formatSupabaseError(error, 'Napaka pri nalaganju kvizov');
-  if (!quizzes || quizzes.length === 0) return [];
 
-  const quizIds = quizzes.map((q) => q.id);
+  // Preveri lokalno bazo in sinhroniziraj kvize, ki še niso v Supabase bazi
+  const db = getInitialDemoDb();
+  const existingIds = new Set((quizzes || []).map((q) => q.id));
+
+  for (const lq of db.quizzes) {
+    if (!existingIds.has(lq.id)) {
+      const lThemes = db.themes.filter((t) => t.quiz_id === lq.id);
+      const lSlides = db.slides.filter((s) => lThemes.some((t) => t.id === s.theme_id));
+      const sByTheme: Record<string, Slide[]> = {};
+      for (const t of lThemes) {
+        sByTheme[t.id] = lSlides.filter((s) => s.theme_id === t.id);
+      }
+      try {
+        await upsertFullQuiz(lq, lThemes, sByTheme, hostId);
+      } catch (e) {
+        console.warn('Samodejna sinhronizacija lokalnega kviza v Supabase ni uspela:', e);
+      }
+    }
+  }
+
+  // Preberi osvežene kvize iz Supabase
+  const { data: refreshedQuizzes } = await supabase
+    .from('quizzes')
+    .select('*')
+    .or(`host_id.eq.${hostId},host_id.eq.demo-host`)
+    .order('created_at', { ascending: false });
+
+  const finalQuizzes = (refreshedQuizzes && refreshedQuizzes.length > 0) ? refreshedQuizzes : (quizzes || []);
+
+  if (finalQuizzes.length === 0) {
+    return db.quizzes.map((q) => {
+      const qThemes = db.themes.filter((t) => t.quiz_id === q.id);
+      const themeIds = new Set(qThemes.map((t) => t.id));
+      const qSlides = db.slides.filter((s) => themeIds.has(s.theme_id));
+      return {
+        ...q,
+        theme_count: qThemes.length,
+        slide_count: qSlides.length,
+      };
+    });
+  }
+
+  const quizIds = finalQuizzes.map((q) => q.id);
   const { data: themes } = await supabase
     .from('themes')
     .select('id, quiz_id')
@@ -277,7 +499,7 @@ export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]>
     slideList = slides || [];
   }
 
-  return quizzes.map((q) => {
+  return finalQuizzes.map((q) => {
     const qThemes = themeList.filter((t) => t.quiz_id === q.id);
     const qThemeIds = new Set(qThemes.map((t) => t.id));
     const qSlides = slideList.filter((s) => qThemeIds.has(s.theme_id));
@@ -444,9 +666,34 @@ export async function fetchQuizDetails(quizId: string): Promise<{
     .from('quizzes')
     .select('*')
     .eq('id', quizId)
-    .single();
+    .maybeSingle();
 
   if (quizErr || !quiz) {
+    const db = getInitialDemoDb();
+    const localQuiz = db.quizzes.find((q) => q.id === quizId);
+    if (localQuiz) {
+      const themes = db.themes
+        .filter((t) => t.quiz_id === quizId)
+        .sort((a, b) => a.order_index - b.order_index);
+      const slidesByTheme: Record<string, Slide[]> = {};
+      for (const theme of themes) {
+        slidesByTheme[theme.id] = db.slides
+          .filter((s) => s.theme_id === theme.id)
+          .sort((a, b) => a.order_index - b.order_index)
+          .map((s) => ({
+            ...s,
+            options: normalizeOptions(s.options),
+            points: Number(s.points ?? 1),
+            timer_seconds: Number(s.timer_seconds ?? 0),
+          }));
+      }
+      try {
+        await upsertFullQuiz(localQuiz, themes, slidesByTheme);
+      } catch (e) {
+        console.warn('Sinhronizacija lokalnega kviza v Supabase ni uspela:', e);
+      }
+      return { quiz: localQuiz, themes, slidesByTheme };
+    }
     throw formatSupabaseError(quizErr || new Error('Kviz ni bil najden.'), 'Napaka pri branju kviza');
   }
 
@@ -748,7 +995,7 @@ export interface ActiveGameSessionWithQuiz {
 /**
  * Ustvari novo živo sejo s 4-mestno številčno kodo ('room_code') in statusom 'lobby'.
  */
-export async function createLiveGameSession(quizId: string): Promise<GameSession> {
+export async function createLiveGameSession(quizId: string, hostId?: string): Promise<GameSession> {
   const generateNumericRoomCode = () => {
     // 4-mestna številčna koda med 1000 in 9999
     return String(Math.floor(1000 + Math.random() * 9000));
@@ -792,6 +1039,10 @@ export async function createLiveGameSession(quizId: string): Promise<GameSession
     notifyDemoUpdate('SESSION_CREATED', session.id);
     return session;
   }
+
+  // 1. ZAGOTOVI, DA JE CELOTEN KVIZ (S TEMATIKAMI IN SLAJDI) ZAPISAN V SUPABASE (UPSERT)
+  // Tako se napaka 23503 foreign key constraint nikoli ne more zgoditi!
+  await ensureQuizSyncedToSupabase(quizId, hostId);
 
   const { data: themes, error: themeError } = await supabase
     .from('themes')
