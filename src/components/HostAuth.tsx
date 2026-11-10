@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
-  Database,
   Lock,
   LogIn,
   Mail,
@@ -327,38 +326,20 @@ export const HostAuth: React.FC<HostAuthProps> = ({
             </p>
           </div>
 
-          {/* Status Supabase povezave & Nastavitve */}
-          <div className="pt-4 border-t border-slate-800/80 space-y-3">
-            {!isConfigured ? (
-              <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 flex items-center justify-between">
-                <span className="text-xs font-medium text-amber-300 flex items-center gap-1.5">
-                  <Database className="w-3.5 h-3.5" />
-                  Supabase ključa še nista nastavljena
-                </span>
-                <button
-                  id="open-supabase-setup-from-auth-btn"
-                  type="button"
-                  onClick={onOpenSupabaseModal}
-                  className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
-                >
-                  Nastavi &amp; SQL
-                </button>
-              </div>
-            ) : (
-              <div className="flex items-center justify-between text-xs text-slate-400">
-                <span className="flex items-center gap-1.5 text-emerald-400 font-medium">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  Povezano s Supabase Auth
-                </span>
-                <button
-                  type="button"
-                  onClick={onOpenSupabaseModal}
-                  className="text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
-                >
-                  SQL Skripta &amp; Nastavitve
-                </button>
-              </div>
-            )}
+          {/* Status povezave & Nastavitve */}
+          <div className="pt-4 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+            <span className="flex items-center gap-1.5 font-medium">
+              <span className={`w-2 h-2 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+              {isConfigured ? 'Povezano s Supabase Auth' : 'QuizPulse Baza'}
+            </span>
+            <button
+              id="open-supabase-setup-from-auth-btn"
+              type="button"
+              onClick={onOpenSupabaseModal}
+              className="text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+            >
+              Nastavitve baze
+            </button>
           </div>
         </div>
       </div>

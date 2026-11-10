@@ -4,6 +4,13 @@ const STORAGE_URL_KEY = 'trivia_supabase_url';
 const STORAGE_ANON_KEY = 'trivia_supabase_anon_key';
 
 /**
+ * Privzeta Supabase baza za aplikacijo (hardcoded fallback, če .env ali localStorage nista nastavljena).
+ */
+export const DEFAULT_SUPABASE_URL = 'https://nwpftuydshsguorxlkie.supabase.co';
+export const DEFAULT_SUPABASE_ANON_KEY =
+  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) || '';
+
+/**
  * Samodejno očisti Supabase URL:
  * 1. Če uporabnik skopira povezavo iz Supabase Dashboarda:
  *    https://supabase.com/dashboard/project/<project_ref>...
@@ -86,17 +93,24 @@ export function getSupabaseConfig() {
     }
   }
 
-  const rawUrl = localUrl || envUrl || '';
-  const rawKey = localKey || envKey || '';
+  const rawUrl = localUrl || envUrl || DEFAULT_SUPABASE_URL;
+  const rawKey = localKey || envKey || DEFAULT_SUPABASE_ANON_KEY;
 
-  const url = cleanSupabaseUrl(rawUrl);
-  const anonKey = cleanSupabaseAnonKey(rawKey);
+  let url = cleanSupabaseUrl(rawUrl);
+  if (!url || url.includes('your-project-id')) {
+    url = DEFAULT_SUPABASE_URL;
+  }
+  let anonKey = cleanSupabaseAnonKey(rawKey);
+  if (anonKey === 'your-supabase-anon-key') {
+    anonKey = DEFAULT_SUPABASE_ANON_KEY;
+  }
 
   const isConfigured = Boolean(
     url &&
       anonKey &&
       url.startsWith('http') &&
-      !url.includes('your-project-id')
+      !url.includes('your-project-id') &&
+      anonKey !== 'your-supabase-anon-key'
   );
 
   return { url, anonKey, isConfigured };

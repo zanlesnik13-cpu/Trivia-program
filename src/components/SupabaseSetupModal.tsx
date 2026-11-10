@@ -105,8 +105,9 @@ export const SupabaseSetupModal: React.FC<SupabaseSetupModalProps> = ({
 
   const handleClear = () => {
     clearSupabaseConfig();
-    setUrl('');
-    setAnonKey('');
+    const cfg = getSupabaseConfig();
+    setUrl(cfg.url);
+    setAnonKey(cfg.anonKey);
     onConfigSaved();
   };
 

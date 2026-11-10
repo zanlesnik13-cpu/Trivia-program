@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import {
-  Database,
   Home,
   LogOut,
   Smartphone,
@@ -16,7 +15,7 @@ import { PlayerView } from './components/PlayerView';
 import { PresentationView } from './components/PresentationView';
 import { QuizBuilder } from './components/QuizBuilder';
 import { SupabaseSetupModal } from './components/SupabaseSetupModal';
-import { getSupabaseClient, getSupabaseConfig } from './lib/supabase';
+import { getSupabaseClient } from './lib/supabase';
 
 interface HostUser {
   id: string;
@@ -96,8 +95,6 @@ export function App() {
 
   const [route, setRoute] = useState<RouteState>(parseCurrentRoute);
 
-  const supabaseConfig = getSupabaseConfig();
-
   // Poslušaj spremembe URL-ja (popstate)
   useEffect(() => {
     const handlePopState = () => {
@@ -172,7 +169,6 @@ export function App() {
         <LandingPage
           onJoinGame={(code) => navigateTo(`/play?code=${code}`)}
           onOpenHost={() => navigateTo('/host')}
-          onOpenSupabaseModal={() => setShowSupabaseModal(true)}
           isHostLoggedIn={Boolean(hostUser)}
           hostEmail={hostUser?.email}
         />
@@ -280,25 +276,6 @@ export function App() {
               <Smartphone className="w-3.5 h-3.5" />
               <span className="hidden md:inline">Igraj kviz (/play)</span>
               <span className="md:hidden">/play</span>
-            </button>
-
-            {/* Gumb za SQL skripto & Supabase povezavo */}
-            <button
-              id="navbar-supabase-setup-btn"
-              onClick={() => setShowSupabaseModal(true)}
-              className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-all cursor-pointer ${
-                supabaseConfig.isConfigured
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20'
-                  : 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/25'
-              }`}
-            >
-              <Database className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">
-                {supabaseConfig.isConfigured
-                  ? 'Supabase Povezan (SQL)'
-                  : 'Supabase SQL & Nastavitve'}
-              </span>
-              <span className="sm:hidden">SQL</span>
             </button>
 
             {hostUser && (

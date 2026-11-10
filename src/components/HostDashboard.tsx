@@ -15,6 +15,7 @@ import {
   QrCode,
   Radio,
   RefreshCw,
+  Settings,
   Smartphone,
   Sparkles,
   StopCircle,
@@ -33,7 +34,7 @@ import {
   fetchHostActiveSessions,
   fetchHostQuizzes,
 } from '../lib/quizService';
-import { appendSupabaseConfigToUrl, getSupabaseConfig } from '../lib/supabase';
+import { appendSupabaseConfigToUrl } from '../lib/supabase';
 import type { GameSession, QuizWithStats } from '../types/quiz';
 
 interface HostDashboardProps {
@@ -83,8 +84,6 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedRemoteLink, setCopiedRemoteLink] = useState(false);
-
-  const supabaseConfig = getSupabaseConfig();
 
   const loadDashboardData = async () => {
     setLoading(true);
@@ -265,9 +264,11 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
           <button
             id="open-sql-schema-dashboard-btn"
             onClick={onOpenSqlModal}
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium bg-slate-800/80 hover:bg-slate-800 text-slate-200 border border-slate-700/80 transition-all cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-xs font-medium bg-slate-800/60 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-700/60 transition-all cursor-pointer"
+            title="⚙️ Nastavitve baze & SQL skripta"
           >
-            <span>SQL Skripta &amp; Supabase</span>
+            <Settings className="w-4 h-4" />
+            <span className="hidden sm:inline">Nastavitve baze</span>
           </button>
 
           <button
@@ -295,28 +296,6 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
           </button>
         </div>
       </div>
-
-      {/* Opozorilo, če Supabase ni povezan */}
-      {!supabaseConfig.isConfigured && (
-        <div className="p-5 rounded-2xl bg-rose-500/15 border-2 border-rose-500/50 text-rose-200 text-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xl">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-6 h-6 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <strong className="font-bold text-rose-300 block text-base mb-1">
-                ⚠️ Supabase baza NI povezana!
-              </strong>
-              Večnapravna igra (računalnik + telefon) zahteva delujočo Supabase bazo, saj je lokalni pomnilnik izklopljen. Kliknite na{' '}
-              <strong>&ldquo;Nastavi Supabase&rdquo;</strong> in vnesite URL ter Anon Key svoje Supabase baze.
-            </div>
-          </div>
-          <button
-            onClick={onOpenSqlModal}
-            className="px-4 py-2.5 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer shadow-lg"
-          >
-            Nastavi Supabase
-          </button>
-        </div>
-      )}
 
       {/* Velik rdeč okvir za prikaz točne Supabase napake (message + details + hint) */}
       {error && (

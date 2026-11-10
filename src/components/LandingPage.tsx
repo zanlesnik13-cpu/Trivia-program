@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import {
   ArrowRight,
-  Database,
   FileUp,
   Flame,
   Gamepad2,
@@ -16,7 +15,6 @@ import {
 interface LandingPageProps {
   onJoinGame: (roomCode: string) => void;
   onOpenHost: () => void;
-  onOpenSupabaseModal: () => void;
   isHostLoggedIn: boolean;
   hostEmail?: string;
 }
@@ -24,7 +22,6 @@ interface LandingPageProps {
 export const LandingPage: React.FC<LandingPageProps> = ({
   onJoinGame,
   onOpenHost,
-  onOpenSupabaseModal,
   isHostLoggedIn,
   hostEmail,
 }) => {
@@ -74,15 +71,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         </div>
 
         <div className="flex items-center gap-2.5 sm:gap-3">
-          <button
-            onClick={onOpenSupabaseModal}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-semibold bg-slate-900/80 hover:bg-slate-800 text-slate-300 border border-slate-800 transition-colors cursor-pointer"
-            title="Nastavitve Supabase povezave"
-          >
-            <Database className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="hidden sm:inline">Supabase</span>
-          </button>
-
           <button
             id="landing-host-btn"
             onClick={onOpenHost}
