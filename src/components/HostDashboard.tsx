@@ -27,6 +27,7 @@ import {
   type ActiveGameSessionWithQuiz,
   closeGameSession,
   createLiveGameSession,
+  createMegaDemoQuiz,
   createQuiz,
   deleteQuiz,
   fetchHostActiveSessions,
@@ -72,6 +73,7 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
   const [newTitle, setNewTitle] = useState('');
   const [newMaxJokers, setNewMaxJokers] = useState(1);
   const [creating, setCreating] = useState(false);
+  const [creatingDemo, setCreatingDemo] = useState(false);
 
   // Modal ob zagonu kviza v živo (izbira naprave: Računalnik/TV ali Telefon Daljinec)
   const [activeLiveSession, setActiveLiveSession] = useState<{
@@ -123,6 +125,25 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
       window.alert(`Napaka pri ustvarjanju kviza:\n${msg}`);
     } finally {
       setCreating(false);
+    }
+  };
+
+  const handleCreateDemoQuiz = async () => {
+    if (creatingDemo) return;
+    setCreatingDemo(true);
+    setError(null);
+    try {
+      const demoQuiz = await createMegaDemoQuiz(hostId);
+      await loadDashboardData();
+      window.alert(
+        `🎉 Demo kviz "${demoQuiz.title}" je bil uspešno ustvarjen in naložen v Supabase bazo!\n\nVsebuje 2 tematiki in 8 profesionalno oblikovanih SVG slajdov (z Joker uvodom, izbirnimi vprašanji A-B-C-D, odprtimi vprašanji in ugibanjem številk).\n\nLahko ga takoj zaženete v živo s klikom na "Zaženi v živo" ali pa si ga ogledate z "Uredi kviz".`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Napaka pri ustvarjanju demo kviza.';
+      setError(msg);
+      window.alert(`Napaka pri ustvarjanju demo kviza:\n${msg}`);
+    } finally {
+      setCreatingDemo(false);
     }
   };
 
@@ -246,6 +267,21 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium bg-slate-800/80 hover:bg-slate-800 text-slate-200 border border-slate-700/80 transition-all cursor-pointer"
           >
             <span>SQL Skripta &amp; Supabase</span>
+          </button>
+
+          <button
+            id="create-demo-quiz-btn"
+            onClick={handleCreateDemoQuiz}
+            disabled={creatingDemo}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 hover:border-emerald-500/60 transition-all cursor-pointer disabled:opacity-60"
+            title="Ustvari pripravljen Mega Demo Kviz z 2 tematikama in 8 vprašanji za testiranje vseh funkcij"
+          >
+            {creatingDemo ? (
+              <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+            ) : (
+              <Sparkles className="w-4 h-4 text-emerald-400" />
+            )}
+            <span>{creatingDemo ? 'Nalagam demo...' : '🎲 Ustvari Demo Kviz za testiranje'}</span>
           </button>
 
           <button
@@ -399,13 +435,28 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
               slajde in določite točke ter Jokerje.
             </p>
           </div>
-          <button
-            onClick={() => setShowCreateModal(true)}
-            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/25 transition-all cursor-pointer"
-          >
-            <Plus className="w-4 h-4" />
-            <span>Ustvari prvi kviz</span>
-          </button>
+          <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/25 transition-all cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Ustvari nov kviz</span>
+            </button>
+            <button
+              id="create-demo-quiz-empty-btn"
+              onClick={handleCreateDemoQuiz}
+              disabled={creatingDemo}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 hover:border-emerald-500/60 transition-all cursor-pointer disabled:opacity-60"
+            >
+              {creatingDemo ? (
+                <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+              ) : (
+                <Sparkles className="w-4 h-4 text-emerald-400" />
+              )}
+              <span>🎲 Ustvari Demo Kviz za testiranje</span>
+            </button>
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">

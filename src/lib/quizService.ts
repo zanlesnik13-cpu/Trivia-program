@@ -1,4 +1,5 @@
 import { compressImageBlobToDataUrl } from './pdfConverter';
+import { generateSlideSvgDataUrl } from './demoQuiz';
 import { getSupabaseClient } from './supabase';
 import type {
   Answer,
@@ -389,7 +390,24 @@ export async function ensureQuizSyncedToSupabase(quizId: string, hostId?: string
   if (localQuiz) {
     const slidesByTheme: Record<string, Slide[]> = {};
     for (const t of localThemes) {
-      slidesByTheme[t.id] = localSlides.filter((s) => s.theme_id === t.id);
+      slidesByTheme[t.id] = localSlides
+        .filter((s) => s.theme_id === t.id)
+        .map((s) => {
+          if (!s.slide_image_url) {
+            const isIntro = s.slide_type === 'theme_intro';
+            const imgUrl = generateSlideSvgDataUrl({
+              badge: isIntro ? `${t.title.toUpperCase()} • JOKER` : `VPRAŠANJE #${s.order_index + 1}`,
+              title: s.question_text || (isIntro ? t.title : `Vprašanje #${s.order_index + 1}`),
+              type: s.slide_type,
+              options: s.slide_type === 'multiple_choice' ? s.options : undefined,
+              points: s.points,
+              timerSeconds: s.timer_seconds,
+              accentColor: isIntro ? '#f59e0b' : '#6366f1',
+            });
+            return { ...s, slide_image_url: imgUrl };
+          }
+          return s;
+        });
     }
     // Brezpogojno izvedi upsert kviza, tematik in slajdov v Supabase
     await upsertFullQuiz(localQuiz, localThemes, slidesByTheme, hostId);
@@ -2271,5 +2289,7 @@ export async function savePlayerAnswer(
   if (error || !data) throw error || new Error('Napaka pri shranjevanju odgovora.');
   return data as Answer;
 }
+
+export { createMegaDemoQuiz, generateSlideSvgDataUrl } from './demoQuiz';
 
 
