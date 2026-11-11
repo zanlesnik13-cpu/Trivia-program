@@ -105,7 +105,26 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         .on(
           'postgres_changes',
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${sessionId}` },
-          () => {
+          (payload) => {
+            if (payload && payload.new && typeof payload.new === 'object') {
+              const updatedSession = payload.new as PresentationData['session'];
+              setData((prev) => {
+                if (!prev) return prev;
+                const nextTheme =
+                  prev.themes.find((t) => t.id === updatedSession.current_theme_id) ||
+                  prev.currentTheme;
+                const nextThemeSlides = nextTheme ? prev.slidesByTheme[nextTheme.id] || [] : [];
+                const nextSlide =
+                  nextThemeSlides.find((s) => s.id === updatedSession.current_slide_id) ||
+                  prev.currentSlide;
+                return {
+                  ...prev,
+                  session: { ...prev.session, ...updatedSession },
+                  currentTheme: nextTheme,
+                  currentSlide: nextSlide,
+                };
+              });
+            }
             loadData();
           }
         )
@@ -158,10 +177,10 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     window.addEventListener('focus', handleRevalidate);
     window.addEventListener('online', handleRevalidate);
 
-    // Periodični varnostni heartbeat (vsakih 5 sekund) proti zamrznitvi
+    // Periodični varnostni heartbeat (vsakih 2.5 sekunde) proti zamrznitvi
     const fallbackPoll = setInterval(() => {
       loadData();
-    }, 5000);
+    }, 2500);
 
     return () => {
       if (channel && supabase) {

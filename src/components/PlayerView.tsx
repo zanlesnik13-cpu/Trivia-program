@@ -60,8 +60,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // Navigacija po slajdih trenutne teme (igralec lahko izbere katerikoli slajd <= max_slide_index_reached)
   const [selectedSlideId, setSelectedSlideId] = useState<string | null>(null);
 
-  // Lokalno urejanje odgovora
-  const [textAnswerInput, setTextAnswerInput] = useState('');
+  // Ločeno lokalno stanje osnutkov odgovorov po ID-ju slajda (drafts[slide.id])
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [savingAnswer, setSavingAnswer] = useState(false);
   const [saveSuccessNotice, setSaveSuccessNotice] = useState(false);
 
@@ -71,8 +71,25 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // Joker aktivacija
   const [activatingJoker, setActivatingJoker] = useState(false);
 
-  const prevMaxSlideReachedRef = useRef<number>(-1);
+  // Sledenje zadnjemu videnemu current_slide_id in current_theme_id iz game_sessions
+  const lastSeenSlideIdRef = useRef<string | null>(null);
+  const lastSeenThemeIdRef = useRef<string | null>(null);
   const prevStatusRef = useRef<string | null>(null);
+
+  // Prenesi shranjene odgovore iz baze v lokalne osnutke SAMO takrat, ko je drafts[slideId] === undefined
+  const seedDraftsFromSavedAnswers = (savedAnswers: Record<string, Answer>) => {
+    setDrafts((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const [sId, ans] of Object.entries(savedAnswers)) {
+        if (next[sId] === undefined && ans?.answer_text !== undefined) {
+          next[sId] = ans.answer_text;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  };
 
   // 1. Reconnect mehanizem ob zagonu: preveri localStorage
   useEffect(() => {
@@ -92,6 +109,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               setActivePlayerId(parsed.playerId);
               const fullData = await fetchPlayerGameData(parsed.sessionId, parsed.playerId);
               setGameData(fullData);
+              seedDraftsFromSavedAnswers(fullData.myAnswers);
+              lastSeenSlideIdRef.current = fullData.session.current_slide_id;
+              lastSeenThemeIdRef.current = fullData.session.current_theme_id;
+              prevStatusRef.current = fullData.session.status;
               setSelectedSlideId(fullData.session.current_slide_id);
               setLoadingGame(false);
               return;
@@ -109,19 +130,28 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
   const [refreshing, setRefreshing] = useState(false);
 
-  // 2. Osveževanje podatkov o igralcu
+  // 2. Osveževanje podatkov o igralcu (brez prepisovanja aktivnega tipkanja!)
   const refreshPlayerData = async () => {
     if (!activeSessionId || !activePlayerId) return;
     try {
       const full = await fetchPlayerGameData(activeSessionId, activePlayerId);
       setGameData(full);
 
-      // Če je gostitelj odprl nov slajd (povečan max_slide_index_reached), skoči na nov slajd
-      if (full.session.max_slide_index_reached > prevMaxSlideReachedRef.current) {
-        prevMaxSlideReachedRef.current = full.session.max_slide_index_reached;
-        if (full.session.current_slide_id) {
-          setSelectedSlideId(full.session.current_slide_id);
-        }
+      // Napolni osnutke SAMO za slajde, kjer je drafts[slideId] === undefined
+      seedDraftsFromSavedAnswers(full.myAnswers);
+
+      // Samodejno preklopi na nov slajd SAMO takrat, ko se current_slide_id (ali current_theme_id)
+      // v game_sessions dejansko spremeni na nov ID!
+      const newHostSlideId = full.session.current_slide_id;
+      const newHostThemeId = full.session.current_theme_id;
+      if (
+        newHostSlideId &&
+        (newHostSlideId !== lastSeenSlideIdRef.current ||
+          newHostThemeId !== lastSeenThemeIdRef.current)
+      ) {
+        lastSeenSlideIdRef.current = newHostSlideId;
+        lastSeenThemeIdRef.current = newHostThemeId;
+        setSelectedSlideId(newHostSlideId);
       }
 
       // Konfeti ob prehodu v leaderboard ali finished
@@ -163,7 +193,31 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         .on(
           'postgres_changes',
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${activeSessionId}` },
-          () => refreshPlayerData()
+          (payload) => {
+            if (payload.new && typeof payload.new === 'object') {
+              const updatedSession = payload.new as Partial<PlayerFullData['session']>;
+              setGameData((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      session: { ...prev.session, ...updatedSession },
+                    }
+                  : prev
+              );
+              if (
+                updatedSession.current_slide_id &&
+                (updatedSession.current_slide_id !== lastSeenSlideIdRef.current ||
+                  updatedSession.current_theme_id !== lastSeenThemeIdRef.current)
+              ) {
+                lastSeenSlideIdRef.current = updatedSession.current_slide_id;
+                if (updatedSession.current_theme_id !== undefined) {
+                  lastSeenThemeIdRef.current = updatedSession.current_theme_id;
+                }
+                setSelectedSlideId(updatedSession.current_slide_id);
+              }
+            }
+            refreshPlayerData();
+          }
         )
         .on(
           'postgres_changes',
@@ -207,10 +261,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     window.addEventListener('focus', handleRevalidate);
     window.addEventListener('online', handleRevalidate);
 
-    // Periodični varnostni heartbeat (vsakih 4 sekund) proti zamrznitvi
+    // Periodični varnostni heartbeat (vsakih 2.5 sekund) proti zamrznitvi
     const fallbackPoll = setInterval(() => {
       refreshPlayerData();
-    }, 4000);
+    }, 2500);
 
     return () => {
       if (channel && supabase) {
@@ -225,7 +279,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     };
   }, [activeSessionId, activePlayerId]);
 
-  // 4. Odštevalnik časa (Timer loop)
+  // 4. Odštevalnik časa (Timer loop) - vedno računa iz timer_started_at in timer_duration
   useEffect(() => {
     const session = gameData?.session;
     if (!session || !session.timer_started_at || !session.timer_duration || session.timer_duration <= 0) {
@@ -250,13 +304,6 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     setTimeLeft(Math.max(0, Math.ceil((endTime - Date.now()) / 1000)));
     return () => clearInterval(interval);
   }, [gameData?.session?.timer_started_at, gameData?.session?.timer_duration]);
-
-  // Sinhronizacija vnosnega polja odgovora ob menjavi izbranega slajda
-  useEffect(() => {
-    if (!selectedSlideId || !gameData) return;
-    const existing = gameData.myAnswers[selectedSlideId];
-    setTextAnswerInput(existing?.answer_text || '');
-  }, [selectedSlideId, gameData?.myAnswers]);
 
   // Slajdi trenutne tematike
   const currentThemeSlides: Slide[] = useMemo(() => {
@@ -375,6 +422,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
       const fullData = await fetchPlayerGameData(session.id, player.id);
       setGameData(fullData);
+      seedDraftsFromSavedAnswers(fullData.myAnswers);
+      lastSeenSlideIdRef.current = fullData.session.current_slide_id;
+      lastSeenThemeIdRef.current = fullData.session.current_theme_id;
+      prevStatusRef.current = fullData.session.status;
       setSelectedSlideId(fullData.session.current_slide_id);
     } catch (err: unknown) {
       setJoinError(err instanceof Error ? err.message : 'Napaka pri vstopu v igro.');
@@ -392,6 +443,9 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     setActiveSessionId(null);
     setActivePlayerId(null);
     setGameData(null);
+    setDrafts({});
+    lastSeenSlideIdRef.current = null;
+    lastSeenThemeIdRef.current = null;
     setRoomCodeInput('');
     setNicknameInput('');
     if (onExit) onExit();
@@ -426,37 +480,54 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   };
 
   // Oddaja odgovora (A/B/C/D ali besedilo / število)
-  const handleSubmitAnswer = async (answerValue: string) => {
-    if (!gameData || !gameData.currentTheme || !currentViewingSlide || savingAnswer) return;
+  const handleSubmitAnswer = async (answerValue: string, explicitSlide?: Slide) => {
+    const targetSlide = explicitSlide || currentViewingSlide;
+    if (!gameData || !gameData.currentTheme || !targetSlide || savingAnswer) return;
     if (gameData.session.status !== 'active_theme' || isTimerExpiredOnCurrentHostSlide) return;
+
+    const cleanVal = answerValue.trim();
+    const slideId = targetSlide.id;
+    const themeId = targetSlide.theme_id || gameData.currentTheme.id;
+
+    // Ohrani vnos tudi v lokalnem osnutku za ta slajd
+    setDrafts((prev) => ({ ...prev, [slideId]: answerValue }));
+
+    // Optimistična posodobitev lokalnega stanja pred klicem v bazo
+    setGameData((prev: PlayerFullData | null) => {
+      if (!prev) return prev;
+      const existing = prev.myAnswers[slideId];
+      const newAns: Answer = {
+        id: existing?.id || `local-${slideId}`,
+        session_id: prev.session.id,
+        player_id: prev.player.id,
+        theme_id: themeId,
+        slide_id: slideId,
+        answer_text: cleanVal,
+        is_correct: false,
+        awarded_points: 0,
+        graded: false,
+      };
+      return {
+        ...prev,
+        myAnswers: { ...prev.myAnswers, [slideId]: newAns },
+      };
+    });
 
     setSavingAnswer(true);
     try {
-      await savePlayerAnswer(
+      const savedAns = await savePlayerAnswer(
         gameData.session.id,
         gameData.player.id,
-        gameData.currentTheme.id,
-        currentViewingSlide.id,
-        answerValue
+        themeId,
+        slideId,
+        cleanVal
       );
 
-      // Optimistična posodobitev
       setGameData((prev: PlayerFullData | null) => {
         if (!prev) return prev;
-        const newAns: Answer = {
-          id: `local-${currentViewingSlide.id}`,
-          session_id: prev.session.id,
-          player_id: prev.player.id,
-          theme_id: prev.currentTheme!.id,
-          slide_id: currentViewingSlide.id,
-          answer_text: answerValue,
-          is_correct: false,
-          awarded_points: 0,
-          graded: false,
-        };
         return {
           ...prev,
-          myAnswers: { ...prev.myAnswers, [currentViewingSlide.id]: newAns },
+          myAnswers: { ...prev.myAnswers, [slideId]: savedAns },
         };
       });
 
@@ -566,13 +637,18 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // ===========================================================================
   const { session, quiz, player, currentTheme, leaderboard } = gameData;
   const myCurrentAnswer = currentViewingSlide ? gameData.myAnswers[currentViewingSlide.id] : undefined;
+  const activeSlideId = currentViewingSlide?.id || '';
+  const currentDraft =
+    drafts[activeSlideId] !== undefined
+      ? drafts[activeSlideId]
+      : myCurrentAnswer?.answer_text ?? '';
 
   // Igralčeva uvrstitev na lestvici
   const myLeaderboardRank =
     leaderboard.find((l: { id: string; rank: number }) => l.id === player.id)?.rank || 1;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col max-w-md mx-auto border-x border-slate-900/90 shadow-2xl relative select-none">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col max-w-md mx-auto border-x border-slate-900/90 shadow-2xl relative">
       {/* GLAVA TEKMOVALCA (Zgornji bar s statusom, vzdevkom in Jokerji) */}
       <header className="sticky top-0 z-30 bg-slate-900/90 backdrop-blur-xl border-b border-slate-800 px-4 py-3 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -912,12 +988,19 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                     Vpiši številko (najbližji dobi točke)
                   </label>
                   <input
+                    key={currentViewingSlide.id}
                     id="player-number-answer-input"
                     type="number"
                     step="any"
                     inputMode="decimal"
-                    value={textAnswerInput}
-                    onChange={(e) => setTextAnswerInput(e.target.value)}
+                    value={currentDraft}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setDrafts((prev) => ({
+                        ...prev,
+                        [currentViewingSlide.id]: val,
+                      }));
+                    }}
                     placeholder="npr. 1999"
                     className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-violet-400 font-mono-code font-bold text-xl text-center focus:outline-none focus:border-violet-500"
                   />
@@ -925,8 +1008,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
                 <button
                   type="button"
-                  disabled={savingAnswer || !textAnswerInput.trim()}
-                  onClick={() => handleSubmitAnswer(textAnswerInput)}
+                  disabled={savingAnswer || !currentDraft.trim()}
+                  onClick={() => handleSubmitAnswer(currentDraft, currentViewingSlide)}
                   className="w-full py-3.5 rounded-2xl bg-violet-600 hover:bg-violet-500 text-white font-bold text-sm shadow-lg shadow-violet-600/30 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                 >
                   <Send className="w-4 h-4" />
@@ -941,10 +1024,17 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                     Tvoj besedilni odgovor
                   </label>
                   <textarea
+                    key={currentViewingSlide.id}
                     id="player-text-answer-input"
                     rows={2}
-                    value={textAnswerInput}
-                    onChange={(e) => setTextAnswerInput(e.target.value)}
+                    value={currentDraft}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setDrafts((prev) => ({
+                        ...prev,
+                        [currentViewingSlide.id]: val,
+                      }));
+                    }}
                     placeholder="Vpiši svoj odgovor tukaj..."
                     className="w-full px-4 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-slate-100 font-semibold text-sm focus:outline-none focus:border-emerald-500"
                   />
@@ -952,8 +1042,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
                 <button
                   type="button"
-                  disabled={savingAnswer || !textAnswerInput.trim()}
-                  onClick={() => handleSubmitAnswer(textAnswerInput)}
+                  disabled={savingAnswer || !currentDraft.trim()}
+                  onClick={() => handleSubmitAnswer(currentDraft, currentViewingSlide)}
                   className="w-full py-3.5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                 >
                   <Send className="w-4 h-4" />

@@ -127,7 +127,15 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         .on(
           'postgres_changes',
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${sessionId}` },
-          () => loadData()
+          (payload) => {
+            if (payload && payload.new && typeof payload.new === 'object') {
+              const updatedSession = payload.new as PresentationData['session'];
+              setData((prev) =>
+                prev ? { ...prev, session: { ...prev.session, ...updatedSession } } : prev
+              );
+            }
+            loadData();
+          }
         )
         .on(
           'postgres_changes',
@@ -171,10 +179,10 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     window.addEventListener('focus', handleRevalidate);
     window.addEventListener('online', handleRevalidate);
 
-    // Periodični varnostni heartbeat (vsakih 5 sekund) proti zamrznitvi
+    // Periodični varnostni heartbeat (vsake 3 sekunde) proti zamrznitvi
     const fallbackPoll = setInterval(() => {
       loadData();
-    }, 5000);
+    }, 3000);
 
     return () => {
       if (channel && supabase) {
@@ -1431,8 +1439,12 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                 </div>
                                 <input
                                   type="text"
-                                  key={`${player.id}-${slide.id}-${ans?.host_comment ?? ''}`}
-                                  defaultValue={ans?.host_comment ?? ''}
+                                  key={`${player.id}-${slide.id}`}
+                                  defaultValue={
+                                    commentDrafts.current[`${player.id}:${slide.id}`] ??
+                                    ans?.host_comment ??
+                                    ''
+                                  }
                                   onChange={(e) => {
                                     commentDrafts.current[`${player.id}:${slide.id}`] = e.target.value;
                                   }}
@@ -1473,11 +1485,12 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 </div>
                 <div className="space-y-1.5">
                   {players.map((p) => {
-                    const rawThemeSum = answers
-                      .filter(
-                        (a) => a.player_id === p.id && a.theme_id === currentTheme.id
-                      )
-                      .reduce((acc, a) => acc + Number(a.awarded_points ?? 0), 0);
+                    const rawThemeSum = gradableSlides.reduce((acc, sl) => {
+                      const ansForSlide = answers.find(
+                        (a) => a.player_id === p.id && a.slide_id === sl.id
+                      );
+                      return acc + Number(ansForSlide?.awarded_points ?? 0);
+                    }, 0);
                     const hasJoker = jokersForCurrentTheme.has(p.id);
                     const finalThemePts = hasJoker ? rawThemeSum * 2 : rawThemeSum;
 

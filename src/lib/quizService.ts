@@ -1030,6 +1030,8 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
     .select('*')
     .eq('session_id', sessionId);
 
+  const dedupedAnswers = deduplicateAnswers((answersData || []) as Answer[]);
+
   return {
     session: session as GameSession,
     quiz: quiz as Quiz,
@@ -1039,8 +1041,147 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
     currentSlide,
     players: (playersData || []) as Player[],
     playerJokers: (jokersData || []) as PlayerJoker[],
-    answers: (answersData || []) as Answer[],
+    answers: dedupedAnswers,
   };
+}
+
+/**
+ * Odstrani morebitne podvojene vrstice za isti (player_id, slide_id) in obdrži zadnjo / ocenjeno vrstico.
+ */
+export function deduplicateAnswers(rawAnswers: Answer[]): Answer[] {
+  const byKey = new Map<string, Answer>();
+  for (const ans of rawAnswers) {
+    const key = `${ans.player_id}_${ans.slide_id}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, ans);
+    } else if (ans.graded && !existing.graded) {
+      byKey.set(key, ans);
+    } else if (ans.graded === existing.graded) {
+      byKey.set(key, ans);
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+/**
+ * Varno shrani ali posodobi odgovor za (session_id, player_id, slide_id):
+ * 1. Najprej preveri, ali za (session_id, player_id, slide_id) že obstaja vrstica v tabeli answers.
+ * 2. Če obstaja, naredi UPDATE na obstoječi vrstici (in izbriše morebitne stare podvojene vrstice).
+ * 3. Če še ne obstaja, naredi UPSERT / INSERT.
+ */
+async function saveOrUpdateAnswerRecord(
+  sessionId: string,
+  playerId: string,
+  themeId: string,
+  slideId: string,
+  fields: {
+    answer_text: string;
+    is_correct: boolean;
+    awarded_points: number;
+    graded: boolean;
+    host_comment?: string | null;
+  },
+  errorContext: string
+): Promise<Answer> {
+  const supabase = requireSupabaseClient();
+
+  const { data: existingRows } = await supabase
+    .from('answers')
+    .select('*')
+    .eq('session_id', sessionId)
+    .eq('player_id', playerId)
+    .eq('slide_id', slideId);
+
+  const baseFields: Record<string, unknown> = {
+    theme_id: themeId,
+    answer_text: fields.answer_text,
+    is_correct: fields.is_correct,
+    awarded_points: Number(fields.awarded_points),
+    graded: fields.graded,
+  };
+
+  const withCommentFields: Record<string, unknown> =
+    fields.host_comment !== undefined
+      ? { ...baseFields, host_comment: fields.host_comment }
+      : baseFields;
+
+  if (existingRows && existingRows.length > 0) {
+    const primary = existingRows[0] as Answer;
+    // Če je bilo v bazi slučajno več vrstic za isti (session_id, player_id, slide_id), počisti odvečne
+    if (existingRows.length > 1) {
+      const extraIds = existingRows
+        .slice(1)
+        .map((r) => (r as Answer).id)
+        .filter(Boolean);
+      if (extraIds.length > 0) {
+        await supabase.from('answers').delete().in('id', extraIds);
+      }
+    }
+
+    let { data, error } = await supabase
+      .from('answers')
+      .update(withCommentFields)
+      .eq('id', primary.id)
+      .select('*')
+      .single();
+
+    if (error && fields.host_comment !== undefined && /host_comment/i.test(error.message || '')) {
+      console.warn(
+        'Stolpec answers.host_comment ne obstaja. Zaženi: ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;'
+      );
+      ({ data, error } = await supabase
+        .from('answers')
+        .update(baseFields)
+        .eq('id', primary.id)
+        .select('*')
+        .single());
+    }
+
+    if (error || !data) {
+      throw formatSupabaseError(error, errorContext);
+    }
+    return data as Answer;
+  }
+
+  // Vrstica še ne obstaja -> ustvari z upsert (ali insert fallbackom)
+  const insertBase: Record<string, unknown> = {
+    id: crypto.randomUUID(),
+    session_id: sessionId,
+    player_id: playerId,
+    slide_id: slideId,
+    ...baseFields,
+  };
+  const insertWithComment: Record<string, unknown> =
+    fields.host_comment !== undefined
+      ? { ...insertBase, host_comment: fields.host_comment }
+      : insertBase;
+
+  const tryInsertOrUpsert = async (payload: Record<string, unknown>) => {
+    const res = await supabase
+      .from('answers')
+      .upsert(payload, { onConflict: 'session_id,player_id,slide_id' })
+      .select('*')
+      .single();
+    if (res.error && (res.error.code === '42P10' || /constraint/i.test(res.error.message || ''))) {
+      return supabase.from('answers').insert(payload).select('*').single();
+    }
+    return res;
+  };
+
+  let { data, error } = await tryInsertOrUpsert(insertWithComment);
+
+  if (error && fields.host_comment !== undefined && /host_comment/i.test(error.message || '')) {
+    console.warn(
+      'Stolpec answers.host_comment ne obstaja. Zaženi: ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;'
+    );
+    ({ data, error } = await tryInsertOrUpsert(insertBase));
+  }
+
+  if (error || !data) {
+    throw formatSupabaseError(error, errorContext);
+  }
+  return data as Answer;
 }
 
 export async function updateGameSession(
@@ -1094,16 +1235,16 @@ export async function togglePlayerJoker(
 ): Promise<boolean> {
   const supabase = requireSupabaseClient();
 
-  const { data: existing } = await supabase
+  const { data: existingRows } = await supabase
     .from('player_jokers')
     .select('id')
     .eq('session_id', sessionId)
     .eq('player_id', playerId)
-    .eq('theme_id', themeId)
-    .maybeSingle();
+    .eq('theme_id', themeId);
 
-  if (existing) {
-    await supabase.from('player_jokers').delete().eq('id', existing.id);
+  if (existingRows && existingRows.length > 0) {
+    const ids = existingRows.map((r) => r.id);
+    await supabase.from('player_jokers').delete().in('id', ids);
     return false;
   } else {
     const { error } = await supabase.from('player_jokers').insert({
@@ -1128,30 +1269,19 @@ export async function submitDemoAnswer(
   isCorrect: boolean = false,
   awardedPoints: number = 0
 ): Promise<Answer> {
-  const supabase = requireSupabaseClient();
-
-  const { data, error } = await supabase
-    .from('answers')
-    .upsert(
-      {
-        session_id: sessionId,
-        player_id: playerId,
-        theme_id: themeId,
-        slide_id: slideId,
-        answer_text: answerText,
-        is_correct: isCorrect,
-        awarded_points: Number(awardedPoints),
-        graded: false,
-      },
-      { onConflict: 'session_id,player_id,slide_id' }
-    )
-    .select('*')
-    .single();
-
-  if (error || !data) {
-    throw formatSupabaseError(error, 'Napaka pri oddaji odgovora v tabelo "answers"');
-  }
-  return data as Answer;
+  return saveOrUpdateAnswerRecord(
+    sessionId,
+    playerId,
+    themeId,
+    slideId,
+    {
+      answer_text: answerText,
+      is_correct: isCorrect,
+      awarded_points: Number(awardedPoints),
+      graded: false,
+    },
+    'Napaka pri oddaji odgovora v tabelo "answers"'
+  );
 }
 
 /**
@@ -1167,43 +1297,20 @@ export async function upsertGradedAnswer(
   awardedPoints: number,
   hostComment?: string
 ): Promise<Answer> {
-  const supabase = requireSupabaseClient();
-
-  const basePayload = {
-    session_id: sessionId,
-    player_id: playerId,
-    theme_id: themeId,
-    slide_id: slideId,
-    answer_text: answerText,
-    is_correct: isCorrect,
-    awarded_points: Number(awardedPoints),
-    graded: true,
-  };
-
-  const run = (payload: Record<string, unknown>) =>
-    supabase
-      .from('answers')
-      .upsert(payload, { onConflict: 'session_id,player_id,slide_id' })
-      .select('*')
-      .single();
-
-  let { data, error } =
-    hostComment !== undefined
-      ? await run({ ...basePayload, host_comment: hostComment.trim() || null })
-      : await run(basePayload);
-
-  // Varen zapis: če stolpec host_comment v bazi še ne obstaja, shrani brez komentarja
-  if (error && hostComment !== undefined && /host_comment/i.test(error.message || '')) {
-    console.warn(
-      'Stolpec answers.host_comment ne obstaja. Zaženi: ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;'
-    );
-    ({ data, error } = await run(basePayload));
-  }
-
-  if (error || !data) {
-    throw formatSupabaseError(error, 'Napaka pri ocenjevanju odgovora v tabeli "answers"');
-  }
-  return data as Answer;
+  return saveOrUpdateAnswerRecord(
+    sessionId,
+    playerId,
+    themeId,
+    slideId,
+    {
+      answer_text: answerText,
+      is_correct: isCorrect,
+      awarded_points: Number(awardedPoints),
+      graded: true,
+      ...(hostComment !== undefined ? { host_comment: hostComment.trim() || null } : {}),
+    },
+    'Napaka pri ocenjevanju odgovora v tabeli "answers"'
+  );
 }
 
 /**
@@ -1325,13 +1432,35 @@ export async function autoPreGradeTheme(
 /**
  * Potrdi ocene za tematiko, izračuna skupne točke vseh igralcev (upošteva 2x Joker za vsako temo!)
  * in prestavi status seje v 'leaderboard'.
+ * Izračun je popolnoma idempotenten: total_score vsakega igralca se vedno preračuna kot vsota
+ * vseh njegovih ocenjenih tematik iz tabele answers + player_jokers (večkratni klik nikoli ne podvoji točk).
  */
 export async function confirmThemeGradesAndShowLeaderboard(
   sessionId: string
 ): Promise<void> {
   const supabase = requireSupabaseClient();
-  const presData = await fetchPresentationData(sessionId);
-  const { players, answers, playerJokers } = presData;
+  let presData = await fetchPresentationData(sessionId);
+
+  // Če v trenutni tematiki še obstaja kakšen neocenjen odgovor, ga pred-oceni
+  if (presData.currentTheme) {
+    const curThemeId = presData.currentTheme.id;
+    const curSlides = presData.slidesByTheme[curThemeId] || [];
+    const curAnswers = presData.answers.filter((a) => a.theme_id === curThemeId);
+    if (curAnswers.some((a) => !a.graded)) {
+      await autoPreGradeTheme(sessionId, curThemeId, curSlides, curAnswers);
+      presData = await fetchPresentationData(sessionId);
+    }
+  }
+
+  const { players, playerJokers, slidesByTheme } = presData;
+  const dedupedAnswers = deduplicateAnswers(presData.answers);
+
+  const slideThemeMap = new Map<string, string>();
+  for (const [tId, slideList] of Object.entries(slidesByTheme)) {
+    for (const s of slideList) {
+      slideThemeMap.set(s.id, tId);
+    }
+  }
 
   const jokerSet = new Set(
     playerJokers.map((pj) => `${pj.player_id}_${pj.theme_id}`)
@@ -1343,13 +1472,15 @@ export async function confirmThemeGradesAndShowLeaderboard(
   }
 
   const playerThemeSums: Record<string, Record<string, number>> = {};
-  for (const ans of answers) {
+  for (const ans of dedupedAnswers) {
     const pts = Number(ans.awarded_points ?? 0);
+    const resolvedThemeId = slideThemeMap.get(ans.slide_id) || ans.theme_id;
+    if (!resolvedThemeId) continue;
     if (!playerThemeSums[ans.player_id]) {
       playerThemeSums[ans.player_id] = {};
     }
-    playerThemeSums[ans.player_id][ans.theme_id] =
-      (playerThemeSums[ans.player_id][ans.theme_id] || 0) + pts;
+    playerThemeSums[ans.player_id][resolvedThemeId] =
+      (playerThemeSums[ans.player_id][resolvedThemeId] || 0) + pts;
   }
 
   for (const player of players) {
@@ -1579,9 +1710,10 @@ export async function fetchPlayerGameData(
     .eq('session_id', sessionId)
     .eq('player_id', playerId);
 
+  const dedupedMyAnswers = deduplicateAnswers((myAnswersData || []) as Answer[]);
   const myAnswers: Record<string, Answer> = {};
-  for (const a of myAnswersData || []) {
-    myAnswers[a.slide_id] = a as Answer;
+  for (const a of dedupedMyAnswers) {
+    myAnswers[a.slide_id] = a;
   }
 
   const { data: allPlayersData } = await supabase
@@ -1621,15 +1753,14 @@ export async function playerActivateJoker(
 ): Promise<{ success: boolean; jokersRemaining: number }> {
   const supabase = requireSupabaseClient();
 
-  const { data: existing } = await supabase
+  const { data: existingRows } = await supabase
     .from('player_jokers')
     .select('id')
     .eq('session_id', sessionId)
     .eq('player_id', playerId)
-    .eq('theme_id', themeId)
-    .maybeSingle();
+    .eq('theme_id', themeId);
 
-  if (existing) {
+  if (existingRows && existingRows.length > 0) {
     const { data: pData } = await supabase
       .from('players')
       .select('jokers_remaining')
@@ -1671,6 +1802,8 @@ export async function playerActivateJoker(
 
 /**
  * Tekmovalec odda ali popravi svoj odgovor na trenutni ali pretekli slajd.
+ * Najprej preveri, ali za (session_id, player_id, slide_id) že obstaja vrstica v answers,
+ * in jo posodobi (oz. uporabi upsert), tako da nikoli ne nastanejo podvojene vrstice.
  */
 export async function savePlayerAnswer(
   sessionId: string,
@@ -1679,29 +1812,20 @@ export async function savePlayerAnswer(
   slideId: string,
   answerText: string
 ): Promise<Answer> {
-  const supabase = requireSupabaseClient();
   const cleanAns = answerText.trim();
-
-  const { data, error } = await supabase
-    .from('answers')
-    .upsert(
-      {
-        session_id: sessionId,
-        player_id: playerId,
-        theme_id: themeId,
-        slide_id: slideId,
-        answer_text: cleanAns,
-        graded: false,
-      },
-      { onConflict: 'session_id,player_id,slide_id' }
-    )
-    .select('*')
-    .single();
-
-  if (error || !data) {
-    throw formatSupabaseError(error, 'Napaka pri shranjevanju odgovora v tabelo "answers"');
-  }
-  return data as Answer;
+  return saveOrUpdateAnswerRecord(
+    sessionId,
+    playerId,
+    themeId,
+    slideId,
+    {
+      answer_text: cleanAns,
+      is_correct: false,
+      awarded_points: 0,
+      graded: false,
+    },
+    'Napaka pri shranjevanju odgovora v tabelo "answers"'
+  );
 }
 
 export { createMegaDemoQuiz, generateSlideSvgDataUrl } from './demoQuiz';
