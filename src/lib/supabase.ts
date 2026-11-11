@@ -1,15 +1,21 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { MY_SUPABASE_URL, MY_SUPABASE_ANON_KEY } from '../supabaseConfig';
 
 const STORAGE_URL_KEY = 'trivia_supabase_url';
 const STORAGE_ANON_KEY = 'trivia_supabase_anon_key';
 
+const isPlaceholderKey = (k: string | undefined | null) =>
+  !k || k.includes('TUKAJ_PRILEPI') || k === 'your-supabase-anon-key';
+
 /**
- * Privzeta Supabase baza za aplikacijo (hardcoded fallback, če .env ali localStorage nista nastavljena).
+ * Privzeta Supabase baza: vrednosti iz src/supabaseConfig.ts
+ * (ključ iz VITE_SUPABASE_ANON_KEY, če v supabaseConfig.ts še ni zamenjan).
  */
-export const DEFAULT_SUPABASE_URL = 'https://nwpftuydshsguorxlkie.supabase.co';
-export const DEFAULT_SUPABASE_ANON_KEY =
-  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ||
-  'sb_publishable_0We5ATxLgWOT3yuorwoUZQ_ICO-SY5N';
+export const DEFAULT_SUPABASE_URL = MY_SUPABASE_URL;
+export const DEFAULT_SUPABASE_ANON_KEY = !isPlaceholderKey(MY_SUPABASE_ANON_KEY)
+  ? MY_SUPABASE_ANON_KEY
+  : (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ||
+    'sb_publishable_0We5ATxLgWOT3yuorwoUZQ_ICO-SY5N';
 
 /**
  * Samodejno očisti Supabase URL:
@@ -58,9 +64,6 @@ export function cleanSupabaseAnonKey(rawKey: string | undefined | null): string 
 }
 
 export function getSupabaseConfig() {
-  const envUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-  const envKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
-
   let localUrl = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_URL_KEY) : null;
   let localKey = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_ANON_KEY) : null;
 
@@ -94,8 +97,8 @@ export function getSupabaseConfig() {
     }
   }
 
-  const rawUrl = localUrl || envUrl || DEFAULT_SUPABASE_URL;
-  const rawKey = localKey || envKey || DEFAULT_SUPABASE_ANON_KEY;
+  const rawUrl = localUrl || DEFAULT_SUPABASE_URL;
+  const rawKey = localKey || DEFAULT_SUPABASE_ANON_KEY;
 
   let url = cleanSupabaseUrl(rawUrl);
   if (!url || url.includes('your-project-id')) {

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { PlayerResultsReview } from './PlayerResultsReview';
 import confetti from 'canvas-confetti';
 import {
   AlertCircle,
@@ -1085,6 +1086,22 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                 )}
               </div>
             </div>
+
+            {/* Pregled rezultatov in komentarjev gostitelja */}
+            {session.status === 'leaderboard' && currentTheme && (
+              <PlayerResultsReview
+                gameData={gameData}
+                themes={[currentTheme]}
+                title="Tvoji rezultati v tem sklopu"
+              />
+            )}
+            {session.status === 'finished' && (
+              <PlayerResultsReview
+                gameData={gameData}
+                themes={gameData.themes}
+                title="Pregled vseh tvojih odgovorov po sklopih"
+              />
+            )}
 
             {/* Lestvica ekip */}
             <div className="bg-slate-900/80 border border-slate-800 rounded-3xl p-4 space-y-3">

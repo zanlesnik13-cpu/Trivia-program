@@ -26,6 +26,9 @@ const QUICK_FIX_SQL = `-- ======================================================
 ALTER TABLE public.quizzes DROP CONSTRAINT IF EXISTS quizzes_host_id_fkey;
 ALTER TABLE public.quizzes ALTER COLUMN host_id TYPE TEXT USING host_id::TEXT;
 
+-- 1b. Opcijski komentar gostitelja pri ocenjevanju
+ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS host_comment TEXT;
+
 -- 2. Izklopi RLS (Row Level Security) na vseh tabelah
 ALTER TABLE public.quizzes DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.themes DISABLE ROW LEVEL SECURITY;

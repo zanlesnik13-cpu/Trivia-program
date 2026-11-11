@@ -216,3 +216,6 @@ ON storage.objects FOR DELETE
 TO anon, authenticated
 USING (bucket_id = 'slides');
 
+
+-- Opcijski komentar gostitelja pri ocenjevanju
+ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;

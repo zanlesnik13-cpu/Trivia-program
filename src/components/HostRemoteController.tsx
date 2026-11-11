@@ -62,6 +62,9 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const commentDrafts = useRef<Record<string, string>>({});
+  const [customExtend, setCustomExtend] = useState('');
+  const [customExtendUnit, setCustomExtendUnit] = useState<'sec' | 'min'>('sec');
   const [refreshing, setRefreshing] = useState(false);
 
   // Beležimo, za katero temo smo že sprožili avtomatsko pred-ocenjevanje v tem pogledu
@@ -354,6 +357,36 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
+  // Podaljšanje časovnika v živo (tudi če teče ali je pravkar potekel)
+  const handleExtendTimer = async (addSeconds: number) => {
+    if (!Number.isFinite(addSeconds) || addSeconds <= 0) return;
+    const sec = Math.round(addSeconds);
+    setActionLoading(true);
+    try {
+      const sess = data?.session;
+      const running =
+        sess?.timer_started_at &&
+        sess.timer_duration &&
+        sess.timer_duration > 0 &&
+        new Date(sess.timer_started_at).getTime() + sess.timer_duration * 1000 > Date.now();
+      if (running && sess) {
+        await updateGameSession(sessionId, {
+          timer_duration: (sess.timer_duration || 0) + sec,
+        });
+      } else {
+        await updateGameSession(sessionId, {
+          timer_started_at: new Date().toISOString(),
+          timer_duration: sec,
+        });
+      }
+      await loadData();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Napaka pri podaljšanju časovnika.');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   const handleStopTimer = async () => {
     setActionLoading(true);
     try {
@@ -399,7 +432,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     slide: Slide,
     existingAnswer: Answer | undefined,
     isCorrect: boolean,
-    awardedPoints: number
+    awardedPoints: number,
+    hostComment?: string
   ) => {
     if (!data?.currentTheme) return;
     const safePoints = Math.max(0, Number.isNaN(awardedPoints) ? 0 : awardedPoints);
@@ -421,6 +455,12 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         is_correct: isCorrect,
         awarded_points: safePoints,
         graded: true,
+        host_comment:
+          hostComment !== undefined
+            ? hostComment
+            : idx >= 0
+            ? prev.answers[idx].host_comment
+            : undefined,
       };
       const nextAnswers = [...prev.answers];
       if (idx >= 0) {
@@ -439,7 +479,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         slide.id,
         ansText,
         isCorrect,
-        safePoints
+        safePoints,
+        hostComment
       );
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Napaka pri shranjevanju ocene.');
@@ -451,6 +492,25 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const handleConfirmGradesAndLeaderboard = async () => {
     setActionLoading(true);
     try {
+      // Shrani še neshranjene komentarje gostitelja
+      for (const [key, text] of Object.entries(commentDrafts.current)) {
+        const [pid, sid] = key.split(':');
+        const slide = (data?.slidesByTheme?.[data.currentTheme?.id ?? ''] || []).find(
+          (sl) => sl.id === sid
+        );
+        const ans = data?.answers.find((a) => a.player_id === pid && a.slide_id === sid);
+        if (slide && (ans?.host_comment ?? '') !== text) {
+          await handleGradeAnswer(
+            pid,
+            slide,
+            ans,
+            Boolean(ans?.is_correct),
+            Number(ans?.awarded_points ?? 0),
+            text
+          );
+        }
+      }
+      commentDrafts.current = {};
       await confirmThemeGradesAndShowLeaderboard(sessionId);
       await loadData();
     } catch (err: unknown) {
@@ -1002,6 +1062,62 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                   <span>Ustavi timer</span>
                 </button>
               </div>
+
+              {/* Podaljšanje časa v živo */}
+              <div className="pt-2 border-t border-slate-800 space-y-2">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                  Podaljšaj čas
+                </span>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { label: '+15s', sec: 15 },
+                    { label: '+30s', sec: 30 },
+                    { label: '+1 min', sec: 60 },
+                  ].map((b) => (
+                    <button
+                      key={b.label}
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={() => handleExtendTimer(b.sec)}
+                      className="py-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-200 font-bold text-xs active:scale-95 transition-all cursor-pointer"
+                    >
+                      {b.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="remote-extend-custom-input"
+                    type="number"
+                    min={1}
+                    value={customExtend}
+                    onChange={(e) => setCustomExtend(e.target.value)}
+                    placeholder="Število"
+                    className="w-20 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-xs focus:outline-none focus:border-emerald-500"
+                  />
+                  <select
+                    value={customExtendUnit}
+                    onChange={(e) => setCustomExtendUnit(e.target.value as 'sec' | 'min')}
+                    className="px-2 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-xs"
+                  >
+                    <option value="sec">sekund</option>
+                    <option value="min">minut</option>
+                  </select>
+                  <button
+                    id="remote-extend-custom-btn"
+                    type="button"
+                    disabled={actionLoading || !customExtend}
+                    onClick={() => {
+                      const n = parseFloat(customExtend);
+                      handleExtendTimer(customExtendUnit === 'min' ? n * 60 : n);
+                      setCustomExtend('');
+                    }}
+                    className="flex-1 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs cursor-pointer"
+                  >
+                    Dodaj čas
+                  </button>
+                </div>
+              </div>
             </div>
 
             {/* Velika navigacijska gumba: Prejšnji slajd / Naslednji slajd */}
@@ -1313,6 +1429,29 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                     />
                                   </div>
                                 </div>
+                                <input
+                                  type="text"
+                                  key={`${player.id}-${slide.id}-${ans?.host_comment ?? ''}`}
+                                  defaultValue={ans?.host_comment ?? ''}
+                                  onChange={(e) => {
+                                    commentDrafts.current[`${player.id}:${slide.id}`] = e.target.value;
+                                  }}
+                                  onBlur={(e) => {
+                                    delete commentDrafts.current[`${player.id}:${slide.id}`];
+                                    if ((ans?.host_comment ?? '') !== e.target.value) {
+                                      handleGradeAnswer(
+                                        player.id,
+                                        slide,
+                                        ans,
+                                        isCorrect,
+                                        awarded,
+                                        e.target.value
+                                      );
+                                    }
+                                  }}
+                                  placeholder="Opcijski komentar / obrazložitev točkovanja (npr. 'Pol točke za delni odgovor' ali 'Zmanjkala letnica')"
+                                  className="w-full mt-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-[11px] text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                                />
                               </div>
                             );
                           })}

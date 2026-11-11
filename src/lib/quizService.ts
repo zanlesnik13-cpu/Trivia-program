@@ -1164,27 +1164,41 @@ export async function upsertGradedAnswer(
   slideId: string,
   answerText: string,
   isCorrect: boolean,
-  awardedPoints: number
+  awardedPoints: number,
+  hostComment?: string
 ): Promise<Answer> {
   const supabase = requireSupabaseClient();
 
-  const { data, error } = await supabase
-    .from('answers')
-    .upsert(
-      {
-        session_id: sessionId,
-        player_id: playerId,
-        theme_id: themeId,
-        slide_id: slideId,
-        answer_text: answerText,
-        is_correct: isCorrect,
-        awarded_points: Number(awardedPoints),
-        graded: true,
-      },
-      { onConflict: 'session_id,player_id,slide_id' }
-    )
-    .select('*')
-    .single();
+  const basePayload = {
+    session_id: sessionId,
+    player_id: playerId,
+    theme_id: themeId,
+    slide_id: slideId,
+    answer_text: answerText,
+    is_correct: isCorrect,
+    awarded_points: Number(awardedPoints),
+    graded: true,
+  };
+
+  const run = (payload: Record<string, unknown>) =>
+    supabase
+      .from('answers')
+      .upsert(payload, { onConflict: 'session_id,player_id,slide_id' })
+      .select('*')
+      .single();
+
+  let { data, error } =
+    hostComment !== undefined
+      ? await run({ ...basePayload, host_comment: hostComment.trim() || null })
+      : await run(basePayload);
+
+  // Varen zapis: če stolpec host_comment v bazi še ne obstaja, shrani brez komentarja
+  if (error && hostComment !== undefined && /host_comment/i.test(error.message || '')) {
+    console.warn(
+      'Stolpec answers.host_comment ne obstaja. Zaženi: ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;'
+    );
+    ({ data, error } = await run(basePayload));
+  }
 
   if (error || !data) {
     throw formatSupabaseError(error, 'Napaka pri ocenjevanju odgovora v tabeli "answers"');
