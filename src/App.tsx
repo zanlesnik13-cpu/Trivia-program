@@ -7,7 +7,7 @@ import {
   Tv,
   UserCheck,
 } from 'lucide-react';
-import { HostAuth } from './components/HostAuth';
+import { HostAuth, getOrCreateGuestHostId } from './components/HostAuth';
 import { HostDashboard } from './components/HostDashboard';
 import { HostRemoteController } from './components/HostRemoteController';
 import { LandingPage } from './components/LandingPage';
@@ -114,17 +114,20 @@ export function App() {
   };
 
   useEffect(() => {
+    const supabase = getSupabaseClient();
+
     const checkInitialAuth = async () => {
       setCheckingSession(true);
-      const supabase = getSupabaseClient();
 
       if (supabase) {
         try {
           const { data } = await supabase.auth.getSession();
           if (data.session?.user) {
+            localStorage.removeItem('trivia_guest_session_active');
             setHostUser({
               id: data.session.user.id,
               email: data.session.user.email || 'gostitelj@quizpulse.si',
+              isDemo: false,
             });
             setCheckingSession(false);
             return;
@@ -136,11 +139,11 @@ export function App() {
 
       // Preveri, ali je uporabnik že vstopil kot Gost (Hiter vstop brez prijave)
       const savedGuestActive = localStorage.getItem('trivia_guest_session_active');
-      const savedGuestId = localStorage.getItem('guest_host_id');
       const savedGuestEmail = localStorage.getItem('guest_host_email');
-      if (savedGuestActive === 'true' && savedGuestId) {
+      if (savedGuestActive === 'true') {
+        const guestHostId = getOrCreateGuestHostId();
         setHostUser({
-          id: savedGuestId,
+          id: guestHostId,
           email: savedGuestEmail || 'gost@quizpulse.si',
           isDemo: true,
         });
@@ -150,6 +153,23 @@ export function App() {
     };
 
     checkInitialAuth();
+
+    if (!supabase) return;
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        localStorage.removeItem('trivia_guest_session_active');
+        setHostUser({
+          id: session.user.id,
+          email: session.user.email || 'gostitelj@quizpulse.si',
+          isDemo: false,
+        });
+      }
+    });
+
+    return () => {
+      authListener?.subscription?.unsubscribe();
+    };
   }, []);
 
   const handleSignOut = async () => {
@@ -313,9 +333,13 @@ export function App() {
         ) : !hostUser ? (
           <HostAuth
             onAuthenticated={(user) => {
-              localStorage.setItem('trivia_guest_session_active', 'true');
-              localStorage.setItem('guest_host_id', user.id);
-              localStorage.setItem('guest_host_email', user.email);
+              if (user.isDemo) {
+                localStorage.setItem('trivia_guest_session_active', 'true');
+                localStorage.setItem('guest_host_id', user.id);
+                localStorage.setItem('guest_host_email', user.email);
+              } else {
+                localStorage.removeItem('trivia_guest_session_active');
+              }
               setHostUser(user);
             }}
             onOpenSupabaseModal={() => setShowSupabaseModal(true)}

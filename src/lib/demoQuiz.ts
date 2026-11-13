@@ -1,4 +1,4 @@
-import { upsertFullQuiz } from './quizService';
+import { resolveHostId, upsertFullQuiz } from './quizService';
 import type { Quiz, Slide, SlideOptions, SlideType, Theme } from '../types/quiz';
 
 function escapeXml(unsafe: string): string {
@@ -234,6 +234,7 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
  * in privlačnimi temnimi neon SVG slajdi ter ga z UPSERT shrani neposredno v Supabase bazo.
  */
 export async function createMegaDemoQuiz(hostId: string): Promise<Quiz> {
+  const effectiveHostId = resolveHostId(hostId);
   const quizId = crypto.randomUUID();
   const theme1Id = crypto.randomUUID();
   const theme2Id = crypto.randomUUID();
@@ -243,7 +244,7 @@ export async function createMegaDemoQuiz(hostId: string): Promise<Quiz> {
 
   const quiz: Quiz = {
     id: quizId,
-    host_id: hostId,
+    host_id: effectiveHostId,
     title: 'Veliki Trivia Kviz (5 Sklopov)',
     max_jokers_per_player: 2,
     created_at: new Date().toISOString(),
@@ -795,7 +796,7 @@ export async function createMegaDemoQuiz(hostId: string): Promise<Quiz> {
   };
 
   // Shrani celoten kviz neposredno v Supabase bazo (quizzes, themes, slides) z UPSERT
-  await upsertFullQuiz(quiz, themes, slidesByTheme, hostId);
+  await upsertFullQuiz(quiz, themes, slidesByTheme, effectiveHostId);
 
   return quiz;
 }

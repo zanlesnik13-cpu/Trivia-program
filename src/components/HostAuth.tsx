@@ -20,13 +20,12 @@ const GUEST_HOST_ID_KEY = 'guest_host_id';
 const GUEST_HOST_EMAIL_KEY = 'guest_host_email';
 
 export function getOrCreateGuestHostId(): string {
-  if (typeof window === 'undefined') return '00000000-0000-4000-8000-000000000001';
+  if (typeof window === 'undefined') return 'guest-00000000-0000-4000-8000-000000000001';
   const existing = localStorage.getItem(GUEST_HOST_ID_KEY);
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (existing && uuidRegex.test(existing)) {
+  if (existing && existing.startsWith('guest-') && existing.length > 'guest-'.length) {
     return existing;
   }
-  const generated = crypto.randomUUID();
+  const generated = `guest-${crypto.randomUUID()}`;
   localStorage.setItem(GUEST_HOST_ID_KEY, generated);
   return generated;
 }
@@ -56,11 +55,11 @@ export const HostAuth: React.FC<HostAuthProps> = ({
 
     const supabase = getSupabaseClient();
     if (!supabase) {
-      // Če Supabase še ni povezan, prijavimo gostitelja s stalnim veljavnim UUID-jem
-      const guestUuid = getOrCreateGuestHostId();
+      // Če Supabase še ni povezan, prijavimo gostitelja z gostujočim ID-jem ('guest-...')
+      const guestHostId = getOrCreateGuestHostId();
       localStorage.setItem(GUEST_HOST_EMAIL_KEY, email.trim());
       onAuthenticated({
-        id: guestUuid,
+        id: guestHostId,
         email: email.trim(),
         isDemo: true,
       });
@@ -83,15 +82,9 @@ export const HostAuth: React.FC<HostAuthProps> = ({
             );
           }
           if (lower.includes('email not confirmed')) {
-            // Če ima uporabnik v Supabase še vklopljeno potrditev e-pošte, ga vseeno spustimo v nadzorno ploščo z determinističnim ali gostujočim UUID-jem
-            const guestUuid = getOrCreateGuestHostId();
-            localStorage.setItem(GUEST_HOST_EMAIL_KEY, email.trim());
-            onAuthenticated({
-              id: guestUuid,
-              email: email.trim(),
-              isDemo: true,
-            });
-            return;
+            throw new Error(
+              'Vaš e-poštni naslov še ni potrjen. Preverite svoj e-poštni predal in kliknite potrditveno povezavo, nato poskusite znova (ali uporabite Hiter vstop kot Gost spodaj).'
+            );
           }
           if (lower.includes('invalid login credentials')) {
             throw new Error(
@@ -101,10 +94,12 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           throw signInErr;
         }
 
-        if (data.user) {
+        const authUser = data.session?.user || data.user;
+        if (authUser) {
           onAuthenticated({
-            id: data.user.id,
-            email: data.user.email || email.trim(),
+            id: authUser.id,
+            email: authUser.email || email.trim(),
+            isDemo: false,
           });
         }
       } else {
@@ -129,19 +124,18 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           throw signUpErr;
         }
 
-        // Če Supabase vrne uporabnika (tudi brez potrjene seje), ga takoj spusti v nadzorno ploščo!
-        if (data.user) {
-          localStorage.setItem(GUEST_HOST_ID_KEY, data.user.id);
-          localStorage.setItem(GUEST_HOST_EMAIL_KEY, data.user.email || email.trim());
+        // Če ima uporabnik takoj aktivno Supabase Auth sejo, ga prijavimo s session.user.id
+        if (data.session?.user) {
           onAuthenticated({
-            id: data.user.id,
-            email: data.user.email || email.trim(),
+            id: data.session.user.id,
+            email: data.session.user.email || email.trim(),
+            isDemo: false,
           });
           return;
         }
 
         setSuccessMsg(
-          'Registracija uspešna! Lahko se prijavite ali uporabite gumb za hiter vstop spodaj.'
+          'Registracija uspešna! Na vaš e-poštni naslov smo poslali potrditveno povezavo. Potrdite e-pošto in se prijavite (ali uporabite Hiter vstop kot Gost spodaj).'
         );
         setMode('login');
       }
@@ -155,11 +149,11 @@ export const HostAuth: React.FC<HostAuthProps> = ({
   };
 
   const handleQuickDemoLogin = () => {
-    const guestUuid = getOrCreateGuestHostId();
+    const guestHostId = getOrCreateGuestHostId();
     const guestEmail = email.trim() || localStorage.getItem(GUEST_HOST_EMAIL_KEY) || 'gost@quizpulse.si';
     localStorage.setItem(GUEST_HOST_EMAIL_KEY, guestEmail);
     onAuthenticated({
-      id: guestUuid,
+      id: guestHostId,
       email: guestEmail,
       isDemo: true,
     });
@@ -311,7 +305,7 @@ export const HostAuth: React.FC<HostAuthProps> = ({
           </div>
 
           {/* Gumb za hiter vstop brez prijave (vedno na voljo) */}
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             <button
               id="quick-demo-login-btn"
               type="button"
@@ -319,10 +313,10 @@ export const HostAuth: React.FC<HostAuthProps> = ({
               className="w-full py-3 px-4 rounded-xl text-xs sm:text-sm font-bold bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/35 text-emerald-300 hover:text-emerald-200 flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/10 transition-all cursor-pointer group"
             >
               <Zap className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
-              <span>⚡ Hiter vstop brez prijave (Demo / Lokalni gostitelj)</span>
+              <span>⚡ Hiter vstop brez prijave (Gost)</span>
             </button>
-            <p className="text-[11px] text-center text-slate-400 leading-tight">
-              Takojšen vstop v nadzorno ploščo za ustvarjanje kvizov in vodenje seje tudi brez registracije.
+            <p className="text-[11px] text-center text-amber-300/90 bg-amber-500/10 border border-amber-500/25 rounded-xl px-3 py-2 leading-relaxed">
+              Kvizi v načinu gosta so shranjeni samo v tem brskalniku. Za trajno shranjevanje in dostop z več naprav ustvari brezplačen račun z e-pošto.
             </p>
           </div>
 

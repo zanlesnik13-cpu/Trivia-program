@@ -30,22 +30,30 @@ export function ensureValidUuid(val?: string | null): string {
   return crypto.randomUUID();
 }
 
-export function getValidUuidHostId(rawHostId?: string): string {
-  if (rawHostId && isValidUuid(rawHostId)) {
-    return rawHostId.trim();
+export function isValidHostId(val: string | undefined | null): boolean {
+  if (!val || typeof val !== 'string') return false;
+  const trimmed = val.trim();
+  return isValidUuid(trimmed) || (trimmed.startsWith('guest-') && trimmed.length > 'guest-'.length);
+}
+
+export function resolveHostId(rawHostId?: string): string {
+  if (isValidHostId(rawHostId)) {
+    return rawHostId!.trim();
   }
   if (typeof window !== 'undefined') {
     const stored = localStorage.getItem('guest_host_id');
-    if (stored && isValidUuid(stored)) {
+    if (stored && stored.startsWith('guest-') && stored.length > 'guest-'.length) {
       return stored.trim();
     }
   }
-  const newUuid = crypto.randomUUID();
+  const newGuestId = `guest-${crypto.randomUUID()}`;
   if (typeof window !== 'undefined') {
-    localStorage.setItem('guest_host_id', newUuid);
+    localStorage.setItem('guest_host_id', newGuestId);
   }
-  return newUuid;
+  return newGuestId;
 }
+
+export const getValidUuidHostId = resolveHostId;
 
 // Ohranjamo prazno naročnino zaradi kompatibilnosti uvozov v komponentah
 export function subscribeToDemoUpdates(_callback: (event: { type: string; sessionId?: string }) => void) {
@@ -840,13 +848,15 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
  * Vrne vse aktivne (še nezaključene) seje iz Supabase skupaj z imenom kviza in številom igralcev.
  */
 export async function fetchHostActiveSessions(
-  _hostId: string
+  hostId: string
 ): Promise<ActiveGameSessionWithQuiz[]> {
   const supabase = requireSupabaseClient();
+  const effectiveHostId = resolveHostId(hostId);
 
   const { data: quizzes, error: qErr } = await supabase
     .from('quizzes')
-    .select('id, title');
+    .select('id, title')
+    .eq('host_id', effectiveHostId);
 
   if (qErr) {
     throw formatSupabaseError(qErr, 'Napaka pri branju kvizov za aktivne seje');
