@@ -98,7 +98,9 @@ CREATE TABLE IF NOT EXISTS public.answers (
     answer_text TEXT NOT NULL DEFAULT '',
     is_correct BOOLEAN DEFAULT FALSE,
     awarded_points NUMERIC DEFAULT 0,
+    bonus_points NUMERIC DEFAULT 0,
     graded BOOLEAN NOT NULL DEFAULT FALSE,
+    host_comment TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(session_id, player_id, slide_id)
 );
@@ -217,5 +219,6 @@ TO anon, authenticated
 USING (bucket_id = 'slides');
 
 
--- Opcijski komentar gostitelja pri ocenjevanju
-ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;
+-- Opcijski komentar gostitelja in bonus točke pri ocenjevanju (za nadgradnjo obstoječe tabele answers)
+ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS host_comment TEXT;
+ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS bonus_points NUMERIC DEFAULT 0;

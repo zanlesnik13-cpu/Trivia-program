@@ -32,10 +32,15 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
             s.slide_type === 'closest_number'
         );
         const hasJoker = jokerThemes.has(theme.id);
-        const rawSum = questions.reduce(
+        const redneTocke = questions.reduce(
           (acc, q) => acc + Number(myAnswers[q.id]?.awarded_points ?? 0),
           0
         );
+        const bonusTocke = questions.reduce(
+          (acc, q) => acc + Number(myAnswers[q.id]?.bonus_points ?? 0),
+          0
+        );
+        const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
         const maxSum = questions.reduce((acc, q) => acc + Number(q.points ?? 0), 0);
 
         return (
@@ -43,22 +48,27 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
             <div className="flex items-center justify-between gap-2 px-1">
               <span className="text-sm font-bold text-slate-100">{theme.title}</span>
               <span className="text-xs font-mono-code font-bold text-emerald-400 shrink-0">
-                {fmt(hasJoker ? rawSum * 2 : rawSum)} t
+                {fmt(tockeTeme)} t
                 {hasJoker && <span className="text-amber-400"> (🃏 ×2)</span>}
+                {bonusTocke > 0 && (
+                  <span className="text-amber-300"> (+{fmt(bonusTocke)} ⭐)</span>
+                )}
               </span>
             </div>
 
             {hasJoker && (
               <p className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-xl px-3 py-1.5">
-                🃏 V tem sklopu si uporabil Jokerja: {fmt(rawSum)} t → {fmt(rawSum * 2)} t (podvojeno,
-                možno {fmt(maxSum)} t brez Jokerja)
+                🃏 V tem sklopu si uporabil Jokerja: {fmt(redneTocke)} t → {fmt(redneTocke * 2)} t
+                {bonusTocke > 0 ? ` + ${fmt(bonusTocke)} ⭐ bonus = ${fmt(tockeTeme)} t` : ''} (možno{' '}
+                {fmt(maxSum)} t rednih brez Jokerja)
               </p>
             )}
 
             {questions.map((q, idx) => {
               const ans = myAnswers[q.id];
               const pts = Number(ans?.awarded_points ?? 0);
-              const good = pts > 0;
+              const bonusPts = Number(ans?.bonus_points ?? 0);
+              const good = pts > 0 || bonusPts > 0;
               return (
                 <div
                   key={q.id}
@@ -88,14 +98,21 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
                         {q.correct_answer || '—'}
                       </span>
                     </div>
-                    <div className="flex justify-between gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="text-slate-400">Točke:</span>
-                      <span className="font-mono-code font-bold text-slate-100">
-                        {fmt(pts)} / {fmt(Number(q.points ?? 0))}
-                        {hasJoker && (
-                          <span className="text-amber-400"> → {fmt(pts * 2)} (🃏 ×2)</span>
+                      <div className="flex flex-wrap items-center justify-end gap-1.5">
+                        <span className="font-mono-code font-bold text-slate-100">
+                          {fmt(pts)} / {fmt(Number(q.points ?? 0))}
+                          {hasJoker && (
+                            <span className="text-amber-400"> → {fmt(pts * 2)} (🃏 ×2)</span>
+                          )}
+                        </span>
+                        {bonusPts > 0 && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-300 text-[10px] font-bold shadow-sm">
+                            ⭐ +{fmt(bonusPts)} bonus (brez 2x Jokerja)
+                          </span>
                         )}
-                      </span>
+                      </div>
                     </div>
                   </div>
                   {ans?.host_comment && (

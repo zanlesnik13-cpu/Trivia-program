@@ -1089,6 +1089,7 @@ async function saveOrUpdateAnswerRecord(
     answer_text: string;
     is_correct: boolean;
     awarded_points: number;
+    bonus_points?: number;
     graded: boolean;
     host_comment?: string | null;
   },
@@ -1111,10 +1112,11 @@ async function saveOrUpdateAnswerRecord(
     graded: fields.graded,
   };
 
-  const withCommentFields: Record<string, unknown> =
-    fields.host_comment !== undefined
-      ? { ...baseFields, host_comment: fields.host_comment }
-      : baseFields;
+  const optionalFields: Record<string, unknown> = {
+    ...baseFields,
+    ...(fields.bonus_points !== undefined ? { bonus_points: Number(fields.bonus_points) } : {}),
+    ...(fields.host_comment !== undefined ? { host_comment: fields.host_comment } : {}),
+  };
 
   if (existingRows && existingRows.length > 0) {
     const primary = existingRows[0] as Answer;
@@ -1131,21 +1133,36 @@ async function saveOrUpdateAnswerRecord(
 
     let { data, error } = await supabase
       .from('answers')
-      .update(withCommentFields)
+      .update(optionalFields)
       .eq('id', primary.id)
       .select('*')
       .single();
 
-    if (error && fields.host_comment !== undefined && /host_comment/i.test(error.message || '')) {
+    if (error && /(host_comment|bonus_points)/i.test(error.message || '')) {
       console.warn(
-        'Stolpec answers.host_comment ne obstaja. Zaženi: ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;'
+        'Stolpec answers.host_comment ali answers.bonus_points ne obstaja. Zaženi: ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS host_comment TEXT; ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS bonus_points NUMERIC DEFAULT 0;'
       );
+      const retryFields = { ...optionalFields };
+      if (/host_comment/i.test(error.message || '')) {
+        delete retryFields.host_comment;
+      }
+      if (/bonus_points/i.test(error.message || '')) {
+        delete retryFields.bonus_points;
+      }
       ({ data, error } = await supabase
         .from('answers')
-        .update(baseFields)
+        .update(retryFields)
         .eq('id', primary.id)
         .select('*')
         .single());
+      if (error && /(host_comment|bonus_points)/i.test(error.message || '')) {
+        ({ data, error } = await supabase
+          .from('answers')
+          .update(baseFields)
+          .eq('id', primary.id)
+          .select('*')
+          .single());
+      }
     }
 
     if (error || !data) {
@@ -1162,10 +1179,11 @@ async function saveOrUpdateAnswerRecord(
     slide_id: slideId,
     ...baseFields,
   };
-  const insertWithComment: Record<string, unknown> =
-    fields.host_comment !== undefined
-      ? { ...insertBase, host_comment: fields.host_comment }
-      : insertBase;
+  const insertOptional: Record<string, unknown> = {
+    ...insertBase,
+    ...(fields.bonus_points !== undefined ? { bonus_points: Number(fields.bonus_points) } : {}),
+    ...(fields.host_comment !== undefined ? { host_comment: fields.host_comment } : {}),
+  };
 
   const tryInsertOrUpsert = async (payload: Record<string, unknown>) => {
     const res = await supabase
@@ -1179,13 +1197,23 @@ async function saveOrUpdateAnswerRecord(
     return res;
   };
 
-  let { data, error } = await tryInsertOrUpsert(insertWithComment);
+  let { data, error } = await tryInsertOrUpsert(insertOptional);
 
-  if (error && fields.host_comment !== undefined && /host_comment/i.test(error.message || '')) {
+  if (error && /(host_comment|bonus_points)/i.test(error.message || '')) {
     console.warn(
-      'Stolpec answers.host_comment ne obstaja. Zaženi: ALTER TABLE answers ADD COLUMN IF NOT EXISTS host_comment TEXT;'
+      'Stolpec answers.host_comment ali answers.bonus_points ne obstaja. Zaženi: ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS host_comment TEXT; ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS bonus_points NUMERIC DEFAULT 0;'
     );
-    ({ data, error } = await tryInsertOrUpsert(insertBase));
+    const retryPayload = { ...insertOptional };
+    if (/host_comment/i.test(error.message || '')) {
+      delete retryPayload.host_comment;
+    }
+    if (/bonus_points/i.test(error.message || '')) {
+      delete retryPayload.bonus_points;
+    }
+    ({ data, error } = await tryInsertOrUpsert(retryPayload));
+    if (error && /(host_comment|bonus_points)/i.test(error.message || '')) {
+      ({ data, error } = await tryInsertOrUpsert(insertBase));
+    }
   }
 
   if (error || !data) {
@@ -1305,7 +1333,8 @@ export async function upsertGradedAnswer(
   answerText: string,
   isCorrect: boolean,
   awardedPoints: number,
-  hostComment?: string
+  hostComment?: string,
+  bonusPoints?: number
 ): Promise<Answer> {
   return saveOrUpdateAnswerRecord(
     sessionId,
@@ -1317,6 +1346,7 @@ export async function upsertGradedAnswer(
       is_correct: isCorrect,
       awarded_points: Number(awardedPoints),
       graded: true,
+      ...(bonusPoints !== undefined ? { bonus_points: Math.max(0, Number(bonusPoints) || 0) } : {}),
       ...(hostComment !== undefined ? { host_comment: hostComment.trim() || null } : {}),
     },
     'Napaka pri ocenjevanju odgovora v tabeli "answers"'
@@ -1440,10 +1470,13 @@ export async function autoPreGradeTheme(
 }
 
 /**
- * Potrdi ocene za tematiko, izračuna skupne točke vseh igralcev (upošteva 2x Joker za vsako temo!)
- * in prestavi status seje v 'leaderboard'.
- * Izračun je popolnoma idempotenten: total_score vsakega igralca se vedno preračuna kot vsota
- * vseh njegovih ocenjenih tematik iz tabele answers + player_jokers (večkratni klik nikoli ne podvoji točk).
+ * Potrdi ocene za tematiko, izračuna skupne točke vseh igralcev (upošteva 2x Joker za redne točke,
+ * bonus_points pa se prištejejo BREZ podvajanja!) in prestavi status seje v 'leaderboard'.
+ * Formula za posamezno tematiko:
+ *   redneTocke = vsota(awarded_points v tej temi)
+ *   bonusTocke = vsota(bonus_points v tej temi)
+ *   tockeTeme = (igralecImaJokerjaVTejTemi ? redneTocke * 2 : redneTocke) + bonusTocke
+ * Skupni rezultat (players.total_score) se vedno preračuna kot vsota tockeTeme čez vse ocenjene tematike.
  */
 export async function confirmThemeGradesAndShowLeaderboard(
   sessionId: string
@@ -1481,24 +1514,34 @@ export async function confirmThemeGradesAndShowLeaderboard(
     newScoresByPlayer[p.id] = 0;
   }
 
-  const playerThemeSums: Record<string, Record<string, number>> = {};
+  const playerThemeSums: Record<
+    string,
+    Record<string, { regular: number; bonus: number }>
+  > = {};
   for (const ans of dedupedAnswers) {
-    const pts = Number(ans.awarded_points ?? 0);
+    const regularPts = Number(ans.awarded_points ?? 0);
+    const bonusPts = Number(ans.bonus_points ?? 0);
     const resolvedThemeId = slideThemeMap.get(ans.slide_id) || ans.theme_id;
     if (!resolvedThemeId) continue;
     if (!playerThemeSums[ans.player_id]) {
       playerThemeSums[ans.player_id] = {};
     }
-    playerThemeSums[ans.player_id][resolvedThemeId] =
-      (playerThemeSums[ans.player_id][resolvedThemeId] || 0) + pts;
+    if (!playerThemeSums[ans.player_id][resolvedThemeId]) {
+      playerThemeSums[ans.player_id][resolvedThemeId] = { regular: 0, bonus: 0 };
+    }
+    playerThemeSums[ans.player_id][resolvedThemeId].regular += regularPts;
+    playerThemeSums[ans.player_id][resolvedThemeId].bonus += bonusPts;
   }
 
   for (const player of players) {
     const themeSums = playerThemeSums[player.id] || {};
     let total = 0;
-    for (const [tId, themeSum] of Object.entries(themeSums)) {
+    for (const [tId, sums] of Object.entries(themeSums)) {
       const hasJoker = jokerSet.has(`${player.id}_${tId}`);
-      total += hasJoker ? themeSum * 2 : themeSum;
+      const redneTocke = sums.regular;
+      const bonusTocke = sums.bonus;
+      const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
+      total += tockeTeme;
     }
     newScoresByPlayer[player.id] = Math.round(total * 100) / 100;
   }

@@ -88,6 +88,7 @@ export interface Answer {
   answer_text: string;
   is_correct: boolean;
   awarded_points: number;
+  bonus_points?: number;
   graded: boolean;
   host_comment?: string | null;
   created_at?: string;

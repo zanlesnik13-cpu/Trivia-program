@@ -434,17 +434,23 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // 6. Ročno ocenjevanje posameznega odgovora igralca na telefonu gostitelja
+  // 6. Ročno ocenjevanje posameznega odgovora igralca na telefonu gostitelja (vključno z bonus_points)
   const handleGradeAnswer = async (
     playerId: string,
     slide: Slide,
     existingAnswer: Answer | undefined,
     isCorrect: boolean,
     awardedPoints: number,
-    hostComment?: string
+    hostComment?: string,
+    bonusPoints?: number
   ) => {
     if (!data?.currentTheme) return;
     const safePoints = Math.max(0, Number.isNaN(awardedPoints) ? 0 : awardedPoints);
+    const currentBonus = Number(existingAnswer?.bonus_points ?? 0);
+    const safeBonus =
+      bonusPoints !== undefined
+        ? Math.max(0, Number.isNaN(bonusPoints) ? 0 : bonusPoints)
+        : currentBonus;
     const ansText = existingAnswer?.answer_text ?? '';
 
     // Optimistična posodobitev v UI za takojšnjo odzivnost na telefonu
@@ -462,6 +468,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         answer_text: ansText,
         is_correct: isCorrect,
         awarded_points: safePoints,
+        bonus_points: safeBonus,
         graded: true,
         host_comment:
           hostComment !== undefined
@@ -488,7 +495,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         ansText,
         isCorrect,
         safePoints,
-        hostComment
+        hostComment,
+        safeBonus
       );
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Napaka pri shranjevanju ocene.');
@@ -496,11 +504,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // 7. Potrdi točke (z upoštevanjem 2x Jokerja!) in prikaži lestvico
+  // 7. Potrdi točke (z upoštevanjem 2x Jokerja za redne točke + bonus_points brez podvajanja!) in prikaži lestvico
   const handleConfirmGradesAndLeaderboard = async () => {
     setActionLoading(true);
     try {
-      // Shrani še neshranjene komentarje gostitelja
+      // Shrani še neshranjene komentarje gostitelja in aktualne bonus_points
       for (const [key, text] of Object.entries(commentDrafts.current)) {
         const [pid, sid] = key.split(':');
         const slide = (data?.slidesByTheme?.[data.currentTheme?.id ?? ''] || []).find(
@@ -514,11 +522,38 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
             ans,
             Boolean(ans?.is_correct),
             Number(ans?.awarded_points ?? 0),
-            text
+            text,
+            Number(ans?.bonus_points ?? 0)
           );
         }
       }
       commentDrafts.current = {};
+
+      // Poskrbi, da so vsi spremenjeni bonus_points v trenutni temi zapisani v tabelo answers
+      if (data?.currentTheme) {
+        const curSlides = data.slidesByTheme[data.currentTheme.id] || [];
+        const slideSet = new Set(curSlides.map((s) => s.id));
+        const bonusAnswers = data.answers.filter(
+          (a) => slideSet.has(a.slide_id) && Number(a.bonus_points ?? 0) > 0
+        );
+        for (const ans of bonusAnswers) {
+          const sl = curSlides.find((s) => s.id === ans.slide_id);
+          if (sl) {
+            await upsertGradedAnswer(
+              sessionId,
+              ans.player_id,
+              data.currentTheme.id,
+              sl.id,
+              ans.answer_text ?? '',
+              Boolean(ans.is_correct),
+              Number(ans.awarded_points ?? 0),
+              ans.host_comment ?? undefined,
+              Number(ans.bonus_points ?? 0)
+            );
+          }
+        }
+      }
+
       await confirmThemeGradesAndShowLeaderboard(sessionId);
       await loadData();
     } catch (err: unknown) {
@@ -1255,6 +1290,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                             );
                             const isCorrect = Boolean(ans?.is_correct);
                             const awarded = Number(ans?.awarded_points ?? 0);
+                            const bonusPts = Number(ans?.bonus_points ?? 0);
                             const usedJoker = jokersForCurrentTheme.has(player.id);
 
                             // Izračun razlike za closest_number
@@ -1286,7 +1322,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                               >
                                 <div className="flex items-start justify-between gap-2">
                                   <div className="min-w-0">
-                                    <div className="flex items-center gap-1.5">
+                                    <div className="flex items-center gap-1.5 flex-wrap">
                                       <span className="text-xs font-bold text-slate-200 truncate">
                                         {player.nickname}
                                       </span>
@@ -1296,6 +1332,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                           title="Igralec ima v tej temi aktiviranega Jokerja (2x ob končnem seštevku teme)"
                                         >
                                           🃏 2x
+                                        </span>
+                                      )}
+                                      {bonusPts > 0 && (
+                                        <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-400/50 text-[10px] font-bold">
+                                          ⭐ +{bonusPts} bonus
                                         </span>
                                       )}
                                       {diffLabel && (
@@ -1437,6 +1478,75 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                     />
                                   </div>
                                 </div>
+
+                                {/* Razdelek za Bonus točke (ne štejejo v 2x Joker) */}
+                                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-1.5">
+                                  <span className="block text-[10px] font-bold text-amber-300">
+                                    ⭐ Bonus točke (ne štejejo v 2x Joker)
+                                  </span>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-1.5">
+                                      {[
+                                        { label: '0', val: 0 },
+                                        { label: '+0.5', val: 0.5 },
+                                        { label: '+1', val: 1 },
+                                      ].map((btn) => (
+                                        <button
+                                          key={btn.label}
+                                          type="button"
+                                          onClick={() =>
+                                            handleGradeAnswer(
+                                              player.id,
+                                              slide,
+                                              ans,
+                                              isCorrect,
+                                              awarded,
+                                              undefined,
+                                              btn.val
+                                            )
+                                          }
+                                          className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                                            bonusPts === btn.val && (btn.val > 0 || bonusPts === 0)
+                                              ? btn.val === 0
+                                                ? 'bg-slate-800 text-slate-200 border border-slate-600'
+                                                : 'bg-amber-500 text-slate-950 shadow-sm'
+                                              : 'bg-slate-900 text-amber-200/80 hover:bg-slate-800 border border-amber-500/20'
+                                          }`}
+                                        >
+                                          {btn.label}
+                                        </button>
+                                      ))}
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5">
+                                      <span className="text-[11px] text-amber-200/80">Bonus:</span>
+                                      <input
+                                        type="number"
+                                        step="0.5"
+                                        min="0"
+                                        value={bonusPts}
+                                        onChange={(e) => {
+                                          const rawVal = parseFloat(e.target.value || '0');
+                                          const safeBonusVal = Math.max(
+                                            0,
+                                            Number.isNaN(rawVal) ? 0 : rawVal
+                                          );
+                                          handleGradeAnswer(
+                                            player.id,
+                                            slide,
+                                            ans,
+                                            isCorrect,
+                                            awarded,
+                                            undefined,
+                                            safeBonusVal
+                                          );
+                                        }}
+                                        className="w-16 px-2 py-1 rounded-lg bg-slate-950 border border-amber-500/40 text-right font-mono-code font-bold text-xs text-amber-300 focus:outline-none focus:border-amber-400"
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+
                                 <input
                                   type="text"
                                   key={`${player.id}-${slide.id}`}
@@ -1457,7 +1567,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                         ans,
                                         isCorrect,
                                         awarded,
-                                        e.target.value
+                                        e.target.value,
+                                        bonusPts
                                       );
                                     }
                                   }}
@@ -1475,24 +1586,39 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
               </div>
             )}
 
-            {/* Povzetek točk trenutne tematike z upoštevanim 2x JOKERJEM */}
+            {/* Povzetek točk trenutne tematike z upoštevanim 2x JOKERJEM in bonus točkami */}
             {players.length > 0 && (
               <div className="bg-slate-900/90 border border-amber-500/30 rounded-2xl p-4 space-y-2.5">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-bold uppercase tracking-wider text-amber-300">
-                    Predogled izračuna teme (vključno z 2x Jokerjem)
+                    Predogled izračuna teme (2x Joker + ⭐ Bonus)
                   </span>
                 </div>
                 <div className="space-y-1.5">
                   {players.map((p) => {
-                    const rawThemeSum = gradableSlides.reduce((acc, sl) => {
+                    const redneTocke = gradableSlides.reduce((acc, sl) => {
                       const ansForSlide = answers.find(
                         (a) => a.player_id === p.id && a.slide_id === sl.id
                       );
                       return acc + Number(ansForSlide?.awarded_points ?? 0);
                     }, 0);
+                    const bonusTocke = gradableSlides.reduce((acc, sl) => {
+                      const ansForSlide = answers.find(
+                        (a) => a.player_id === p.id && a.slide_id === sl.id
+                      );
+                      return acc + Number(ansForSlide?.bonus_points ?? 0);
+                    }, 0);
                     const hasJoker = jokersForCurrentTheme.has(p.id);
-                    const finalThemePts = hasJoker ? rawThemeSum * 2 : rawThemeSum;
+                    const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
+
+                    let formulaText = `+${tockeTeme} t`;
+                    if (hasJoker && bonusTocke > 0) {
+                      formulaText = `(${redneTocke} × 2) + ${bonusTocke} ⭐ = +${tockeTeme} t`;
+                    } else if (hasJoker) {
+                      formulaText = `${redneTocke} × 2 = +${tockeTeme} t`;
+                    } else if (bonusTocke > 0) {
+                      formulaText = `${redneTocke} + ${bonusTocke} ⭐ = +${tockeTeme} t`;
+                    }
 
                     return (
                       <div
@@ -1506,11 +1632,14 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                               (🃏 Joker 2x)
                             </span>
                           )}
+                          {bonusTocke > 0 && (
+                            <span className="text-[10px] font-bold text-amber-300">
+                              (⭐ +{bonusTocke})
+                            </span>
+                          )}
                         </span>
                         <span className="font-mono-code font-bold text-emerald-400">
-                          {hasJoker
-                            ? `${rawThemeSum} × 2 = +${finalThemePts} t`
-                            : `+${finalThemePts} t`}
+                          {formulaText}
                         </span>
                       </div>
                     );
