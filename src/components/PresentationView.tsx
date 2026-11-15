@@ -750,30 +750,66 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                   {currentSlide.question_text || 'Vprašanje se bo prikazalo tukaj.'}
                 </h3>
 
-                {/* Če je izbirni A/B/C/D tip slajda */}
-                {currentSlide.slide_type === 'multiple_choice' && (
+                {/* Če je večdelno vprašanje */}
+                {currentSlide.question_parts && currentSlide.question_parts.length > 0 ? (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
-                    {(
-                      [
-                        { key: 'A', bg: 'bg-rose-500/15 border-rose-500/40 text-rose-300', badge: 'bg-rose-500 text-slate-950' },
-                        { key: 'B', bg: 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300', badge: 'bg-indigo-500 text-white' },
-                        { key: 'C', bg: 'bg-amber-500/15 border-amber-500/40 text-amber-300', badge: 'bg-amber-500 text-slate-950' },
-                        { key: 'D', bg: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300', badge: 'bg-emerald-500 text-slate-950' },
-                      ] as const
-                    ).map(({ key, bg, badge }) => (
+                    {currentSlide.question_parts.map((part, pIdx) => (
                       <div
-                        key={key}
-                        className={`flex items-center gap-3.5 p-4 rounded-2xl border ${bg} backdrop-blur-md`}
+                        key={part.id}
+                        className="p-4 rounded-2xl bg-slate-950/85 border border-fuchsia-500/35 space-y-2"
                       >
-                        <span className={`w-9 h-9 rounded-xl font-bold flex items-center justify-center text-sm shadow-md ${badge}`}>
-                          {key}
-                        </span>
-                        <span className="text-base sm:text-lg font-semibold text-slate-100">
-                          {currentSlide.options[key] || `Možnost ${key}`}
-                        </span>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="px-2.5 py-0.5 rounded-lg bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 text-xs font-bold">
+                            {part.label || `Del ${pIdx + 1}`}
+                          </span>
+                          <span className="text-xs font-bold text-emerald-400">
+                            {part.points} t
+                          </span>
+                        </div>
+                        {part.type === 'multiple_choice' && part.options && (
+                          <div className="grid grid-cols-2 gap-1.5 pt-1">
+                            {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => (
+                              <div
+                                key={letter}
+                                className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-200 font-semibold truncate"
+                              >
+                                <span className="text-indigo-400 font-bold mr-1.5">
+                                  {letter}:
+                                </span>
+                                {part.options?.[lIdx] || `Možnost ${letter}`}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
+                ) : (
+                  /* Če je izbirni A/B/C/D tip slajda */
+                  currentSlide.slide_type === 'multiple_choice' && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
+                      {(
+                        [
+                          { key: 'A', bg: 'bg-rose-500/15 border-rose-500/40 text-rose-300', badge: 'bg-rose-500 text-slate-950' },
+                          { key: 'B', bg: 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300', badge: 'bg-indigo-500 text-white' },
+                          { key: 'C', bg: 'bg-amber-500/15 border-amber-500/40 text-amber-300', badge: 'bg-amber-500 text-slate-950' },
+                          { key: 'D', bg: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300', badge: 'bg-emerald-500 text-slate-950' },
+                        ] as const
+                      ).map(({ key, bg, badge }) => (
+                        <div
+                          key={key}
+                          className={`flex items-center gap-3.5 p-4 rounded-2xl border ${bg} backdrop-blur-md`}
+                        >
+                          <span className={`w-9 h-9 rounded-xl font-bold flex items-center justify-center text-sm shadow-md ${badge}`}>
+                            {key}
+                          </span>
+                          <span className="text-base sm:text-lg font-semibold text-slate-100">
+                            {currentSlide.options[key] || `Možnost ${key}`}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )
                 )}
               </div>
             )}

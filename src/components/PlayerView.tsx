@@ -3,10 +3,12 @@ import { PlayerResultsReview } from './PlayerResultsReview';
 import confetti from 'canvas-confetti';
 import {
   AlertCircle,
+  Calendar,
   Check,
   CheckCircle2,
   Clock,
   Info,
+  Layers,
   Loader2,
   Lock,
   LogOut,
@@ -15,6 +17,14 @@ import {
   Send,
   Sparkles,
 } from 'lucide-react';
+import {
+  formatSloveneDate,
+  hasAnyMultiPartValue,
+  isMultiPartSlide,
+  parseMultiPartAnswer,
+  roundPoints,
+  serializeMultiPartAnswer,
+} from '../lib/questionUtils';
 import {
   fetchPlayerGameData,
   findSessionByRoomCode,
@@ -60,7 +70,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // Navigacija po slajdih trenutne teme (igralec lahko izbere katerikoli slajd <= max_slide_index_reached)
   const [selectedSlideId, setSelectedSlideId] = useState<string | null>(null);
 
-  // Ločeno lokalno stanje osnutkov odgovorov po ID-ju slajda (drafts[slide.id])
+  // Ločeno lokalno stanje osnutkov odgovorov po ID-ju slajda (drafts[slide.id] oz. drafts[`${slide.id}:${part.id}`])
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [savingAnswer, setSavingAnswer] = useState(false);
   const [saveSuccessNotice, setSaveSuccessNotice] = useState(false);
@@ -76,15 +86,26 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   const lastSeenThemeIdRef = useRef<string | null>(null);
   const prevStatusRef = useRef<string | null>(null);
 
-  // Prenesi shranjene odgovore iz baze v lokalne osnutke SAMO takrat, ko je drafts[slideId] === undefined
+  // Prenesi shranjene odgovore iz baze v lokalne osnutke SAMO takrat, ko je drafts[key] === undefined
   const seedDraftsFromSavedAnswers = (savedAnswers: Record<string, Answer>) => {
     setDrafts((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const [sId, ans] of Object.entries(savedAnswers)) {
-        if (next[sId] === undefined && ans?.answer_text !== undefined) {
-          next[sId] = ans.answer_text;
-          changed = true;
+        if (ans?.answer_text !== undefined) {
+          if (next[sId] === undefined) {
+            next[sId] = ans.answer_text;
+            changed = true;
+          }
+          // Če gre za večdelni JSON odgovor, napolni tudi ključe `${sId}:${partId}` samo če še niso nastavljeni
+          const { values } = parseMultiPartAnswer(ans.answer_text);
+          for (const [partId, partVal] of Object.entries(values)) {
+            const compositeKey = `${sId}:${partId}`;
+            if (next[compositeKey] === undefined) {
+              next[compositeKey] = partVal;
+              changed = true;
+            }
+          }
         }
       }
       return changed ? next : prev;
@@ -835,7 +856,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                   const isLocked = idx > maxAllowedIndex;
                   const isCurrentViewing = currentViewingSlide.id === slide.id;
                   const isHostCurrent = session.current_slide_id === slide.id;
-                  const hasAnswered = Boolean(gameData.myAnswers[slide.id]?.answer_text);
+                  const savedAnsText = gameData.myAnswers[slide.id]?.answer_text;
+                  const hasAnswered = isMultiPartSlide(slide)
+                    ? hasAnyMultiPartValue(savedAnsText)
+                    : Boolean(savedAnsText);
 
                   return (
                     <button
@@ -903,8 +927,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                   Vprašanje {viewingSlideIndex + 1} od {currentThemeSlides.length}
                 </span>
                 <span className="text-xs font-bold text-emerald-400">
-                  {currentViewingSlide.points}{' '}
-                  {currentViewingSlide.points === 1 ? 'točka' : 'točke'}
+                  {roundPoints(currentViewingSlide.points)}{' '}
+                  {roundPoints(currentViewingSlide.points) === 1 ? 'točka' : 'točke'}
                   {hasJokerInCurrentTheme && ' (2x Joker!)'}
                 </span>
               </div>
@@ -920,22 +944,190 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               )}
             </div>
 
-            {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA */}
+            {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA (ali večdelno vprašanje) */}
             {isTimerExpiredOnCurrentHostSlide ? (
               <div className="p-5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-center space-y-1">
                 <Lock className="w-6 h-6 text-rose-400 mx-auto" />
                 <p className="text-sm font-bold text-rose-200">Čas za odgovor je potekel!</p>
                 <p className="text-xs text-slate-400">
-                  Oddani odgovor je zaklenjen: <strong>{myCurrentAnswer?.answer_text || 'Brez odgovora'}</strong>
+                  Oddani odgovor je zaklenjen.
                 </p>
               </div>
-            ) : currentViewingSlide.slide_type === 'info_only' ? (
+            ) : currentViewingSlide.slide_type === 'info_only' ||
+              currentViewingSlide.slide_type === 'theme_intro' ? (
               <div className="p-6 rounded-2xl bg-slate-900/80 border border-slate-800 text-center space-y-2">
                 <Info className="w-7 h-7 text-sky-400 mx-auto" />
                 <p className="text-sm font-bold text-slate-200">Samo info slajd</p>
                 <p className="text-xs text-slate-400">
                   Spremljaj navodila ali razlago na glavnem zaslonu.
                 </p>
+              </div>
+            ) : isMultiPartSlide(currentViewingSlide) && currentViewingSlide.question_parts ? (
+              /* VEČDELNO VPRAŠANJE (question_parts) */
+              <div className="space-y-4">
+                <div className="flex items-center justify-between px-1">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-fuchsia-300">
+                    <Layers className="w-3.5 h-3.5 text-fuchsia-400" />
+                    <span>Večdelno vprašanje ({currentViewingSlide.question_parts.length} deli)</span>
+                  </span>
+                </div>
+
+                {(() => {
+                  const savedValues = parseMultiPartAnswer(myCurrentAnswer?.answer_text).values;
+                  const getPartDraft = (partId: string) => {
+                    const key = `${currentViewingSlide.id}:${partId}`;
+                    return drafts[key] !== undefined ? drafts[key] : savedValues[partId] ?? '';
+                  };
+
+                  const buildFullMultiPartJson = (overridePartId?: string, overrideVal?: string) => {
+                    const map: Record<string, string> = {};
+                    for (const p of currentViewingSlide.question_parts || []) {
+                      if (overridePartId && p.id === overridePartId) {
+                        map[p.id] = (overrideVal ?? '').trim();
+                      } else {
+                        map[p.id] = getPartDraft(p.id).trim();
+                      }
+                    }
+                    return serializeMultiPartAnswer(map);
+                  };
+
+                  return (
+                    <>
+                      {currentViewingSlide.question_parts.map((part, pIdx) => {
+                        const partDraft = getPartDraft(part.id);
+                        const partInputKey = `${currentViewingSlide.id}:${part.id}`;
+                        const partOpts = part.options || ['', '', '', ''];
+
+                        return (
+                          <div
+                            key={partInputKey}
+                            className="bg-slate-900/85 border border-slate-800 rounded-3xl p-4 space-y-3 shadow-md"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-bold text-fuchsia-300">
+                                {part.label || `Del ${pIdx + 1}`}
+                              </span>
+                              <span className="text-[11px] font-mono-code font-bold text-emerald-400">
+                                {roundPoints(part.points)} t
+                              </span>
+                            </div>
+
+                            {part.type === 'multiple_choice' ? (
+                              <div className="grid grid-cols-2 gap-2.5">
+                                {(
+                                  [
+                                    { key: 'A', idx: 0, bg: 'bg-rose-500', hover: 'hover:bg-rose-400', border: 'border-rose-400' },
+                                    { key: 'B', idx: 1, bg: 'bg-indigo-600', hover: 'hover:bg-indigo-500', border: 'border-indigo-400' },
+                                    { key: 'C', idx: 2, bg: 'bg-amber-500', hover: 'hover:bg-amber-400', border: 'border-amber-400' },
+                                    { key: 'D', idx: 3, bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', border: 'border-emerald-400' },
+                                  ] as const
+                                ).map(({ key, idx, bg, hover, border }) => {
+                                  const isSelected = partDraft.trim().toUpperCase() === key;
+                                  const optText = partOpts[idx];
+                                  return (
+                                    <button
+                                      key={key}
+                                      type="button"
+                                      onClick={() => {
+                                        setDrafts((prev) => ({
+                                          ...prev,
+                                          [partInputKey]: key,
+                                        }));
+                                        const jsonStr = buildFullMultiPartJson(part.id, key);
+                                        handleSubmitAnswer(jsonStr, currentViewingSlide);
+                                      }}
+                                      className={`min-h-[60px] p-3 rounded-2xl flex flex-col justify-between text-left transition-all active:scale-95 cursor-pointer border-2 ${
+                                        isSelected
+                                          ? `${bg} text-white ${border} shadow-lg`
+                                          : `bg-slate-950/90 text-slate-200 border-slate-800 ${hover}`
+                                      }`}
+                                    >
+                                      <div className="flex items-center justify-between w-full">
+                                        <span className="font-mono-code font-black text-base">
+                                          {key}
+                                        </span>
+                                        {isSelected && <Check className="w-4 h-4 text-white" />}
+                                      </div>
+                                      <span className="text-[11px] font-semibold truncate w-full mt-0.5">
+                                        {optText || `Možnost ${key}`}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            ) : part.type === 'closest_number' ? (
+                              <input
+                                key={partInputKey}
+                                type="number"
+                                step="any"
+                                inputMode="decimal"
+                                value={partDraft}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setDrafts((prev) => ({
+                                    ...prev,
+                                    [partInputKey]: val,
+                                  }));
+                                }}
+                                placeholder="Vpiši številko..."
+                                className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-violet-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-violet-500"
+                              />
+                            ) : part.type === 'closest_date' ? (
+                              <div className="space-y-1.5">
+                                <input
+                                  key={partInputKey}
+                                  type="date"
+                                  value={partDraft}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    setDrafts((prev) => ({
+                                      ...prev,
+                                      [partInputKey]: val,
+                                    }));
+                                  }}
+                                  className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-base text-center focus:outline-none focus:border-cyan-500"
+                                />
+                                {partDraft && (
+                                  <p className="text-xs font-bold text-cyan-300 text-center">
+                                    📅 Izbrano: {formatSloveneDate(partDraft)}
+                                  </p>
+                                )}
+                              </div>
+                            ) : (
+                              <input
+                                key={partInputKey}
+                                type="text"
+                                value={partDraft}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setDrafts((prev) => ({
+                                    ...prev,
+                                    [partInputKey]: val,
+                                  }));
+                                }}
+                                placeholder="Vpiši odgovor..."
+                                className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-slate-100 font-semibold text-sm focus:outline-none focus:border-emerald-500"
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
+
+                      <button
+                        type="button"
+                        disabled={savingAnswer}
+                        onClick={() => {
+                          const jsonStr = buildFullMultiPartJson();
+                          handleSubmitAnswer(jsonStr, currentViewingSlide);
+                        }}
+                        className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                      >
+                        <Send className="w-4 h-4" />
+                        <span>Shrani vse odgovore</span>
+                      </button>
+                    </>
+                  );
+                })()}
               </div>
             ) : currentViewingSlide.slide_type === 'multiple_choice' ? (
               /* A / B / C / D Veliki barvni gumbi */
@@ -1016,6 +1208,47 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                   <span>Shrani številko</span>
                 </button>
               </div>
+            ) : currentViewingSlide.slide_type === 'closest_date' ? (
+              /* Ugani datum (closest_date) */
+              <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
+                <div className="space-y-2">
+                  <label className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-cyan-400">
+                    <Calendar className="w-3.5 h-3.5" />
+                    <span>Izberi datum (najbližji datum zmaga!)</span>
+                  </label>
+                  <input
+                    key={currentViewingSlide.id}
+                    id="player-date-answer-input"
+                    type="date"
+                    value={currentDraft}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setDrafts((prev) => ({
+                        ...prev,
+                        [currentViewingSlide.id]: val,
+                      }));
+                    }}
+                    className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-cyan-500"
+                  />
+                  {currentDraft && (
+                    <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-center">
+                      <span className="text-xs font-bold text-cyan-300">
+                        Izbrano: {formatSloveneDate(currentDraft)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  disabled={savingAnswer || !currentDraft.trim()}
+                  onClick={() => handleSubmitAnswer(currentDraft, currentViewingSlide)}
+                  className="w-full py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <Send className="w-4 h-4" />
+                  <span>Shrani datum</span>
+                </button>
+              </div>
             ) : (
               /* Odprto besedilo (open_text) */
               <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
@@ -1062,11 +1295,43 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
             {/* Prikaz trenutno shranjenega odgovora */}
             {myCurrentAnswer?.answer_text && !saveSuccessNotice && (
-              <div className="p-3 rounded-2xl bg-slate-900/60 border border-slate-800/80 text-xs flex items-center justify-between text-slate-300">
-                <span>Tvoj shranjen odgovor:</span>
-                <span className="font-mono-code font-bold text-emerald-400">
-                  {myCurrentAnswer.answer_text}
-                </span>
+              <div className="p-3 rounded-2xl bg-slate-900/60 border border-slate-800/80 text-xs space-y-1.5 text-slate-300">
+                {isMultiPartSlide(currentViewingSlide) && currentViewingSlide.question_parts ? (
+                  <>
+                    <span className="text-[11px] font-semibold text-slate-400 block">
+                      Tvoji shranjeni odgovori:
+                    </span>
+                    <div className="space-y-1">
+                      {currentViewingSlide.question_parts.map((part, pIdx) => {
+                        const savedMap = parseMultiPartAnswer(myCurrentAnswer.answer_text).values;
+                        const val = savedMap[part.id] || '';
+                        const formatted =
+                          part.type === 'closest_date' && val
+                            ? formatSloveneDate(val)
+                            : val || '—';
+                        return (
+                          <div key={part.id} className="flex items-center justify-between gap-2">
+                            <span className="text-slate-400 truncate">
+                              {part.label || `Del ${pIdx + 1}`}:
+                            </span>
+                            <span className="font-mono-code font-bold text-emerald-400">
+                              {formatted}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex items-center justify-between">
+                    <span>Tvoj shranjen odgovor:</span>
+                    <span className="font-mono-code font-bold text-emerald-400">
+                      {currentViewingSlide.slide_type === 'closest_date'
+                        ? formatSloveneDate(myCurrentAnswer.answer_text)
+                        : myCurrentAnswer.answer_text}
+                    </span>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1100,23 +1365,62 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                 {currentThemeSlides
                   .filter(
                     (s: Slide) =>
+                      isMultiPartSlide(s) ||
                       s.slide_type === 'multiple_choice' ||
                       s.slide_type === 'open_text' ||
-                      s.slide_type === 'closest_number'
+                      s.slide_type === 'closest_number' ||
+                      s.slide_type === 'closest_date'
                   )
                   .map((slide: Slide, idx: number) => {
                     const ans = gameData.myAnswers[slide.id];
+                    const multiPart = isMultiPartSlide(slide) && slide.question_parts;
+                    const parsedMulti = multiPart
+                      ? parseMultiPartAnswer(ans?.answer_text).values
+                      : null;
                     return (
                       <div
                         key={slide.id}
-                        className="p-3 rounded-2xl bg-slate-950/80 border border-slate-800/80 flex items-center justify-between text-xs"
+                        className="p-3 rounded-2xl bg-slate-950/80 border border-slate-800/80 space-y-1.5 text-xs"
                       >
-                        <span className="text-slate-300 font-semibold truncate max-w-[200px]">
-                          #{idx + 1}. {slide.question_text || `Vprašanje ${idx + 1}`}
-                        </span>
-                        <span className="font-mono-code font-bold text-emerald-400">
-                          {ans?.answer_text || '—'}
-                        </span>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-slate-300 font-semibold truncate max-w-[200px]">
+                            #{idx + 1}. {slide.question_text || `Vprašanje ${idx + 1}`}
+                          </span>
+                          {!multiPart && (
+                            <span className="font-mono-code font-bold text-emerald-400">
+                              {ans?.answer_text
+                                ? slide.slide_type === 'closest_date'
+                                  ? formatSloveneDate(ans.answer_text)
+                                  : ans.answer_text
+                                : '—'}
+                            </span>
+                          )}
+                        </div>
+                        {multiPart && slide.question_parts && (
+                          <div className="pl-2 space-y-1 border-l-2 border-fuchsia-500/30">
+                            {slide.question_parts.map((part, pIdx) => {
+                              const rawVal = parsedMulti?.[part.id] || '';
+                              const displayVal = rawVal
+                                ? part.type === 'closest_date'
+                                  ? formatSloveneDate(rawVal)
+                                  : rawVal
+                                : '—';
+                              return (
+                                <div
+                                  key={part.id}
+                                  className="flex items-center justify-between text-[11px]"
+                                >
+                                  <span className="text-slate-400">
+                                    {part.label || `Del ${pIdx + 1}`}:
+                                  </span>
+                                  <span className="font-mono-code font-bold text-emerald-400">
+                                    {displayVal}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}

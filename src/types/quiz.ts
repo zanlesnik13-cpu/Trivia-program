@@ -3,7 +3,23 @@ export type SlideType =
   | 'info_only'
   | 'multiple_choice'
   | 'open_text'
-  | 'closest_number';
+  | 'closest_number'
+  | 'closest_date';
+
+export type QuestionPartType =
+  | 'multiple_choice'
+  | 'open_text'
+  | 'closest_number'
+  | 'closest_date';
+
+export interface QuestionPart {
+  id: string;
+  label: string;
+  type: QuestionPartType;
+  options?: string[];
+  correct_answer: string;
+  points: number;
+}
 
 export type GameSessionStatus =
   | 'lobby'
@@ -46,6 +62,7 @@ export interface Slide {
   correct_answer: string;
   points: number;
   timer_seconds: number;
+  question_parts?: QuestionPart[] | null;
 }
 
 export interface GameSession {

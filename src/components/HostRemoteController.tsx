@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Award,
+  Calendar,
   Check,
   CheckCircle2,
   ChevronLeft,
@@ -12,8 +13,10 @@ import {
   Crown,
   Eye,
   Hash,
+  Layers,
   ListChecks,
   Loader2,
+  Minus,
   Play,
   Plus,
   RefreshCw,
@@ -24,6 +27,15 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import {
+  calculateDateDiffDays,
+  formatDaysDeviationLabel,
+  formatSloveneDate,
+  isMultiPartSlide,
+  parseMultiPartAnswer,
+  roundPoints,
+  serializeMultiPartAnswer,
+} from '../lib/questionUtils';
 import {
   addDemoPlayer,
   autoPreGradeTheme,
@@ -434,7 +446,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // 6. Ročno ocenjevanje posameznega odgovora igralca na telefonu gostitelja (vključno z bonus_points)
+  // 6. Ročno ocenjevanje posameznega odgovora igralca na telefonu gostitelja (vključno z bonus_points in večdelnimi vprašanji)
   const handleGradeAnswer = async (
     playerId: string,
     slide: Slide,
@@ -442,16 +454,22 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     isCorrect: boolean,
     awardedPoints: number,
     hostComment?: string,
-    bonusPoints?: number
+    bonusPoints?: number,
+    overrideAnswerText?: string
   ) => {
     if (!data?.currentTheme) return;
-    const safePoints = Math.max(0, Number.isNaN(awardedPoints) ? 0 : awardedPoints);
-    const currentBonus = Number(existingAnswer?.bonus_points ?? 0);
+    const safePoints = roundPoints(
+      Math.max(0, Number.isNaN(awardedPoints) ? 0 : awardedPoints)
+    );
+    const currentBonus = roundPoints(Number(existingAnswer?.bonus_points ?? 0));
     const safeBonus =
       bonusPoints !== undefined
-        ? Math.max(0, Number.isNaN(bonusPoints) ? 0 : bonusPoints)
+        ? roundPoints(Math.max(0, Number.isNaN(bonusPoints) ? 0 : bonusPoints))
         : currentBonus;
-    const ansText = existingAnswer?.answer_text ?? '';
+    const ansText =
+      overrideAnswerText !== undefined
+        ? overrideAnswerText
+        : existingAnswer?.answer_text ?? '';
 
     // Optimistična posodobitev v UI za takojšnjo odzivnost na telefonu
     setData((prev) => {
@@ -504,6 +522,41 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
+  // Ocenjevanje posameznega podvprašanja pri večdelnem slajdu (question_parts)
+  const handleGradeQuestionPart = async (
+    playerId: string,
+    slide: Slide,
+    existingAnswer: Answer | undefined,
+    partId: string,
+    newPartPoints: number
+  ) => {
+    const parts = slide.question_parts || [];
+    if (parts.length === 0) return;
+
+    const parsed = parseMultiPartAnswer(existingAnswer?.answer_text);
+    const nextPartScores: Record<string, number> = { ...parsed.partScores };
+    const safePartPts = roundPoints(
+      Math.max(0, Number.isNaN(newPartPoints) ? 0 : newPartPoints)
+    );
+    nextPartScores[partId] = safePartPts;
+
+    const totalAwarded = roundPoints(
+      parts.reduce((sum, p) => sum + roundPoints(Number(nextPartScores[p.id] ?? 0)), 0)
+    );
+    const updatedAnswerText = serializeMultiPartAnswer(parsed.values, nextPartScores);
+
+    await handleGradeAnswer(
+      playerId,
+      slide,
+      existingAnswer,
+      totalAwarded > 0,
+      totalAwarded,
+      undefined,
+      undefined,
+      updatedAnswerText
+    );
+  };
+
   // 7. Potrdi točke (z upoštevanjem 2x Jokerja za redne točke + bonus_points brez podvajanja!) in prikaži lestvico
   const handleConfirmGradesAndLeaderboard = async () => {
     setActionLoading(true);
@@ -546,9 +599,9 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
               sl.id,
               ans.answer_text ?? '',
               Boolean(ans.is_correct),
-              Number(ans.awarded_points ?? 0),
+              roundPoints(Number(ans.awarded_points ?? 0)),
               ans.host_comment ?? undefined,
-              Number(ans.bonus_points ?? 0)
+              roundPoints(Number(ans.bonus_points ?? 0))
             );
           }
         }
@@ -621,12 +674,48 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     for (let i = 0; i < data.players.length; i++) {
       const p = data.players[i];
       let sampleAnswer = '';
-      if (slide.slide_type === 'multiple_choice') {
+      if (isMultiPartSlide(slide)) {
+        const partMap: Record<string, string> = {};
+        (slide.question_parts || []).forEach((part) => {
+          if (part.type === 'multiple_choice') {
+            const choices = ['A', 'B', 'C', 'D'];
+            partMap[part.id] =
+              i === 0 && part.correct_answer ? part.correct_answer : choices[i % 4];
+          } else if (part.type === 'closest_number') {
+            const base = parseFloat(part.correct_answer || '100') || 100;
+            partMap[part.id] = String(base + (i === 0 ? 0 : (i + 1) * 3));
+          } else if (part.type === 'closest_date') {
+            const baseDate = part.correct_answer || '1991-06-25';
+            if (i === 0) {
+              partMap[part.id] = baseDate;
+            } else {
+              const d = new Date(`${baseDate}T00:00:00Z`);
+              d.setUTCDate(d.getUTCDate() + i * 5);
+              partMap[part.id] = d.toISOString().slice(0, 10);
+            }
+          } else {
+            partMap[part.id] =
+              i === 0 && part.correct_answer
+                ? part.correct_answer
+                : `Odgovor (${p.nickname})`;
+          }
+        });
+        sampleAnswer = serializeMultiPartAnswer(partMap);
+      } else if (slide.slide_type === 'multiple_choice') {
         const choices = ['A', 'B', 'C', 'D'];
         sampleAnswer = i === 0 && slide.correct_answer ? slide.correct_answer : choices[i % 4];
       } else if (slide.slide_type === 'closest_number') {
         const base = parseFloat(slide.correct_answer || '1999') || 1999;
         sampleAnswer = String(base + (i === 0 ? 1 : (i + 1) * 4));
+      } else if (slide.slide_type === 'closest_date') {
+        const baseDate = slide.correct_answer || '1991-06-25';
+        if (i === 0) {
+          sampleAnswer = baseDate;
+        } else {
+          const d = new Date(`${baseDate}T00:00:00Z`);
+          d.setUTCDate(d.getUTCDate() + i * 7);
+          sampleAnswer = d.toISOString().slice(0, 10);
+        }
       } else {
         sampleAnswer =
           i === 0 && slide.correct_answer ? slide.correct_answer : `Odgovor ekipe ${p.nickname}`;
@@ -687,9 +776,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   // Vprašalni slajdi trenutne tematike za pogled ocenjevanja (grading_theme)
   const gradableSlides = currentThemeSlides.filter(
     (s) =>
+      isMultiPartSlide(s) ||
       s.slide_type === 'multiple_choice' ||
       s.slide_type === 'open_text' ||
-      s.slide_type === 'closest_number'
+      s.slide_type === 'closest_number' ||
+      s.slide_type === 'closest_date'
   );
 
   const STATUS_LABELS: Record<GameSessionStatus, { label: string; color: string }> = {
@@ -977,32 +1068,67 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 </p>
               </div>
 
-              {/* Možni odgovori, če je multiple_choice */}
-              {currentSlide.slide_type === 'multiple_choice' && (
-                <div className="grid grid-cols-2 gap-1.5 text-xs">
-                  {(['A', 'B', 'C', 'D'] as const).map((optKey) => {
-                    const isRight =
-                      currentSlide.correct_answer === optKey ||
-                      Boolean(currentSlide.correct_answer?.trim().toUpperCase().startsWith(optKey));
-                    return (
-                      <div
-                        key={optKey}
-                        className={`px-2.5 py-1.5 rounded-lg border truncate ${
-                          isRight
-                            ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300 font-bold'
-                            : 'bg-slate-950/70 border-slate-800 text-slate-400'
-                        }`}
-                      >
-                        <span className="font-mono-code mr-1">{optKey}:</span>
-                        <span>{currentSlide.options[optKey] || '—'}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+              {/* Možni odgovori, če je klasičen multiple_choice */}
+              {!isMultiPartSlide(currentSlide) &&
+                currentSlide.slide_type === 'multiple_choice' && (
+                  <div className="grid grid-cols-2 gap-1.5 text-xs">
+                    {(['A', 'B', 'C', 'D'] as const).map((optKey) => {
+                      const isRight =
+                        currentSlide.correct_answer === optKey ||
+                        Boolean(
+                          currentSlide.correct_answer?.trim().toUpperCase().startsWith(optKey)
+                        );
+                      return (
+                        <div
+                          key={optKey}
+                          className={`px-2.5 py-1.5 rounded-lg border truncate ${
+                            isRight
+                              ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300 font-bold'
+                              : 'bg-slate-950/70 border-slate-800 text-slate-400'
+                          }`}
+                        >
+                          <span className="font-mono-code mr-1">{optKey}:</span>
+                          <span>{currentSlide.options[optKey] || '—'}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
 
-              {/* Pravilen odgovor (viden SAMO gostitelju na telefonu!) */}
-              {currentSlide.slide_type !== 'theme_intro' &&
+              {/* Podvprašanja in pravilni odgovori, če je večdelno vprašanje */}
+              {isMultiPartSlide(currentSlide) ? (
+                <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
+                    <Layers className="w-4 h-4 shrink-0 text-emerald-400" />
+                    <span>
+                      Večdelno vprašanje ({currentSlide.question_parts?.length || 0} delov) —
+                      Pravilni odgovori:
+                    </span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {(currentSlide.question_parts || []).map((part, pIdx) => (
+                      <div
+                        key={part.id}
+                        className="flex items-center justify-between gap-2 text-xs px-2.5 py-1.5 rounded-lg bg-slate-950/70 border border-slate-800"
+                      >
+                        <span className="text-slate-200 font-semibold truncate">
+                          {part.label || `Del ${pIdx + 1}`}{' '}
+                          <span className="text-[10px] text-slate-400">
+                            ({part.points} t)
+                          </span>
+                        </span>
+                        <span className="font-mono-code font-black text-emerald-400 shrink-0">
+                          {part.type === 'closest_date'
+                            ? formatSloveneDate(part.correct_answer)
+                            : part.correct_answer || '—'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                /* Pravilen odgovor (viden SAMO gostitelju na telefonu!) */
+                currentSlide.slide_type !== 'theme_intro' &&
                 currentSlide.slide_type !== 'info_only' && (
                   <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 text-xs text-emerald-300">
@@ -1010,10 +1136,13 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                       <span>Pravilen odgovor (samo za vas):</span>
                     </div>
                     <span className="text-sm font-mono-code font-black text-emerald-400">
-                      {currentSlide.correct_answer || 'Ni določen'}
+                      {currentSlide.slide_type === 'closest_date'
+                        ? formatSloveneDate(currentSlide.correct_answer)
+                        : currentSlide.correct_answer || 'Ni določen'}
                     </span>
                   </div>
-                )}
+                )
+              )}
             </div>
 
             {/* Števec oddanih odgovorov na trenutni slajd v živo */}
@@ -1222,9 +1351,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 </span>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Izbirni (<code className="text-indigo-300">multiple_choice</code>) in najbližji
-                številski odgovori (<code className="text-indigo-300">closest_number</code>) so
-                samodejno pred-ocenjeni. Preverite ali prilagodite točke vsakega tekmovalca.
+                Izbirni (<code className="text-indigo-300">multiple_choice</code>), najbližje
+                število (<code className="text-indigo-300">closest_number</code>) in najbližji
+                datum (<code className="text-indigo-300">closest_date</code> — samodejno
+                razvrščeno od najbližjega do najbolj oddaljenega) so samodejno pred-ocenjeni.
+                Točke lahko prilagajate po korakih <strong className="text-slate-200">0.25</strong>.
               </p>
             </div>
 
@@ -1236,15 +1367,65 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
             ) : (
               <div className="space-y-4">
                 {gradableSlides.map((slide, qIdx) => {
-                  const maxPts = Number(slide.points ?? 1);
-                  const halfPts = Math.round((maxPts / 2) * 100) / 100;
+                  const multiPart = isMultiPartSlide(slide);
+                  const parts = slide.question_parts || [];
+                  const maxPts = roundPoints(
+                    multiPart
+                      ? parts.reduce((sum, p) => sum + Number(p.points ?? 1), 0)
+                      : Number(slide.points ?? 1)
+                  );
                   const slideAnswers = answers.filter((a) => a.slide_id === slide.id);
 
                   // Če je closest_number, izračunamo najmanjšo razliko za prikaz ob odgovoru
                   const targetNum =
-                    slide.slide_type === 'closest_number'
+                    !multiPart && slide.slide_type === 'closest_number'
                       ? parseFloat((slide.correct_answer || '').replace(',', '.'))
                       : NaN;
+
+                  // Samodejna razvrstitev tekmovalcev pri closest_date (od najmanjšega odstopanja v dneh do največjega)
+                  const datePartForSorting = multiPart
+                    ? parts.find((p) => p.type === 'closest_date')
+                    : undefined;
+                  const shouldSortByDate =
+                    (!multiPart && slide.slide_type === 'closest_date') ||
+                    Boolean(datePartForSorting);
+
+                  const sortedPlayersForSlide = shouldSortByDate
+                    ? [...players].sort((pA, pB) => {
+                        const ansA = slideAnswers.find((a) => a.player_id === pA.id);
+                        const ansB = slideAnswers.find((a) => a.player_id === pB.id);
+                        let diffA: number | null = null;
+                        let diffB: number | null = null;
+
+                        if (!multiPart && slide.slide_type === 'closest_date') {
+                          diffA = calculateDateDiffDays(ansA?.answer_text, slide.correct_answer);
+                          diffB = calculateDateDiffDays(ansB?.answer_text, slide.correct_answer);
+                        } else if (datePartForSorting) {
+                          const parsedA = parseMultiPartAnswer(ansA?.answer_text);
+                          const parsedB = parseMultiPartAnswer(ansB?.answer_text);
+                          diffA = calculateDateDiffDays(
+                            parsedA.values[datePartForSorting.id],
+                            datePartForSorting.correct_answer
+                          );
+                          diffB = calculateDateDiffDays(
+                            parsedB.values[datePartForSorting.id],
+                            datePartForSorting.correct_answer
+                          );
+                        }
+
+                        if (diffA === null && diffB === null) return 0;
+                        if (diffA === null) return 1;
+                        if (diffB === null) return -1;
+                        return diffA - diffB;
+                      })
+                    : players;
+
+                  // Hitri gumbi za enodelno vprašanje (koraki po 0.25)
+                  const quickPointButtons = Array.from(
+                    new Set(
+                      [0, 0.25, 0.5, 0.75, 1, maxPts].map((v) => roundPoints(v))
+                    )
+                  ).sort((a, b) => a - b);
 
                   return (
                     <div
@@ -1253,49 +1434,75 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                     >
                       {/* Naslov vprašanja in pravilen odgovor */}
                       <div className="space-y-1.5 pb-2.5 border-b border-slate-800">
-                        <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
                           <span className="inline-flex items-center gap-1 text-xs font-bold text-indigo-400">
-                            {slide.slide_type === 'multiple_choice' && (
-                              <ListChecks className="w-3.5 h-3.5" />
-                            )}
-                            {slide.slide_type === 'open_text' && (
-                              <Type className="w-3.5 h-3.5" />
-                            )}
-                            {slide.slide_type === 'closest_number' && (
-                              <Hash className="w-3.5 h-3.5" />
+                            {multiPart ? (
+                              <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                            ) : (
+                              <>
+                                {slide.slide_type === 'multiple_choice' && (
+                                  <ListChecks className="w-3.5 h-3.5" />
+                                )}
+                                {slide.slide_type === 'open_text' && (
+                                  <Type className="w-3.5 h-3.5" />
+                                )}
+                                {slide.slide_type === 'closest_number' && (
+                                  <Hash className="w-3.5 h-3.5" />
+                                )}
+                                {slide.slide_type === 'closest_date' && (
+                                  <Calendar className="w-3.5 h-3.5 text-amber-400" />
+                                )}
+                              </>
                             )}
                             <span>
                               Vprašanje #{qIdx + 1} ({maxPts} t)
+                              {multiPart ? ` • ${parts.length} podvprašanj` : ''}
                             </span>
                           </span>
-                          <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-xs font-mono-code font-bold text-emerald-300">
-                            Pravilno: {slide.correct_answer || '—'}
-                          </span>
+                          {!multiPart && (
+                            <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-xs font-mono-code font-bold text-emerald-300">
+                              Pravilno:{' '}
+                              {slide.slide_type === 'closest_date'
+                                ? formatSloveneDate(slide.correct_answer)
+                                : slide.correct_answer || '—'}
+                            </span>
+                          )}
                         </div>
                         <p className="text-sm font-semibold text-slate-100">
                           {slide.question_text || `Slajd #${slide.order_index + 1}`}
                         </p>
+                        {shouldSortByDate && (
+                          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/30 text-[11px] font-semibold text-amber-200">
+                            <Calendar className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                            <span>
+                              Seznam je samodejno razvrščen od najbližjega datuma (zgoraj) do
+                              najbolj oddaljenega (spodaj).
+                            </span>
+                          </div>
+                        )}
                       </div>
 
                       {/* Seznam vseh tekmovalcev in njihovih odgovorov */}
-                      {players.length === 0 ? (
+                      {sortedPlayersForSlide.length === 0 ? (
                         <p className="text-xs text-slate-500 italic">
                           Ni prijavljenih tekmovalcev.
                         </p>
                       ) : (
                         <div className="space-y-2.5">
-                          {players.map((player) => {
+                          {sortedPlayersForSlide.map((player, sortRankIdx) => {
                             const ans = slideAnswers.find(
                               (a) => a.player_id === player.id
                             );
                             const isCorrect = Boolean(ans?.is_correct);
-                            const awarded = Number(ans?.awarded_points ?? 0);
-                            const bonusPts = Number(ans?.bonus_points ?? 0);
+                            const awarded = roundPoints(Number(ans?.awarded_points ?? 0));
+                            const bonusPts = roundPoints(Number(ans?.bonus_points ?? 0));
                             const usedJoker = jokersForCurrentTheme.has(player.id);
 
-                            // Izračun razlike za closest_number
+                            // Izračun razlike za closest_number ali closest_date (enodelno vprašanje)
                             let diffLabel: string | null = null;
+                            let isExactDateMatch = false;
                             if (
+                              !multiPart &&
                               slide.slide_type === 'closest_number' &&
                               !Number.isNaN(targetNum) &&
                               ans?.answer_text
@@ -1309,20 +1516,42 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                   100;
                                 diffLabel = `Δ = ${diff}`;
                               }
+                            } else if (
+                              !multiPart &&
+                              slide.slide_type === 'closest_date' &&
+                              ans?.answer_text
+                            ) {
+                              const diffDays = calculateDateDiffDays(
+                                ans.answer_text,
+                                slide.correct_answer
+                              );
+                              if (diffDays !== null) {
+                                diffLabel = formatDaysDeviationLabel(diffDays);
+                                isExactDateMatch = diffDays === 0;
+                              }
                             }
+
+                            const parsedMulti = multiPart
+                              ? parseMultiPartAnswer(ans?.answer_text)
+                              : null;
 
                             return (
                               <div
                                 key={player.id}
                                 className={`p-3 rounded-xl border transition-all space-y-2.5 ${
-                                  isCorrect
+                                  isCorrect || awarded > 0
                                     ? 'bg-emerald-500/10 border-emerald-500/40'
                                     : 'bg-slate-950/80 border-slate-800'
                                 }`}
                               >
                                 <div className="flex items-start justify-between gap-2">
-                                  <div className="min-w-0">
+                                  <div className="min-w-0 flex-1">
                                     <div className="flex items-center gap-1.5 flex-wrap">
+                                      {shouldSortByDate && (
+                                        <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono-code text-[10px] font-bold">
+                                          #{sortRankIdx + 1}
+                                        </span>
+                                      )}
                                       <span className="text-xs font-bold text-slate-200 truncate">
                                         {player.nickname}
                                       </span>
@@ -1340,55 +1569,111 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                         </span>
                                       )}
                                       {diffLabel && (
-                                        <span className="px-1.5 py-0.2 rounded bg-violet-500/20 text-violet-300 text-[10px] font-mono-code font-semibold">
+                                        <span
+                                          className={`px-2 py-0.5 rounded-md text-[10px] font-mono-code font-bold border ${
+                                            isExactDateMatch
+                                              ? 'bg-emerald-500/25 text-emerald-200 border-emerald-400/50'
+                                              : 'bg-violet-500/20 text-violet-200 border-violet-500/40'
+                                          }`}
+                                        >
                                           {diffLabel}
                                         </span>
                                       )}
                                     </div>
-                                    <p className="text-sm font-mono-code font-bold text-white mt-0.5 break-words">
-                                      {ans?.answer_text ? (
-                                        ans.answer_text
-                                      ) : (
-                                        <span className="text-xs italic text-slate-500 font-sans font-normal">
-                                          Brez oddanega odgovora
-                                        </span>
-                                      )}
-                                    </p>
+
+                                    {/* Prikaz odgovora za ENODELNO vprašanje */}
+                                    {!multiPart && (
+                                      <p className="text-sm font-mono-code font-bold text-white mt-0.5 break-words">
+                                        {ans?.answer_text ? (
+                                          slide.slide_type === 'closest_date' ? (
+                                            formatSloveneDate(ans.answer_text)
+                                          ) : (
+                                            ans.answer_text
+                                          )
+                                        ) : (
+                                          <span className="text-xs italic text-slate-500 font-sans font-normal">
+                                            Brez oddanega odgovora
+                                          </span>
+                                        )}
+                                      </p>
+                                    )}
                                   </div>
 
-                                  {/* Hiter preklopnik: Zelena kljukica (Pravilno) / Rdeč križec (Napačno) */}
+                                  {/* Hiter preklopnik: Zelena kljukica (Vse pravilno) / Rdeč križec (Napačno - 0 t) */}
                                   <div className="flex items-center gap-1.5 shrink-0">
                                     <button
                                       type="button"
-                                      onClick={() =>
-                                        handleGradeAnswer(
-                                          player.id,
-                                          slide,
-                                          ans,
-                                          true,
-                                          maxPts
-                                        )
-                                      }
+                                      onClick={() => {
+                                        if (multiPart && parsedMulti) {
+                                          const fullPartScores: Record<string, number> = {};
+                                          parts.forEach((p) => {
+                                            fullPartScores[p.id] = roundPoints(
+                                              Number(p.points ?? 1)
+                                            );
+                                          });
+                                          handleGradeAnswer(
+                                            player.id,
+                                            slide,
+                                            ans,
+                                            true,
+                                            maxPts,
+                                            undefined,
+                                            undefined,
+                                            serializeMultiPartAnswer(
+                                              parsedMulti.values,
+                                              fullPartScores
+                                            )
+                                          );
+                                        } else {
+                                          handleGradeAnswer(
+                                            player.id,
+                                            slide,
+                                            ans,
+                                            true,
+                                            maxPts
+                                          );
+                                        }
+                                      }}
                                       className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all cursor-pointer ${
-                                        isCorrect
+                                        awarded === maxPts && maxPts > 0
                                           ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/30 font-bold'
                                           : 'bg-slate-800 text-slate-400 hover:text-emerald-400'
                                       }`}
-                                      title="Označi kot pravilno"
+                                      title="Podeli polne točke"
                                     >
                                       <Check className="w-5 h-5" />
                                     </button>
                                     <button
                                       type="button"
-                                      onClick={() =>
-                                        handleGradeAnswer(
-                                          player.id,
-                                          slide,
-                                          ans,
-                                          false,
-                                          0
-                                        )
-                                      }
+                                      onClick={() => {
+                                        if (multiPart && parsedMulti) {
+                                          const zeroPartScores: Record<string, number> = {};
+                                          parts.forEach((p) => {
+                                            zeroPartScores[p.id] = 0;
+                                          });
+                                          handleGradeAnswer(
+                                            player.id,
+                                            slide,
+                                            ans,
+                                            false,
+                                            0,
+                                            undefined,
+                                            undefined,
+                                            serializeMultiPartAnswer(
+                                              parsedMulti.values,
+                                              zeroPartScores
+                                            )
+                                          );
+                                        } else {
+                                          handleGradeAnswer(
+                                            player.id,
+                                            slide,
+                                            ans,
+                                            false,
+                                            0
+                                          );
+                                        }
+                                      }}
                                       className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all cursor-pointer ${
                                         !isCorrect && awarded === 0
                                           ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30 font-bold'
@@ -1401,67 +1686,237 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                   </div>
                                 </div>
 
-                                {/* Hitri gumbi za točke (0, polovične 0.5, polne točke) + poljubni vnos */}
-                                <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-slate-800/70">
-                                  <div className="flex items-center gap-1.5">
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleGradeAnswer(player.id, slide, ans, false, 0)
+                                {/* VEČDELNO VPRAŠANJE: Ločeno ocenjevanje vsakega podvprašanja */}
+                                {multiPart && parsedMulti && (
+                                  <div className="space-y-2 pt-1.5 border-t border-slate-800/80">
+                                    {parts.map((part, pIdx) => {
+                                      const rawVal = parsedMulti.values[part.id] ?? '';
+                                      const partMaxPts = roundPoints(Number(part.points ?? 1));
+                                      const currentPartScore = roundPoints(
+                                        Number(parsedMulti.partScores[part.id] ?? 0)
+                                      );
+
+                                      let partDiffBadge: string | null = null;
+                                      let partExactDate = false;
+                                      if (part.type === 'closest_date' && rawVal) {
+                                        const dDays = calculateDateDiffDays(
+                                          rawVal,
+                                          part.correct_answer
+                                        );
+                                        if (dDays !== null) {
+                                          partDiffBadge = formatDaysDeviationLabel(dDays);
+                                          partExactDate = dDays === 0;
+                                        }
+                                      } else if (part.type === 'closest_number' && rawVal) {
+                                        const tNum = parseFloat(
+                                          (part.correct_answer || '').replace(',', '.')
+                                        );
+                                        const pNum = parseFloat(rawVal.trim().replace(',', '.'));
+                                        if (!Number.isNaN(tNum) && !Number.isNaN(pNum)) {
+                                          const diff =
+                                            Math.round(Math.abs(pNum - tNum) * 100) / 100;
+                                          partDiffBadge = `Δ = ${diff}`;
+                                        }
                                       }
-                                      className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                                        awarded === 0
-                                          ? 'bg-rose-500/30 text-rose-200 border border-rose-500/50'
-                                          : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
-                                      }`}
-                                    >
-                                      0
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleGradeAnswer(
-                                          player.id,
-                                          slide,
-                                          ans,
-                                          true,
-                                          halfPts
+
+                                      const partQuickButtons = Array.from(
+                                        new Set(
+                                          [0, 0.25, 0.5, 0.75, 1, partMaxPts].map((v) =>
+                                            roundPoints(v)
+                                          )
                                         )
-                                      }
-                                      className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                                        awarded === halfPts && halfPts > 0
-                                          ? 'bg-amber-500/30 text-amber-200 border border-amber-500/50'
-                                          : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
-                                      }`}
-                                    >
-                                      +{halfPts}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleGradeAnswer(
-                                          player.id,
-                                          slide,
-                                          ans,
-                                          true,
-                                          maxPts
-                                        )
-                                      }
-                                      className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                                        awarded === maxPts && maxPts > 0
-                                          ? 'bg-emerald-500/30 text-emerald-200 border border-emerald-500/50'
-                                          : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
-                                      }`}
-                                    >
-                                      +{maxPts}
-                                    </button>
+                                      ).sort((a, b) => a - b);
+
+                                      return (
+                                        <div
+                                          key={part.id}
+                                          className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2"
+                                        >
+                                          <div className="flex items-start justify-between gap-2">
+                                            <div className="min-w-0">
+                                              <div className="flex items-center gap-1.5 flex-wrap">
+                                                <span className="text-[11px] font-bold text-indigo-300">
+                                                  {part.label || `Del ${pIdx + 1}`} ({partMaxPts}{' '}
+                                                  t)
+                                                </span>
+                                                <span className="text-[10px] font-mono-code text-emerald-300/90 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/25">
+                                                  Pravilno:{' '}
+                                                  {part.type === 'closest_date'
+                                                    ? formatSloveneDate(part.correct_answer)
+                                                    : part.correct_answer || '—'}
+                                                </span>
+                                                {partDiffBadge && (
+                                                  <span
+                                                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono-code font-bold border ${
+                                                      partExactDate
+                                                        ? 'bg-emerald-500/25 text-emerald-200 border-emerald-400/50'
+                                                        : 'bg-violet-500/20 text-violet-200 border-violet-500/40'
+                                                    }`}
+                                                  >
+                                                    {partDiffBadge}
+                                                  </span>
+                                                )}
+                                              </div>
+                                              <p className="text-xs font-mono-code font-bold text-white mt-1 break-words">
+                                                {rawVal ? (
+                                                  part.type === 'closest_date' ? (
+                                                    formatSloveneDate(rawVal)
+                                                  ) : (
+                                                    rawVal
+                                                  )
+                                                ) : (
+                                                  <span className="italic text-slate-500 font-sans font-normal">
+                                                    Brez odgovora
+                                                  </span>
+                                                )}
+                                              </p>
+                                            </div>
+                                          </div>
+
+                                          {/* Hitri gumbi za del vprašanja (korak 0.25) */}
+                                          <div className="flex items-center justify-between gap-2 flex-wrap">
+                                            <div className="flex items-center gap-1 flex-wrap">
+                                              {partQuickButtons.map((ptsVal) => (
+                                                <button
+                                                  key={ptsVal}
+                                                  type="button"
+                                                  onClick={() =>
+                                                    handleGradeQuestionPart(
+                                                      player.id,
+                                                      slide,
+                                                      ans,
+                                                      part.id,
+                                                      ptsVal
+                                                    )
+                                                  }
+                                                  className={`px-2 py-0.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
+                                                    currentPartScore === ptsVal
+                                                      ? ptsVal === 0
+                                                        ? 'bg-rose-500/30 text-rose-200 border border-rose-500/50'
+                                                        : ptsVal >= partMaxPts
+                                                        ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                                                        : 'bg-amber-500/30 text-amber-200 border border-amber-500/50'
+                                                      : 'bg-slate-950 text-slate-400 hover:bg-slate-800 border border-slate-800'
+                                                  }`}
+                                                >
+                                                  {ptsVal === 0 ? '0' : `+${ptsVal}`}
+                                                </button>
+                                              ))}
+                                            </div>
+
+                                            <div className="flex items-center gap-1">
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  handleGradeQuestionPart(
+                                                    player.id,
+                                                    slide,
+                                                    ans,
+                                                    part.id,
+                                                    Math.max(0, roundPoints(currentPartScore - 0.25))
+                                                  )
+                                                }
+                                                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] font-bold text-slate-300 cursor-pointer"
+                                                title="-0.25 točke"
+                                              >
+                                                -0.25
+                                              </button>
+                                              <input
+                                                type="number"
+                                                step="0.25"
+                                                min={0}
+                                                value={currentPartScore}
+                                                onChange={(e) => {
+                                                  const val = parseFloat(e.target.value || '0');
+                                                  handleGradeQuestionPart(
+                                                    player.id,
+                                                    slide,
+                                                    ans,
+                                                    part.id,
+                                                    val
+                                                  );
+                                                }}
+                                                className="w-14 px-1.5 py-0.5 rounded-lg bg-slate-950 border border-slate-700 text-right font-mono-code font-bold text-xs text-emerald-400 focus:outline-none focus:border-indigo-500"
+                                              />
+                                              <button
+                                                type="button"
+                                                onClick={() =>
+                                                  handleGradeQuestionPart(
+                                                    player.id,
+                                                    slide,
+                                                    ans,
+                                                    part.id,
+                                                    roundPoints(currentPartScore + 0.25)
+                                                  )
+                                                }
+                                                className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] font-bold text-emerald-300 cursor-pointer"
+                                                title="+0.25 točke"
+                                              >
+                                                +0.25
+                                              </button>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+
+                                {/* Hitri gumbi za skupne točke slajda (koraki po 0.25: 0, 0.25, 0.5, 0.75, 1, max) + poljubni vnos */}
+                                <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-slate-800/70 flex-wrap">
+                                  <div className="flex items-center gap-1 flex-wrap">
+                                    {quickPointButtons.map((ptsVal) => (
+                                      <button
+                                        key={ptsVal}
+                                        type="button"
+                                        onClick={() =>
+                                          handleGradeAnswer(
+                                            player.id,
+                                            slide,
+                                            ans,
+                                            ptsVal > 0,
+                                            ptsVal
+                                          )
+                                        }
+                                        className={`px-2 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                                          awarded === ptsVal
+                                            ? ptsVal === 0
+                                              ? 'bg-rose-500/30 text-rose-200 border border-rose-500/50'
+                                              : ptsVal >= maxPts
+                                              ? 'bg-emerald-500/30 text-emerald-200 border border-emerald-500/50'
+                                              : 'bg-amber-500/30 text-amber-200 border border-amber-500/50'
+                                            : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
+                                        }`}
+                                      >
+                                        {ptsVal === 0 ? '0' : `+${ptsVal}`}
+                                      </button>
+                                    ))}
                                   </div>
 
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-[11px] text-slate-400">Točke:</span>
+                                  <div className="flex items-center gap-1">
+                                    <span className="text-[11px] text-slate-400 mr-0.5">
+                                      Skupaj:
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const nextVal = Math.max(0, roundPoints(awarded - 0.25));
+                                        handleGradeAnswer(
+                                          player.id,
+                                          slide,
+                                          ans,
+                                          nextVal > 0,
+                                          nextVal
+                                        );
+                                      }}
+                                      className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
+                                      title="Odštej 0.25 točke"
+                                    >
+                                      <Minus className="w-3.5 h-3.5" />
+                                    </button>
                                     <input
                                       type="number"
-                                      step="0.5"
+                                      step="0.25"
                                       min={0}
                                       value={awarded}
                                       onChange={(e) => {
@@ -1476,19 +1931,38 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                       }}
                                       className="w-16 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-right font-mono-code font-bold text-xs text-emerald-400 focus:outline-none focus:border-indigo-500"
                                     />
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const nextVal = roundPoints(awarded + 0.25);
+                                        handleGradeAnswer(
+                                          player.id,
+                                          slide,
+                                          ans,
+                                          nextVal > 0,
+                                          nextVal
+                                        );
+                                      }}
+                                      className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 cursor-pointer"
+                                      title="Prištej 0.25 točke"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                    </button>
                                   </div>
                                 </div>
 
-                                {/* Razdelek za Bonus točke (ne štejejo v 2x Joker) */}
+                                {/* Razdelek za Bonus točke (ne štejejo v 2x Joker) — korak 0.25 */}
                                 <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-1.5">
                                   <span className="block text-[10px] font-bold text-amber-300">
                                     ⭐ Bonus točke (ne štejejo v 2x Joker)
                                   </span>
-                                  <div className="flex items-center justify-between gap-2">
-                                    <div className="flex items-center gap-1.5">
+                                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                                    <div className="flex items-center gap-1 flex-wrap">
                                       {[
                                         { label: '0', val: 0 },
+                                        { label: '+0.25', val: 0.25 },
                                         { label: '+0.5', val: 0.5 },
+                                        { label: '+0.75', val: 0.75 },
                                         { label: '+1', val: 1 },
                                       ].map((btn) => (
                                         <button
@@ -1505,7 +1979,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                               btn.val
                                             )
                                           }
-                                          className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                                          className={`px-2 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
                                             bonusPts === btn.val && (btn.val > 0 || bonusPts === 0)
                                               ? btn.val === 0
                                                 ? 'bg-slate-800 text-slate-200 border border-slate-600'
@@ -1522,14 +1996,13 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                       <span className="text-[11px] text-amber-200/80">Bonus:</span>
                                       <input
                                         type="number"
-                                        step="0.5"
+                                        step="0.25"
                                         min="0"
                                         value={bonusPts}
                                         onChange={(e) => {
                                           const rawVal = parseFloat(e.target.value || '0');
-                                          const safeBonusVal = Math.max(
-                                            0,
-                                            Number.isNaN(rawVal) ? 0 : rawVal
+                                          const safeBonusVal = roundPoints(
+                                            Math.max(0, Number.isNaN(rawVal) ? 0 : rawVal)
                                           );
                                           handleGradeAnswer(
                                             player.id,
@@ -1596,20 +2069,26 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 </div>
                 <div className="space-y-1.5">
                   {players.map((p) => {
-                    const redneTocke = gradableSlides.reduce((acc, sl) => {
-                      const ansForSlide = answers.find(
-                        (a) => a.player_id === p.id && a.slide_id === sl.id
-                      );
-                      return acc + Number(ansForSlide?.awarded_points ?? 0);
-                    }, 0);
-                    const bonusTocke = gradableSlides.reduce((acc, sl) => {
-                      const ansForSlide = answers.find(
-                        (a) => a.player_id === p.id && a.slide_id === sl.id
-                      );
-                      return acc + Number(ansForSlide?.bonus_points ?? 0);
-                    }, 0);
+                    const redneTocke = roundPoints(
+                      gradableSlides.reduce((acc, sl) => {
+                        const ansForSlide = answers.find(
+                          (a) => a.player_id === p.id && a.slide_id === sl.id
+                        );
+                        return acc + Number(ansForSlide?.awarded_points ?? 0);
+                      }, 0)
+                    );
+                    const bonusTocke = roundPoints(
+                      gradableSlides.reduce((acc, sl) => {
+                        const ansForSlide = answers.find(
+                          (a) => a.player_id === p.id && a.slide_id === sl.id
+                        );
+                        return acc + Number(ansForSlide?.bonus_points ?? 0);
+                      }, 0)
+                    );
                     const hasJoker = jokersForCurrentTheme.has(p.id);
-                    const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
+                    const tockeTeme = roundPoints(
+                      (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke
+                    );
 
                     let formulaText = `+${tockeTeme} t`;
                     if (hasJoker && bonusTocke > 0) {

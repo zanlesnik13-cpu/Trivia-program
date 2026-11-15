@@ -1,6 +1,13 @@
 import { compressImageBlobToDataUrl } from './pdfConverter';
 import { generateSlideSvgDataUrl } from './demoQuiz';
 import { requireSupabaseClient } from './supabase';
+import {
+  calculateDateDiffDays,
+  isMultiPartSlide,
+  parseMultiPartAnswer,
+  roundPoints,
+  serializeMultiPartAnswer,
+} from './questionUtils';
 import type {
   Answer,
   GameSession,
@@ -8,6 +15,8 @@ import type {
   PlayerFullData,
   PlayerJoker,
   PresentationData,
+  QuestionPart,
+  QuestionPartType,
   Quiz,
   QuizWithStats,
   Slide,
@@ -73,6 +82,49 @@ function normalizeOptions(raw: unknown): SlideOptions {
   return { A: '', B: '', C: '', D: '' };
 }
 
+function normalizeQuestionParts(raw: unknown): QuestionPart[] | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const validTypes: QuestionPartType[] = [
+    'multiple_choice',
+    'open_text',
+    'closest_number',
+    'closest_date',
+  ];
+  const parts: QuestionPart[] = [];
+  raw.forEach((item, idx) => {
+    if (!item || typeof item !== 'object') return;
+    const obj = item as Record<string, unknown>;
+    const rawType = String(obj.type || 'open_text') as QuestionPartType;
+    const type: QuestionPartType = validTypes.includes(rawType) ? rawType : 'open_text';
+    let options: string[] | undefined = undefined;
+    if (type === 'multiple_choice') {
+      if (Array.isArray(obj.options)) {
+        const arr = obj.options.map((o) => String(o ?? ''));
+        options = [arr[0] ?? '', arr[1] ?? '', arr[2] ?? '', arr[3] ?? ''];
+      } else if (obj.options && typeof obj.options === 'object') {
+        const optObj = obj.options as Record<string, unknown>;
+        options = [
+          String(optObj.A ?? ''),
+          String(optObj.B ?? ''),
+          String(optObj.C ?? ''),
+          String(optObj.D ?? ''),
+        ];
+      } else {
+        options = ['', '', '', ''];
+      }
+    }
+    parts.push({
+      id: typeof obj.id === 'string' && obj.id.trim() ? obj.id.trim() : `part-${idx + 1}`,
+      label: typeof obj.label === 'string' ? obj.label : `Del ${idx + 1}`,
+      type,
+      ...(options ? { options } : {}),
+      correct_answer: typeof obj.correct_answer === 'string' ? obj.correct_answer : '',
+      points: roundPoints(obj.points !== undefined ? Number(obj.points) : 1),
+    });
+  });
+  return parts.length > 0 ? parts : null;
+}
+
 /**
  * Izpiše podrobno Supabase napako z vsemi zahtevanimi polji:
  * error.message + error.details + error.hint + error.code
@@ -95,6 +147,9 @@ export function formatSupabaseError(err: unknown, context: string): Error {
     } else if (obj.code === '22P02') {
       extraHelp =
         '\n• REŠITEV: Neveljaven UUID format v enem izmed ID polj (invalid input syntax for type uuid).';
+    } else if (obj.code === '23514' && msgStr.includes('slides_slide_type_check')) {
+      extraHelp =
+        '\n• REŠITEV: Tabela "slides" ima staro omejitev CHECK za slide_type. Odprite ⚙️ Nastavitve baze na /host in v Supabase SQL Editorju zaženite "Hiter popravek" za podporo tipu "closest_date" in "question_parts"!';
     }
 
     return new Error(`${context}\n• Napaka (message): ${codeStr}${msgStr}${detailsStr}${hintStr}${extraHelp}`);
@@ -166,20 +221,8 @@ export async function upsertFullQuiz(
     }
   }
 
-  // 3. Upsert v tabelo slides — SAMO stolpci iz SQL sheme:
-  // id, theme_id, order_index, slide_image_url, slide_type, question_text, options, correct_answer, points, timer_seconds
-  const cleanSlidesPayload: Array<{
-    id: string;
-    theme_id: string;
-    order_index: number;
-    slide_image_url: string | null;
-    slide_type: SlideType;
-    question_text: string;
-    options: SlideOptions;
-    correct_answer: string;
-    points: number;
-    timer_seconds: number;
-  }> = [];
+  // 3. Upsert v tabelo slides
+  const cleanSlidesPayload: Array<Record<string, unknown>> = [];
 
   for (const theme of themes) {
     const cleanThemeId = themeIdMap.get(theme.id) || ensureValidUuid(theme.id);
@@ -187,6 +230,12 @@ export async function upsertFullQuiz(
     tSlides.forEach((s, idx) => {
       const cleanSlideId = ensureValidUuid(s.id);
       const slideType: SlideType = s.slide_type || 'multiple_choice';
+      const normalizedParts = normalizeQuestionParts(s.question_parts);
+      const computedPoints = normalizedParts
+        ? roundPoints(normalizedParts.reduce((sum, p) => sum + Number(p.points || 0), 0))
+        : roundPoints(
+            s.points ?? (slideType === 'theme_intro' || slideType === 'info_only' ? 0 : 1)
+          );
       cleanSlidesPayload.push({
         id: cleanSlideId,
         theme_id: cleanThemeId,
@@ -196,18 +245,27 @@ export async function upsertFullQuiz(
         question_text: s.question_text ?? '',
         options: normalizeOptions(s.options),
         correct_answer: s.correct_answer ?? '',
-        points: Number(
-          s.points ?? (slideType === 'theme_intro' || slideType === 'info_only' ? 0 : 1)
-        ),
+        points: computedPoints,
         timer_seconds: Number(s.timer_seconds ?? 0),
+        question_parts: normalizedParts,
       });
     });
   }
 
   if (cleanSlidesPayload.length > 0) {
-    const { error: slidesErr } = await supabase
+    let { error: slidesErr } = await supabase
       .from('slides')
       .upsert(cleanSlidesPayload, { onConflict: 'id' });
+
+    if (slidesErr && /question_parts/i.test(slidesErr.message || '')) {
+      console.warn(
+        'Stolpec slides.question_parts ne obstaja v bazi. Zaženi: ALTER TABLE public.slides ADD COLUMN IF NOT EXISTS question_parts JSONB DEFAULT NULL;'
+      );
+      const withoutParts = cleanSlidesPayload.map(({ question_parts: _qp, ...rest }) => rest);
+      ({ error: slidesErr } = await supabase
+        .from('slides')
+        .upsert(withoutParts, { onConflict: 'id' }));
+    }
 
     if (slidesErr) {
       throw formatSupabaseError(slidesErr, 'KORAK 3 SPODLETEL — Zapis slajdov v tabelo "slides"');
@@ -513,6 +571,7 @@ export async function fetchQuizDetails(quizId: string): Promise<{
     }
 
     for (const rawSlide of slidesData || []) {
+      const normalizedParts = normalizeQuestionParts(rawSlide.question_parts);
       const slide: Slide = {
         id: rawSlide.id,
         theme_id: rawSlide.theme_id,
@@ -522,8 +581,9 @@ export async function fetchQuizDetails(quizId: string): Promise<{
         question_text: rawSlide.question_text || '',
         options: normalizeOptions(rawSlide.options),
         correct_answer: rawSlide.correct_answer || '',
-        points: Number(rawSlide.points ?? 1),
+        points: roundPoints(rawSlide.points ?? 1),
         timer_seconds: Number(rawSlide.timer_seconds ?? 0),
+        question_parts: normalizedParts,
       };
       if (!slidesByTheme[slide.theme_id]) {
         slidesByTheme[slide.theme_id] = [];
@@ -593,6 +653,7 @@ export async function createTheme(
     introSlide: {
       ...(slideData as Slide),
       options: normalizeOptions(slideData.options),
+      question_parts: normalizeQuestionParts(slideData.question_parts),
     },
   };
 }
@@ -635,8 +696,9 @@ export async function createSlide(
   const supabase = requireSupabaseClient();
   const slideId = crypto.randomUUID();
   const slideType: SlideType = payload.slide_type ?? 'multiple_choice';
+  const normalizedParts = normalizeQuestionParts(payload.question_parts);
 
-  const defaultSlide = {
+  const defaultSlide: Record<string, unknown> = {
     id: slideId,
     theme_id: themeId,
     order_index: Number(payload.order_index ?? 0),
@@ -645,17 +707,27 @@ export async function createSlide(
     question_text: payload.question_text ?? '',
     options: normalizeOptions(payload.options),
     correct_answer: payload.correct_answer ?? '',
-    points: Number(
+    points: roundPoints(
       payload.points ?? (slideType === 'theme_intro' || slideType === 'info_only' ? 0 : 1)
     ),
     timer_seconds: Number(payload.timer_seconds ?? 0),
+    ...(normalizedParts !== null ? { question_parts: normalizedParts } : {}),
   };
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from('slides')
     .insert(defaultSlide)
     .select('*')
     .single();
+
+  if (error && /question_parts/i.test(error.message || '')) {
+    const { question_parts: _qp, ...withoutParts } = defaultSlide;
+    ({ data, error } = await supabase
+      .from('slides')
+      .insert(withoutParts)
+      .select('*')
+      .single());
+  }
 
   if (error || !data) {
     throw formatSupabaseError(error, 'Napaka pri ustvarjanju slajda v tabeli "slides"');
@@ -663,8 +735,9 @@ export async function createSlide(
   return {
     ...(data as Slide),
     options: normalizeOptions(data.options),
-    points: Number(data.points ?? 1),
+    points: roundPoints(data.points ?? 1),
     timer_seconds: Number(data.timer_seconds ?? 0),
+    question_parts: normalizeQuestionParts(data.question_parts),
   };
 }
 
@@ -682,15 +755,33 @@ export async function updateSlide(
   if (updates.question_text !== undefined) cleanUpdates.question_text = updates.question_text;
   if (updates.options !== undefined) cleanUpdates.options = normalizeOptions(updates.options);
   if (updates.correct_answer !== undefined) cleanUpdates.correct_answer = updates.correct_answer;
-  if (updates.points !== undefined) cleanUpdates.points = Number(updates.points);
+  if (updates.points !== undefined) cleanUpdates.points = roundPoints(updates.points);
   if (updates.timer_seconds !== undefined) cleanUpdates.timer_seconds = Number(updates.timer_seconds);
+  if (updates.question_parts !== undefined) {
+    cleanUpdates.question_parts = normalizeQuestionParts(updates.question_parts);
+  }
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from('slides')
     .update(cleanUpdates)
     .eq('id', slideId)
     .select('*')
     .single();
+
+  if (error && /question_parts/i.test(error.message || '')) {
+    console.warn(
+      'Stolpec slides.question_parts ne obstaja v bazi. Zaženi: ALTER TABLE public.slides ADD COLUMN IF NOT EXISTS question_parts JSONB DEFAULT NULL;'
+    );
+    const { question_parts: _qp, ...withoutParts } = cleanUpdates;
+    if (Object.keys(withoutParts).length > 0) {
+      ({ data, error } = await supabase
+        .from('slides')
+        .update(withoutParts)
+        .eq('id', slideId)
+        .select('*')
+        .single());
+    }
+  }
 
   if (error || !data) {
     throw formatSupabaseError(error, 'Napaka pri shranjevanju slajda v tabelo "slides"');
@@ -698,8 +789,9 @@ export async function updateSlide(
   return {
     ...(data as Slide),
     options: normalizeOptions(data.options),
-    points: Number(data.points ?? 1),
+    points: roundPoints(data.points ?? 1),
     timer_seconds: Number(data.timer_seconds ?? 0),
+    question_parts: normalizeQuestionParts(data.question_parts) ?? normalizeQuestionParts(updates.question_parts),
   };
 }
 
@@ -1000,6 +1092,7 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
     }
 
     for (const raw of slidesData || []) {
+      const normalizedParts = normalizeQuestionParts(raw.question_parts);
       const slide: Slide = {
         id: raw.id,
         theme_id: raw.theme_id,
@@ -1009,8 +1102,9 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
         question_text: raw.question_text || '',
         options: normalizeOptions(raw.options),
         correct_answer: raw.correct_answer || '',
-        points: Number(raw.points ?? 1),
+        points: roundPoints(raw.points ?? 1),
         timer_seconds: Number(raw.timer_seconds ?? 0),
+        question_parts: normalizedParts,
       };
       if (!slidesByTheme[slide.theme_id]) slidesByTheme[slide.theme_id] = [];
       slidesByTheme[slide.theme_id].push(slide);
@@ -1108,13 +1202,13 @@ async function saveOrUpdateAnswerRecord(
     theme_id: themeId,
     answer_text: fields.answer_text,
     is_correct: fields.is_correct,
-    awarded_points: Number(fields.awarded_points),
+    awarded_points: roundPoints(fields.awarded_points),
     graded: fields.graded,
   };
 
   const optionalFields: Record<string, unknown> = {
     ...baseFields,
-    ...(fields.bonus_points !== undefined ? { bonus_points: Number(fields.bonus_points) } : {}),
+    ...(fields.bonus_points !== undefined ? { bonus_points: roundPoints(fields.bonus_points) } : {}),
     ...(fields.host_comment !== undefined ? { host_comment: fields.host_comment } : {}),
   };
 
@@ -1181,7 +1275,7 @@ async function saveOrUpdateAnswerRecord(
   };
   const insertOptional: Record<string, unknown> = {
     ...insertBase,
-    ...(fields.bonus_points !== undefined ? { bonus_points: Number(fields.bonus_points) } : {}),
+    ...(fields.bonus_points !== undefined ? { bonus_points: roundPoints(fields.bonus_points) } : {}),
     ...(fields.host_comment !== undefined ? { host_comment: fields.host_comment } : {}),
   };
 
@@ -1315,7 +1409,7 @@ export async function submitDemoAnswer(
     {
       answer_text: answerText,
       is_correct: isCorrect,
-      awarded_points: Number(awardedPoints),
+      awarded_points: roundPoints(awardedPoints),
       graded: false,
     },
     'Napaka pri oddaji odgovora v tabelo "answers"'
@@ -1344,9 +1438,9 @@ export async function upsertGradedAnswer(
     {
       answer_text: answerText,
       is_correct: isCorrect,
-      awarded_points: Number(awardedPoints),
+      awarded_points: roundPoints(awardedPoints),
       graded: true,
-      ...(bonusPoints !== undefined ? { bonus_points: Math.max(0, Number(bonusPoints) || 0) } : {}),
+      ...(bonusPoints !== undefined ? { bonus_points: Math.max(0, roundPoints(bonusPoints)) } : {}),
       ...(hostComment !== undefined ? { host_comment: hostComment.trim() || null } : {}),
     },
     'Napaka pri ocenjevanju odgovora v tabeli "answers"'
@@ -1357,7 +1451,9 @@ export async function upsertGradedAnswer(
  * Avtomatsko pred-oceni vse oddane odgovore za dano tematiko:
  * - multiple_choice: primerja answer_text === correct_answer
  * - closest_number: izračuna |odgovor_igralca - correct_answer| in označi najbližjega (ali več ob izenačenju) kot pravilnega
+ * - closest_date: izračuna razliko v dnevih med odgovorom igralca in ciljnim datumom ter nagradi najbližjega (ali več ob izenačenju)
  * - open_text: če še ni ocenjen, preveri ujemanje besedila (brez velikih/malih črk)
+ * - večdelna vprašanja (question_parts): ovrednoti vsak del posebej in sešteje točke
  */
 export async function autoPreGradeTheme(
   sessionId: string,
@@ -1367,8 +1463,10 @@ export async function autoPreGradeTheme(
 ): Promise<void> {
   const questionSlides = slides.filter(
     (s) =>
+      isMultiPartSlide(s) ||
       s.slide_type === 'multiple_choice' ||
       s.slide_type === 'closest_number' ||
+      s.slide_type === 'closest_date' ||
       s.slide_type === 'open_text'
   );
 
@@ -1384,8 +1482,111 @@ export async function autoPreGradeTheme(
     const slideAnswers = existingAnswers.filter((a) => a.slide_id === slide.id);
     if (slideAnswers.length === 0) continue;
 
+    // 1. Večdelno vprašanje (question_parts)
+    if (isMultiPartSlide(slide) && slide.question_parts) {
+      const parts = slide.question_parts;
+      // Za dele tipa closest_number in closest_date najprej izračunaj minimalno razliko med vsemi igralci
+      const minNumDiffByPart: Record<string, number> = {};
+      const minDateDiffByPart: Record<string, number> = {};
+
+      for (const part of parts) {
+        if (part.type === 'closest_number') {
+          const targetNum = parseFloat((part.correct_answer || '').trim().replace(',', '.'));
+          if (!Number.isNaN(targetNum)) {
+            const diffs: number[] = [];
+            for (const ans of slideAnswers) {
+              const { values } = parseMultiPartAnswer(ans.answer_text);
+              const val = parseFloat((values[part.id] || '').trim().replace(',', '.'));
+              if (!Number.isNaN(val)) {
+                diffs.push(Math.abs(val - targetNum));
+              }
+            }
+            if (diffs.length > 0) {
+              minNumDiffByPart[part.id] = Math.min(...diffs);
+            }
+          }
+        } else if (part.type === 'closest_date') {
+          const targetDate = (part.correct_answer || '').trim();
+          if (targetDate) {
+            const diffs: number[] = [];
+            for (const ans of slideAnswers) {
+              const { values } = parseMultiPartAnswer(ans.answer_text);
+              const diffDays = calculateDateDiffDays(values[part.id], targetDate);
+              if (diffDays !== null) {
+                diffs.push(diffDays);
+              }
+            }
+            if (diffs.length > 0) {
+              minDateDiffByPart[part.id] = Math.min(...diffs);
+            }
+          }
+        }
+      }
+
+      for (const ans of slideAnswers) {
+        if (ans.graded) continue;
+        const { values, partScores: existingPartScores } = parseMultiPartAnswer(ans.answer_text);
+        const computedPartScores: Record<string, number> = { ...existingPartScores };
+        let totalAwarded = 0;
+
+        for (const part of parts) {
+          const partMaxPts = roundPoints(part.points ?? 1);
+          const rawVal = (values[part.id] || '').trim();
+          const partCorrect = (part.correct_answer || '').trim();
+          let partScore = 0;
+
+          if (part.type === 'multiple_choice') {
+            const normAns = rawVal.toUpperCase();
+            const normCorr = partCorrect.toUpperCase();
+            const isMatch =
+              partCorrect !== '' &&
+              normAns !== '' &&
+              (normAns === normCorr ||
+                normCorr.startsWith(normAns) ||
+                normAns.startsWith(normCorr));
+            partScore = isMatch ? partMaxPts : 0;
+          } else if (part.type === 'open_text') {
+            const isExact =
+              partCorrect !== '' &&
+              rawVal !== '' &&
+              rawVal.toLowerCase() === partCorrect.toLowerCase();
+            partScore = isExact ? partMaxPts : 0;
+          } else if (part.type === 'closest_number') {
+            const targetNum = parseFloat(partCorrect.replace(',', '.'));
+            const valNum = parseFloat(rawVal.replace(',', '.'));
+            const minDiff = minNumDiffByPart[part.id];
+            if (!Number.isNaN(targetNum) && !Number.isNaN(valNum) && minDiff !== undefined) {
+              const isWinner = Math.abs(Math.abs(valNum - targetNum) - minDiff) < 1e-9;
+              partScore = isWinner ? partMaxPts : 0;
+            }
+          } else if (part.type === 'closest_date') {
+            const diffDays = calculateDateDiffDays(rawVal, partCorrect);
+            const minDiff = minDateDiffByPart[part.id];
+            if (diffDays !== null && minDiff !== undefined && diffDays === minDiff) {
+              partScore = partMaxPts;
+            }
+          }
+
+          computedPartScores[part.id] = roundPoints(partScore);
+          totalAwarded += computedPartScores[part.id];
+        }
+
+        const finalAwarded = roundPoints(totalAwarded);
+        const updatedJson = serializeMultiPartAnswer(values, computedPartScores);
+        updatesToSave.push({
+          playerId: ans.player_id,
+          slideId: slide.id,
+          answerText: updatedJson,
+          isCorrect: finalAwarded > 0,
+          awardedPoints: finalAwarded,
+        });
+      }
+      continue;
+    }
+
+    // 2. Klasično enodelno vprašanje
     const correctRaw = (slide.correct_answer || '').trim();
-    const maxPts = Number(slide.points ?? 1);
+    const maxPts = roundPoints(slide.points ?? 1);
 
     if (slide.slide_type === 'multiple_choice') {
       for (const ans of slideAnswers) {
@@ -1394,6 +1595,7 @@ export async function autoPreGradeTheme(
         const normCorrect = correctRaw.toUpperCase();
         const isMatch =
           correctRaw !== '' &&
+          normAns !== '' &&
           (normAns === normCorrect ||
             normCorrect.startsWith(normAns) ||
             normAns.startsWith(normCorrect));
@@ -1429,6 +1631,39 @@ export async function autoPreGradeTheme(
           for (const { ans, diff } of diffs) {
             if (ans.graded) continue;
             const isWinner = Math.abs(diff - minDiff) < 1e-9;
+            updatesToSave.push({
+              playerId: ans.player_id,
+              slideId: slide.id,
+              answerText: ans.answer_text,
+              isCorrect: isWinner,
+              awardedPoints: isWinner ? maxPts : 0,
+            });
+          }
+        }
+      }
+    } else if (slide.slide_type === 'closest_date') {
+      if (correctRaw) {
+        const diffs: Array<{ ans: Answer; diffDays: number }> = [];
+        for (const ans of slideAnswers) {
+          const diffDays = calculateDateDiffDays(ans.answer_text, correctRaw);
+          if (diffDays !== null) {
+            diffs.push({ ans, diffDays });
+          } else if (!ans.graded) {
+            updatesToSave.push({
+              playerId: ans.player_id,
+              slideId: slide.id,
+              answerText: ans.answer_text,
+              isCorrect: false,
+              awardedPoints: 0,
+            });
+          }
+        }
+
+        if (diffs.length > 0) {
+          const minDiff = Math.min(...diffs.map((d) => d.diffDays));
+          for (const { ans, diffDays } of diffs) {
+            if (ans.graded) continue;
+            const isWinner = diffDays === minDiff;
             updatesToSave.push({
               playerId: ans.player_id,
               slideId: slide.id,
@@ -1519,8 +1754,8 @@ export async function confirmThemeGradesAndShowLeaderboard(
     Record<string, { regular: number; bonus: number }>
   > = {};
   for (const ans of dedupedAnswers) {
-    const regularPts = Number(ans.awarded_points ?? 0);
-    const bonusPts = Number(ans.bonus_points ?? 0);
+    const regularPts = roundPoints(ans.awarded_points ?? 0);
+    const bonusPts = roundPoints(ans.bonus_points ?? 0);
     const resolvedThemeId = slideThemeMap.get(ans.slide_id) || ans.theme_id;
     if (!resolvedThemeId) continue;
     if (!playerThemeSums[ans.player_id]) {
@@ -1543,7 +1778,7 @@ export async function confirmThemeGradesAndShowLeaderboard(
       const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
       total += tockeTeme;
     }
-    newScoresByPlayer[player.id] = Math.round(total * 100) / 100;
+    newScoresByPlayer[player.id] = roundPoints(total);
   }
 
   // Posodobi total_score za vsakega igralca v Supabase
@@ -1727,6 +1962,7 @@ export async function fetchPlayerGameData(
       .order('order_index', { ascending: true });
 
     for (const raw of slidesData || []) {
+      const normalizedParts = normalizeQuestionParts(raw.question_parts);
       const slide: Slide = {
         id: raw.id,
         theme_id: raw.theme_id,
@@ -1736,8 +1972,9 @@ export async function fetchPlayerGameData(
         question_text: raw.question_text || '',
         options: normalizeOptions(raw.options),
         correct_answer: raw.correct_answer || '',
-        points: Number(raw.points ?? 1),
+        points: roundPoints(raw.points ?? 1),
         timer_seconds: Number(raw.timer_seconds ?? 0),
+        question_parts: normalizedParts,
       };
       if (!slidesByTheme[slide.theme_id]) slidesByTheme[slide.theme_id] = [];
       slidesByTheme[slide.theme_id].push(slide);

@@ -26,9 +26,14 @@ const QUICK_FIX_SQL = `-- ======================================================
 ALTER TABLE public.quizzes DROP CONSTRAINT IF EXISTS quizzes_host_id_fkey;
 ALTER TABLE public.quizzes ALTER COLUMN host_id TYPE TEXT USING host_id::TEXT;
 
--- 1b. Opcijski komentar gostitelja in bonus točke pri ocenjevanju
+-- 1b. Opcijski komentar gostitelja, bonus točke, večdelna vprašanja (question_parts) in tip 'closest_date'
 ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS host_comment TEXT;
 ALTER TABLE public.answers ADD COLUMN IF NOT EXISTS bonus_points NUMERIC DEFAULT 0;
+ALTER TABLE public.slides ADD COLUMN IF NOT EXISTS question_parts JSONB DEFAULT NULL;
+ALTER TABLE public.slides DROP CONSTRAINT IF EXISTS slides_slide_type_check;
+ALTER TABLE public.slides ADD CONSTRAINT slides_slide_type_check CHECK (
+    slide_type IN ('theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number', 'closest_date')
+);
 
 -- 2. Izklopi RLS (Row Level Security) na vseh tabelah
 ALTER TABLE public.quizzes DISABLE ROW LEVEL SECURITY;

@@ -1,4 +1,11 @@
 import React from 'react';
+import {
+  calculateDateDiffDays,
+  formatDaysDeviationLabel,
+  formatSloveneDate,
+  isMultiPartSlide,
+  parseMultiPartAnswer,
+} from '../lib/questionUtils';
 import type { PlayerFullData, Theme } from '../types/quiz';
 
 interface PlayerResultsReviewProps {
@@ -27,9 +34,11 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
       {themes.map((theme) => {
         const questions = (slidesByTheme[theme.id] || []).filter(
           (s) =>
+            isMultiPartSlide(s) ||
             s.slide_type === 'multiple_choice' ||
             s.slide_type === 'open_text' ||
-            s.slide_type === 'closest_number'
+            s.slide_type === 'closest_number' ||
+            s.slide_type === 'closest_date'
         );
         const hasJoker = jokerThemes.has(theme.id);
         const redneTocke = questions.reduce(
@@ -69,6 +78,15 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
               const pts = Number(ans?.awarded_points ?? 0);
               const bonusPts = Number(ans?.bonus_points ?? 0);
               const good = pts > 0 || bonusPts > 0;
+              const multiPart = isMultiPartSlide(q) && q.question_parts;
+              const parsedMulti = multiPart
+                ? parseMultiPartAnswer(ans?.answer_text)
+                : null;
+              const singleDateDiff =
+                !multiPart && q.slide_type === 'closest_date' && ans?.answer_text
+                  ? calculateDateDiffDays(ans.answer_text, q.correct_answer)
+                  : null;
+
               return (
                 <div
                   key={q.id}
@@ -79,26 +97,102 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
                   }`}
                 >
                   <p className="text-xs font-semibold text-slate-200 leading-snug">
-                    {idx + 1}. {q.question_text}
+                    {idx + 1}. {q.question_text || `Vprašanje #${idx + 1}`}
                   </p>
-                  <div className="grid grid-cols-1 gap-1 text-[11px]">
-                    <div className="flex justify-between gap-2">
-                      <span className="text-slate-400">Tvoj odgovor:</span>
-                      <span className={`font-bold text-right ${good ? 'text-emerald-300' : 'text-rose-300'}`}>
-                        {ans?.answer_text
-                          ? q.slide_type === 'multiple_choice' && q.options[ans.answer_text as 'A']
-                            ? `${ans.answer_text}) ${q.options[ans.answer_text as 'A']}`
-                            : ans.answer_text
-                          : '— (brez odgovora)'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between gap-2">
-                      <span className="text-slate-400">Pravilen odgovor:</span>
-                      <span className="font-bold text-emerald-400 text-right">
-                        {q.correct_answer || '—'}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="grid grid-cols-1 gap-1.5 text-[11px]">
+                    {multiPart && q.question_parts ? (
+                      <div className="space-y-1.5 pt-0.5">
+                        {q.question_parts.map((part, pIdx) => {
+                          const rawAns = parsedMulti?.values[part.id] || '';
+                          const partPts = parsedMulti?.partScores[part.id];
+                          const displayAns = rawAns
+                            ? part.type === 'closest_date'
+                              ? formatSloveneDate(rawAns)
+                              : rawAns
+                            : '— (brez odgovora)';
+                          const displayCorr = part.correct_answer
+                            ? part.type === 'closest_date'
+                              ? formatSloveneDate(part.correct_answer)
+                              : part.correct_answer
+                            : '—';
+                          const pDateDiff =
+                            part.type === 'closest_date' && rawAns
+                              ? calculateDateDiffDays(rawAns, part.correct_answer)
+                              : null;
+
+                          return (
+                            <div
+                              key={part.id}
+                              className="p-2 rounded-xl bg-slate-900/80 border border-slate-800/80 space-y-1"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-bold text-fuchsia-300">
+                                  {part.label || `Del ${pIdx + 1}`}
+                                </span>
+                                <span className="font-mono-code font-bold text-emerald-400">
+                                  {partPts !== undefined ? `${fmt(partPts)} / ` : ''}
+                                  {fmt(part.points)} t
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-2">
+                                <span className="text-slate-400">Tvoj odgovor:</span>
+                                <span className="font-bold text-slate-100 text-right">
+                                  {displayAns}
+                                  {pDateDiff !== null && (
+                                    <span className="ml-1.5 text-[10px] text-cyan-300">
+                                      ({formatDaysDeviationLabel(pDateDiff)})
+                                    </span>
+                                  )}
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-2">
+                                <span className="text-slate-400">Pravilen odgovor:</span>
+                                <span className="font-bold text-emerald-400 text-right">
+                                  {displayCorr}
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex justify-between gap-2">
+                          <span className="text-slate-400">Tvoj odgovor:</span>
+                          <span
+                            className={`font-bold text-right ${
+                              good ? 'text-emerald-300' : 'text-rose-300'
+                            }`}
+                          >
+                            {ans?.answer_text
+                              ? q.slide_type === 'multiple_choice' &&
+                                q.options[ans.answer_text as 'A']
+                                ? `${ans.answer_text}) ${q.options[ans.answer_text as 'A']}`
+                                : q.slide_type === 'closest_date'
+                                ? formatSloveneDate(ans.answer_text)
+                                : ans.answer_text
+                              : '— (brez odgovora)'}
+                            {singleDateDiff !== null && (
+                              <span className="ml-1.5 text-[10px] text-cyan-300">
+                                ({formatDaysDeviationLabel(singleDateDiff)})
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex justify-between gap-2">
+                          <span className="text-slate-400">Pravilen odgovor:</span>
+                          <span className="font-bold text-emerald-400 text-right">
+                            {q.correct_answer
+                              ? q.slide_type === 'closest_date'
+                                ? formatSloveneDate(q.correct_answer)
+                                : q.correct_answer
+                              : '—'}
+                          </span>
+                        </div>
+                      </>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 border-t border-slate-800/60">
                       <span className="text-slate-400">Točke:</span>
                       <div className="flex flex-wrap items-center justify-end gap-1.5">
                         <span className="font-mono-code font-bold text-slate-100">

@@ -124,6 +124,13 @@ export function generateSlideSvgDataUrl(config: SlideSvgConfig): string {
         <text x="400" y="58" text-anchor="middle" fill="#c4b5fd" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="700">🔢 Vpis številke (najbližji ugib zmaga!)</text>
       </g>
     `;
+  } else if (type === 'closest_date') {
+    centerElementSvg = `
+      <g transform="translate(520, 680)">
+        <rect width="880" height="96" rx="20" fill="#1e293b" fill-opacity="0.85" stroke="#06b6d4" stroke-width="2" stroke-dasharray="8 6"/>
+        <text x="440" y="58" text-anchor="middle" fill="#67e8f9" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="700">📅 Izbira datuma (najbližji datum zmaga!)</text>
+      </g>
+    `;
   }
 
   // Podnaslov ali vnosna navodila

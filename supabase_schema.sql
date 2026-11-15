@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS public.themes (
 );
 
 -- 3. Tabela: slides (Slajdi znotraj tematike)
--- Tipi slajdov: 'theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number'
+-- Tipi slajdov: 'theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number', 'closest_date'
 -- Pomembno glede Jokerja: Vsaka tematika se začne s 'theme_intro', kjer lahko igralci aktivirajo Jokerja za dvojne točke v tej temi.
 CREATE TABLE IF NOT EXISTS public.slides (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -40,13 +40,21 @@ CREATE TABLE IF NOT EXISTS public.slides (
     order_index INTEGER NOT NULL DEFAULT 0,
     slide_image_url TEXT,
     slide_type TEXT NOT NULL DEFAULT 'multiple_choice' CHECK (
-        slide_type IN ('theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number')
+        slide_type IN ('theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number', 'closest_date')
     ),
     question_text TEXT DEFAULT '',
     options JSONB DEFAULT '{"A": "", "B": "", "C": "", "D": ""}'::jsonb,
     correct_answer TEXT DEFAULT '',
     points NUMERIC NOT NULL DEFAULT 1,
-    timer_seconds INTEGER NOT NULL DEFAULT 0
+    timer_seconds INTEGER NOT NULL DEFAULT 0,
+    question_parts JSONB DEFAULT NULL
+);
+
+-- Nadgradnja za obstoječo tabelo slides (večdelna vprašanja in tip 'closest_date'):
+ALTER TABLE public.slides ADD COLUMN IF NOT EXISTS question_parts JSONB DEFAULT NULL;
+ALTER TABLE public.slides DROP CONSTRAINT IF EXISTS slides_slide_type_check;
+ALTER TABLE public.slides ADD CONSTRAINT slides_slide_type_check CHECK (
+    slide_type IN ('theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number', 'closest_date')
 );
 
 -- 4. Tabela: game_sessions (Aktivne igre v živo)

@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  Calendar,
   Check,
   CheckCircle2,
   Clock,
@@ -13,6 +14,7 @@ import {
   Hash,
   Image as ImageIcon,
   Info,
+  Layers,
   ListChecks,
   Loader2,
   Plus,
@@ -23,6 +25,7 @@ import {
   Type,
 } from 'lucide-react';
 import { convertPdfToImages } from '../lib/pdfConverter';
+import { formatSloveneDate, roundPoints } from '../lib/questionUtils';
 import {
   createSlide,
   createTheme,
@@ -34,7 +37,15 @@ import {
   uploadSlideImage,
   upsertFullQuiz,
 } from '../lib/quizService';
-import type { Quiz, Slide, SlideOptions, SlideType, Theme } from '../types/quiz';
+import type {
+  QuestionPart,
+  QuestionPartType,
+  Quiz,
+  Slide,
+  SlideOptions,
+  SlideType,
+  Theme,
+} from '../types/quiz';
 
 interface QuizBuilderProps {
   quizId: string;
@@ -90,6 +101,14 @@ const SLIDE_TYPE_META: Record<
       'Igralci vpišejo številsko vrednost (točke za točen ali najbližji približek).',
     badgeClass: 'bg-violet-500/15 text-violet-300 border-violet-500/30',
     icon: Hash,
+  },
+  closest_date: {
+    label: 'Datum — najbližji pravemu (closest_date)',
+    shortLabel: 'Datum',
+    description:
+      'Igralci izberejo datum (leto, mesec, dan). Pri ocenjevanju se odgovori samodejno razvrstijo od najbližjega datuma (najmanj dni odstopanja) do najbolj oddaljenega!',
+    badgeClass: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30',
+    icon: Calendar,
   },
 };
 
@@ -587,6 +606,128 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
     updateLocalSlideField('options', nextOptions);
   };
 
+  // Posodobi polje question_parts in samodejno preračunaj skupne točke slajda
+  const updateLocalQuestionParts = (nextParts: QuestionPart[] | null) => {
+    if (!currentTheme || !currentSlide) return;
+    const cleaned = nextParts && nextParts.length > 0 ? nextParts : null;
+    const sumPoints = cleaned
+      ? roundPoints(cleaned.reduce((acc, p) => acc + Number(p.points || 0), 0))
+      : currentSlide.points;
+    setSlidesByTheme((prev) => ({
+      ...prev,
+      [currentTheme.id]: (prev[currentTheme.id] || []).map((s) =>
+        s.id === currentSlide.id
+          ? {
+              ...s,
+              question_parts: cleaned,
+              points: cleaned ? sumPoints : s.points,
+            }
+          : s
+      ),
+    }));
+  };
+
+  // Dodaj nov del vprašanja (če je trenutno klasično enodelno vprašanje, ustvari Del 1 iz trenutnih nastavitev + Del 2)
+  const handleAddQuestionPart = () => {
+    if (!currentSlide) return;
+    const existing = currentSlide.question_parts || [];
+    if (existing.length === 0) {
+      const firstType: QuestionPartType =
+        currentSlide.slide_type === 'multiple_choice' ||
+        currentSlide.slide_type === 'open_text' ||
+        currentSlide.slide_type === 'closest_number' ||
+        currentSlide.slide_type === 'closest_date'
+          ? currentSlide.slide_type
+          : 'open_text';
+      const part1: QuestionPart = {
+        id: crypto.randomUUID(),
+        label: 'Del 1',
+        type: firstType,
+        ...(firstType === 'multiple_choice'
+          ? {
+              options: [
+                currentSlide.options?.A || '',
+                currentSlide.options?.B || '',
+                currentSlide.options?.C || '',
+                currentSlide.options?.D || '',
+              ],
+            }
+          : {}),
+        correct_answer: currentSlide.correct_answer || '',
+        points: roundPoints(currentSlide.points || 1),
+      };
+      const part2: QuestionPart = {
+        id: crypto.randomUUID(),
+        label: 'Del 2',
+        type: 'open_text',
+        correct_answer: '',
+        points: 1,
+      };
+      updateLocalQuestionParts([part1, part2]);
+    } else {
+      const nextPart: QuestionPart = {
+        id: crypto.randomUUID(),
+        label: `Del ${existing.length + 1}`,
+        type: 'open_text',
+        correct_answer: '',
+        points: 1,
+      };
+      updateLocalQuestionParts([...existing, nextPart]);
+    }
+  };
+
+  const handleUpdateQuestionPart = (partId: string, patch: Partial<QuestionPart>) => {
+    if (!currentSlide || !currentSlide.question_parts) return;
+    const nextParts = currentSlide.question_parts.map((p) => {
+      if (p.id !== partId) return p;
+      const updated: QuestionPart = { ...p, ...patch };
+      if (patch.type === 'multiple_choice' && !updated.options) {
+        updated.options = ['', '', '', ''];
+      }
+      return updated;
+    });
+    updateLocalQuestionParts(nextParts);
+  };
+
+  const handleRemoveQuestionPart = (partId: string) => {
+    if (!currentSlide || !currentSlide.question_parts) return;
+    const remaining = currentSlide.question_parts.filter((p) => p.id !== partId);
+    if (remaining.length <= 1) {
+      // Če ostane le še 1 del (ali 0), lahko preklopimo nazaj na klasično enodelno vprašanje
+      if (remaining.length === 1) {
+        const last = remaining[0];
+        if (!currentTheme) return;
+        setSlidesByTheme((prev) => ({
+          ...prev,
+          [currentTheme.id]: (prev[currentTheme.id] || []).map((s) =>
+            s.id === currentSlide.id
+              ? {
+                  ...s,
+                  slide_type: last.type,
+                  correct_answer: last.correct_answer,
+                  points: roundPoints(last.points || 1),
+                  options:
+                    last.type === 'multiple_choice' && last.options
+                      ? {
+                          A: last.options[0] || '',
+                          B: last.options[1] || '',
+                          C: last.options[2] || '',
+                          D: last.options[3] || '',
+                        }
+                      : s.options,
+                  question_parts: null,
+                }
+              : s
+          ),
+        }));
+        return;
+      }
+      updateLocalQuestionParts(null);
+      return;
+    }
+    updateLocalQuestionParts(remaining);
+  };
+
   // Shrani izbrani slajd in celoten kviz z UPSERT v Supabase bazo
   const handleSaveCurrentSlide = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -1026,9 +1167,12 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
               {/* Seznam slajdov v trenutni tematiki */}
               <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
                 {currentSlides.map((slide, idx) => {
-                  const meta = SLIDE_TYPE_META[slide.slide_type];
+                  const meta = SLIDE_TYPE_META[slide.slide_type] || SLIDE_TYPE_META.multiple_choice;
                   const Icon = meta.icon;
                   const isSelected = currentSlide?.id === slide.id;
+                  const hasParts = Boolean(
+                    slide.question_parts && slide.question_parts.length > 0
+                  );
 
                   return (
                     <div
@@ -1058,17 +1202,24 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
                       {/* Podatki o slajdu */}
                       <div className="flex-1 min-w-0 space-y-1">
-                        <div className="flex items-center gap-1.5">
-                          <span
-                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border ${meta.badgeClass}`}
-                          >
-                            <Icon className="w-3 h-3" />
-                            <span>{meta.shortLabel}</span>
-                          </span>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {hasParts ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30">
+                              <Layers className="w-3 h-3" />
+                              <span>Večdelno ({slide.question_parts!.length} deli)</span>
+                            </span>
+                          ) : (
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border ${meta.badgeClass}`}
+                            >
+                              <Icon className="w-3 h-3" />
+                              <span>{meta.shortLabel}</span>
+                            </span>
+                          )}
                           {slide.slide_type !== 'theme_intro' &&
                             slide.slide_type !== 'info_only' && (
                               <span className="text-[10px] text-emerald-400 font-semibold">
-                                {slide.points} t
+                                {roundPoints(slide.points)} t
                               </span>
                             )}
                         </div>
@@ -1234,6 +1385,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                     updateLocalSlideField('slide_type', nextType);
                     if (nextType === 'theme_intro' || nextType === 'info_only') {
                       updateLocalSlideField('points', 0);
+                      updateLocalQuestionParts(null);
                     } else if (currentSlide.points === 0) {
                       updateLocalSlideField('points', 1);
                     }
@@ -1249,10 +1401,10 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
                 <div
                   className={`p-3 rounded-xl border text-xs leading-relaxed ${
-                    SLIDE_TYPE_META[currentSlide.slide_type].badgeClass
+                    (SLIDE_TYPE_META[currentSlide.slide_type] || SLIDE_TYPE_META.multiple_choice).badgeClass
                   }`}
                 >
-                  {SLIDE_TYPE_META[currentSlide.slide_type].description}
+                  {(SLIDE_TYPE_META[currentSlide.slide_type] || SLIDE_TYPE_META.multiple_choice).description}
                 </div>
               </div>
 
@@ -1273,122 +1425,405 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                 />
               </div>
 
-              {/* Možne izbire in pravilen odgovor glede na tip slajda */}
-              {currentSlide.slide_type === 'multiple_choice' && (
-                <div className="space-y-3 p-4 rounded-2xl bg-slate-950/70 border border-slate-800">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-indigo-300">
-                      Možni odgovori (A / B / C / D) &amp; Pravilen odgovor
-                    </span>
-                    <span className="text-[11px] text-slate-400">
-                      Kliknite črko za označitev pravilnega
-                    </span>
-                  </div>
+              {/* Če slajd NI theme_intro ali info_only: klasični odgovor ALI večdelno vprašanje */}
+              {currentSlide.slide_type !== 'theme_intro' &&
+                currentSlide.slide_type !== 'info_only' && (
+                  <>
+                    {/* Če slajd NIMA večdelnih vprašanj, prikaži klasično polje za odgovor */}
+                    {(!currentSlide.question_parts ||
+                      currentSlide.question_parts.length === 0) && (
+                      <>
+                        {currentSlide.slide_type === 'multiple_choice' && (
+                          <div className="space-y-3 p-4 rounded-2xl bg-slate-950/70 border border-slate-800">
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-semibold uppercase tracking-wider text-indigo-300">
+                                Možni odgovori (A / B / C / D) &amp; Pravilen odgovor
+                              </span>
+                              <span className="text-[11px] text-slate-400">
+                                Kliknite črko za označitev pravilnega
+                              </span>
+                            </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {(['A', 'B', 'C', 'D'] as const).map((letter) => {
-                      const isCorrect =
-                        currentSlide.correct_answer === letter ||
-                        Boolean(currentSlide.correct_answer?.trim().toUpperCase().startsWith(letter));
-                      return (
-                        <div
-                          key={letter}
-                          className={`flex items-center gap-2 p-2 rounded-xl border transition-all ${
-                            isCorrect
-                              ? 'bg-emerald-500/15 border-emerald-500/50'
-                              : 'bg-slate-900/90 border-slate-800'
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateLocalSlideField('correct_answer', letter)
-                            }
-                            className={`w-8 h-8 rounded-lg font-bold text-xs flex items-center justify-center shrink-0 transition-all cursor-pointer ${
-                              isCorrect
-                                ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/30'
-                                : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                            }`}
-                            title={`Označi ${letter} kot pravilen odgovor`}
-                          >
-                            {isCorrect ? <Check className="w-4 h-4" /> : letter}
-                          </button>
-                          <input
-                            type="text"
-                            value={currentSlide.options[letter] || ''}
-                            onChange={(e) =>
-                              updateLocalSlideOption(letter, e.target.value)
-                            }
-                            placeholder={`Odgovor ${letter} (opcijsko)`}
-                            className="w-full bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
-                          />
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {(['A', 'B', 'C', 'D'] as const).map((letter) => {
+                                const isCorrect =
+                                  currentSlide.correct_answer === letter ||
+                                  Boolean(
+                                    currentSlide.correct_answer
+                                      ?.trim()
+                                      .toUpperCase()
+                                      .startsWith(letter)
+                                  );
+                                return (
+                                  <div
+                                    key={letter}
+                                    className={`flex items-center gap-2 p-2 rounded-xl border transition-all ${
+                                      isCorrect
+                                        ? 'bg-emerald-500/15 border-emerald-500/50'
+                                        : 'bg-slate-900/90 border-slate-800'
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateLocalSlideField('correct_answer', letter)
+                                      }
+                                      className={`w-8 h-8 rounded-lg font-bold text-xs flex items-center justify-center shrink-0 transition-all cursor-pointer ${
+                                        isCorrect
+                                          ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/30'
+                                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                                      }`}
+                                      title={`Označi ${letter} kot pravilen odgovor`}
+                                    >
+                                      {isCorrect ? <Check className="w-4 h-4" /> : letter}
+                                    </button>
+                                    <input
+                                      type="text"
+                                      value={currentSlide.options[letter] || ''}
+                                      onChange={(e) =>
+                                        updateLocalSlideOption(letter, e.target.value)
+                                      }
+                                      placeholder={`Odgovor ${letter} (opcijsko)`}
+                                      className="w-full bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
+                                    />
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {currentSlide.slide_type === 'open_text' && (
+                          <div>
+                            <label className="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">
+                              Pravilen odgovor (besedilo)
+                            </label>
+                            <input
+                              id="slide-correct-open-text-input"
+                              type="text"
+                              value={currentSlide.correct_answer}
+                              onChange={(e) =>
+                                updateLocalSlideField('correct_answer', e.target.value)
+                              }
+                              placeholder="npr. Ljubljana"
+                              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                            />
+                          </div>
+                        )}
+
+                        {currentSlide.slide_type === 'closest_number' && (
+                          <div>
+                            <label className="block text-xs font-semibold uppercase tracking-wider text-violet-400 mb-1.5">
+                              Pravilna številka (closest_number)
+                            </label>
+                            <input
+                              id="slide-correct-number-input"
+                              type="number"
+                              step="any"
+                              value={currentSlide.correct_answer}
+                              onChange={(e) =>
+                                updateLocalSlideField('correct_answer', e.target.value)
+                              }
+                              placeholder="npr. 1999"
+                              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono-code text-slate-100 placeholder-slate-600 focus:outline-none focus:border-violet-500"
+                            />
+                          </div>
+                        )}
+
+                        {currentSlide.slide_type === 'closest_date' && (
+                          <div className="space-y-1.5">
+                            <label className="block text-xs font-semibold uppercase tracking-wider text-cyan-400">
+                              Pravilen datum (closest_date)
+                            </label>
+                            <input
+                              id="slide-correct-date-input"
+                              type="date"
+                              value={currentSlide.correct_answer}
+                              onChange={(e) =>
+                                updateLocalSlideField('correct_answer', e.target.value)
+                              }
+                              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono-code text-slate-100 focus:outline-none focus:border-cyan-500"
+                            />
+                            {currentSlide.correct_answer && (
+                              <p className="text-xs text-cyan-300 font-semibold">
+                                📅 Izbrani ciljni datum: {formatSloveneDate(currentSlide.correct_answer)}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {/* VEČDELNA VPRAŠANJA (question_parts) */}
+                    <div className="space-y-3 pt-2 border-t border-slate-800/80">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2">
+                          <Layers className="w-4 h-4 text-fuchsia-400" />
+                          <span className="text-xs font-bold uppercase tracking-wider text-fuchsia-300">
+                            Večdelno vprašanje (podvprašanja na istem slajdu)
+                          </span>
                         </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
+                        {currentSlide.question_parts &&
+                          currentSlide.question_parts.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => updateLocalQuestionParts(null)}
+                              className="text-[11px] text-slate-400 hover:text-rose-400 underline cursor-pointer"
+                            >
+                              Preklopi nazaj na enodelno vprašanje
+                            </button>
+                          )}
+                      </div>
 
-              {currentSlide.slide_type === 'open_text' && (
-                <div>
-                  <label className="block text-xs font-semibold uppercase tracking-wider text-emerald-400 mb-1.5">
-                    Pravilen odgovor (besedilo)
-                  </label>
-                  <input
-                    id="slide-correct-open-text-input"
-                    type="text"
-                    value={currentSlide.correct_answer}
-                    onChange={(e) =>
-                      updateLocalSlideField('correct_answer', e.target.value)
-                    }
-                    placeholder="npr. Ljubljana"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-              )}
+                      {currentSlide.question_parts &&
+                        currentSlide.question_parts.length > 0 && (
+                          <div className="space-y-3">
+                            {currentSlide.question_parts.map((part, pIdx) => {
+                              const partOpts = part.options || ['', '', '', ''];
+                              return (
+                                <div
+                                  key={part.id}
+                                  className="p-3.5 rounded-2xl bg-slate-950/90 border border-fuchsia-500/30 space-y-3"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="px-2 py-0.5 rounded-md bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 text-[11px] font-bold">
+                                      Del #{pIdx + 1}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveQuestionPart(part.id)}
+                                      className="inline-flex items-center gap-1 text-[11px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                      <span>Odstrani del</span>
+                                    </button>
+                                  </div>
 
-              {currentSlide.slide_type === 'closest_number' && (
-                <div>
-                  <label className="block text-xs font-semibold uppercase tracking-wider text-violet-400 mb-1.5">
-                    Pravilna številka (closest_number)
-                  </label>
-                  <input
-                    id="slide-correct-number-input"
-                    type="number"
-                    step="any"
-                    value={currentSlide.correct_answer}
-                    onChange={(e) =>
-                      updateLocalSlideField('correct_answer', e.target.value)
-                    }
-                    placeholder="npr. 1999"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono-code text-slate-100 placeholder-slate-600 focus:outline-none focus:border-violet-500"
-                  />
-                </div>
-              )}
+                                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+                                    <div className="sm:col-span-5">
+                                      <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">
+                                        Oznaka / podvprašanje
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={part.label}
+                                        onChange={(e) =>
+                                          handleUpdateQuestionPart(part.id, {
+                                            label: e.target.value,
+                                          })
+                                        }
+                                        placeholder={`npr. Del ${pIdx + 1}: Ime dogodka`}
+                                        className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-semibold text-slate-100 focus:outline-none focus:border-fuchsia-500"
+                                      />
+                                    </div>
+
+                                    <div className="sm:col-span-4">
+                                      <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">
+                                        Tip odgovora
+                                      </label>
+                                      <select
+                                        value={part.type}
+                                        onChange={(e) =>
+                                          handleUpdateQuestionPart(part.id, {
+                                            type: e.target.value as QuestionPartType,
+                                          })
+                                        }
+                                        className="w-full px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-semibold text-slate-100 focus:outline-none focus:border-fuchsia-500"
+                                      >
+                                        <option value="open_text">Odprto besedilo</option>
+                                        <option value="multiple_choice">Izbirni A/B/C/D</option>
+                                        <option value="closest_number">Številka (najbližji)</option>
+                                        <option value="closest_date">Datum (najbližji)</option>
+                                      </select>
+                                    </div>
+
+                                    <div className="sm:col-span-3">
+                                      <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">
+                                        Točke za ta del
+                                      </label>
+                                      <input
+                                        type="number"
+                                        min={0}
+                                        step="0.25"
+                                        value={part.points}
+                                        onChange={(e) =>
+                                          handleUpdateQuestionPart(part.id, {
+                                            points: Math.max(
+                                              0,
+                                              roundPoints(parseFloat(e.target.value || '0'))
+                                            ),
+                                          })
+                                        }
+                                        className="w-full px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-bold text-emerald-400 focus:outline-none focus:border-fuchsia-500"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  {part.type === 'multiple_choice' && (
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                                      {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => {
+                                        const isCorr =
+                                          part.correct_answer.trim().toUpperCase() === letter;
+                                        return (
+                                          <div
+                                            key={letter}
+                                            className={`flex items-center gap-2 p-2 rounded-xl border ${
+                                              isCorr
+                                                ? 'bg-emerald-500/15 border-emerald-500/50'
+                                                : 'bg-slate-900 border-slate-800'
+                                            }`}
+                                          >
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleUpdateQuestionPart(part.id, {
+                                                  correct_answer: letter,
+                                                })
+                                              }
+                                              className={`w-7 h-7 rounded-lg font-bold text-xs flex items-center justify-center shrink-0 cursor-pointer ${
+                                                isCorr
+                                                  ? 'bg-emerald-500 text-slate-950'
+                                                  : 'bg-slate-800 text-slate-300'
+                                              }`}
+                                            >
+                                              {isCorr ? <Check className="w-3.5 h-3.5" /> : letter}
+                                            </button>
+                                            <input
+                                              type="text"
+                                              value={partOpts[lIdx] || ''}
+                                              onChange={(e) => {
+                                                const nextOpts = [
+                                                  partOpts[0] || '',
+                                                  partOpts[1] || '',
+                                                  partOpts[2] || '',
+                                                  partOpts[3] || '',
+                                                ];
+                                                nextOpts[lIdx] = e.target.value;
+                                                handleUpdateQuestionPart(part.id, {
+                                                  options: nextOpts,
+                                                });
+                                              }}
+                                              placeholder={`Možnost ${letter}`}
+                                              className="w-full bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
+                                            />
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+
+                                  {part.type === 'open_text' && (
+                                    <div>
+                                      <label className="block text-[10px] font-semibold uppercase tracking-wider text-emerald-400 mb-1">
+                                        Pravilen odgovor za {part.label || `Del #${pIdx + 1}`}
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={part.correct_answer}
+                                        onChange={(e) =>
+                                          handleUpdateQuestionPart(part.id, {
+                                            correct_answer: e.target.value,
+                                          })
+                                        }
+                                        placeholder="Vpišite pravilen besedilni odgovor..."
+                                        className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-emerald-500"
+                                      />
+                                    </div>
+                                  )}
+
+                                  {part.type === 'closest_number' && (
+                                    <div>
+                                      <label className="block text-[10px] font-semibold uppercase tracking-wider text-violet-400 mb-1">
+                                        Pravilna številka za {part.label || `Del #${pIdx + 1}`}
+                                      </label>
+                                      <input
+                                        type="number"
+                                        step="any"
+                                        value={part.correct_answer}
+                                        onChange={(e) =>
+                                          handleUpdateQuestionPart(part.id, {
+                                            correct_answer: e.target.value,
+                                          })
+                                        }
+                                        placeholder="npr. 1991"
+                                        className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-mono-code text-slate-100 focus:outline-none focus:border-violet-500"
+                                      />
+                                    </div>
+                                  )}
+
+                                  {part.type === 'closest_date' && (
+                                    <div className="space-y-1">
+                                      <label className="block text-[10px] font-semibold uppercase tracking-wider text-cyan-400">
+                                        Pravilen datum za {part.label || `Del #${pIdx + 1}`}
+                                      </label>
+                                      <input
+                                        type="date"
+                                        value={part.correct_answer}
+                                        onChange={(e) =>
+                                          handleUpdateQuestionPart(part.id, {
+                                            correct_answer: e.target.value,
+                                          })
+                                        }
+                                        className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-mono-code text-slate-100 focus:outline-none focus:border-cyan-500"
+                                      />
+                                      {part.correct_answer && (
+                                        <p className="text-[11px] text-cyan-300 font-semibold">
+                                          📅 Izbrano: {formatSloveneDate(part.correct_answer)}
+                                        </p>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                      <button
+                        id="add-question-part-btn"
+                        type="button"
+                        onClick={handleAddQuestionPart}
+                        className="w-full py-2.5 px-3.5 rounded-xl text-xs font-semibold bg-fuchsia-500/15 hover:bg-fuchsia-500/25 text-fuchsia-200 border border-fuchsia-500/35 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        <Plus className="w-4 h-4 text-fuchsia-300" />
+                        <span>+ Dodaj dodaten del vprašanja (podvprašanje)</span>
+                      </button>
+                    </div>
+                  </>
+                )}
 
               {/* Točke in časovnik */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
                 <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
                   <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-300">
                     <Trophy className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Točke za pravilen odgovor</span>
+                    <span>
+                      {currentSlide.question_parts &&
+                      currentSlide.question_parts.length > 0
+                        ? 'Skupaj točk slajda (vsota delov)'
+                        : 'Točke za pravilen odgovor'}
+                    </span>
                   </label>
                   <input
                     id="slide-points-input"
                     type="number"
                     min={0}
-                    step="0.5"
+                    step="0.25"
+                    disabled={Boolean(
+                      currentSlide.question_parts &&
+                        currentSlide.question_parts.length > 0
+                    )}
                     value={currentSlide.points}
                     onChange={(e) =>
                       updateLocalSlideField(
                         'points',
-                        Math.max(0, parseFloat(e.target.value || '0'))
+                        Math.max(0, roundPoints(parseFloat(e.target.value || '0')))
                       )
                     }
-                    className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-sm font-bold text-emerald-400 focus:outline-none focus:border-indigo-500"
+                    className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-sm font-bold text-emerald-400 disabled:opacity-70 focus:outline-none focus:border-indigo-500"
                   />
                   <p className="text-[11px] text-slate-500">
-                    Ob aktiviranem Jokerju v tej temi se točke podvojijo (2x).
+                    Korak 0.25 točke. Ob aktiviranem Jokerju v tej temi se točke podvojijo (2x).
                   </p>
                 </div>
 
