@@ -119,7 +119,11 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw) as StoredPlayerSession;
-          if (parsed.sessionId && parsed.playerId && parsed.reconnectToken) {
+          const urlRoomCode = initialRoomCode?.trim() || '';
+          const isDifferentRoomInUrl =
+            urlRoomCode.length > 0 && parsed.roomCode && parsed.roomCode !== urlRoomCode;
+
+          if (!isDifferentRoomInUrl && parsed.sessionId && parsed.playerId && parsed.reconnectToken) {
             const reconnected = await reconnectPlayer(
               parsed.sessionId,
               parsed.playerId,
@@ -147,7 +151,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     };
 
     attemptReconnect();
-  }, []);
+  }, [initialRoomCode]);
 
   const [refreshing, setRefreshing] = useState(false);
 
@@ -404,20 +408,11 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         return;
       }
 
-      // Eksplicitno poišči sejo v Supabase po 4-mestni kodi
-      const { data: sessionData, error: sessionErr } = await supabase
-        .from('game_sessions')
-        .select('*')
-        .eq('room_code', code.trim())
-        .single();
-
-      const session = sessionData || (await findSessionByRoomCode(code));
-      if (sessionErr || !session) {
-        const errDetails = sessionErr
-          ? ` (${sessionErr.message}${sessionErr.details ? ` — ${sessionErr.details}` : ''})`
-          : '';
+      // Poišči najnovejšo sejo v Supabase po 4-mestni kodi
+      const session = await findSessionByRoomCode(code);
+      if (!session) {
         setJoinError(
-          `Soba s kodo "${code}" ni bila najdena v Supabase tabeli game_sessions${errDetails}. Preverite kodo na glavnem zaslonu.`
+          `Soba s kodo "${code}" ni bila najdena v Supabase tabeli game_sessions. Preverite kodo na glavnem zaslonu.`
         );
         return;
       }
@@ -427,7 +422,24 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         return;
       }
 
-      const player = await joinSessionAsPlayer(session.id, cleanNick);
+      // Če ima naprava v localStorage že shranjen veljaven reconnect_token za to sejo,
+      // obnovi obstoječega igralca, da nikoli ne ustvari podvojenega zapisa v tabeli players.
+      let player = null;
+      try {
+        const existingRaw = localStorage.getItem(LOCAL_STORAGE_KEY);
+        if (existingRaw) {
+          const parsed = JSON.parse(existingRaw) as StoredPlayerSession;
+          if (parsed.sessionId === session.id && parsed.playerId && parsed.reconnectToken) {
+            player = await reconnectPlayer(session.id, parsed.playerId, parsed.reconnectToken);
+          }
+        }
+      } catch {
+        // ignore parse error
+      }
+
+      if (!player) {
+        player = await joinSessionAsPlayer(session.id, cleanNick);
+      }
 
       // Shrani v localStorage za odpornost na prekinitev / reload
       const stored: StoredPlayerSession = {

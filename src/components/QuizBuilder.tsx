@@ -312,6 +312,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
           timer_seconds: currentSlide.timer_seconds,
           slide_image_url: currentSlide.slide_image_url,
           order_index: currentSlide.order_index,
+          question_parts: currentSlide.question_parts,
         });
       }
 

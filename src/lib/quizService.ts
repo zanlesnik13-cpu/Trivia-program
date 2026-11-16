@@ -238,7 +238,11 @@ export async function upsertFullQuiz(
       const slideType: SlideType = s.slide_type || 'multiple_choice';
       const normalizedParts = normalizeQuestionParts(s.question_parts);
       const computedPoints = normalizedParts
-        ? roundPoints(normalizedParts.reduce((sum, p) => sum + Number(p.points || 0), 0))
+        ? roundPoints(
+            normalizedParts
+              .filter((p) => !p.is_bonus)
+              .reduce((sum, p) => sum + Number(p.points || 0), 0)
+          )
         : roundPoints(
             s.points ?? (slideType === 'theme_intro' || slideType === 'info_only' ? 0 : 1)
           );
@@ -370,13 +374,15 @@ export async function ensureQuizSyncedToSupabase(quizId: string, _hostId?: strin
   }
 }
 
-export async function fetchHostQuizzes(_hostId: string): Promise<QuizWithStats[]> {
+export async function fetchHostQuizzes(hostId: string): Promise<QuizWithStats[]> {
   const supabase = requireSupabaseClient();
+  const effectiveHostId = resolveHostId(hostId);
 
-  // Preberi vse kvize v Supabase bazi (tako za trenutnega gostitelja kot za gostujoči/demo način)
+  // Preberi kvize trenutnega gostitelja iz Supabase baze
   const { data: quizzes, error } = await supabase
     .from('quizzes')
     .select('*')
+    .eq('host_id', effectiveHostId)
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -1380,10 +1386,11 @@ export async function togglePlayerJoker(
     .eq('player_id', playerId)
     .eq('theme_id', themeId);
 
+  let isActivated = false;
   if (existingRows && existingRows.length > 0) {
     const ids = existingRows.map((r) => r.id);
     await supabase.from('player_jokers').delete().in('id', ids);
-    return false;
+    isActivated = false;
   } else {
     const { error } = await supabase.from('player_jokers').insert({
       id: crypto.randomUUID(),
@@ -1394,8 +1401,43 @@ export async function togglePlayerJoker(
     if (error) {
       throw formatSupabaseError(error, 'Napaka pri vklopu Jokerja v tabeli "player_jokers"');
     }
-    return true;
+    isActivated = true;
   }
+
+  // Sinhroniziraj players.jokers_remaining z dejanskim številom porabljenih Jokerjev v seji
+  const { data: sData } = await supabase
+    .from('game_sessions')
+    .select('quiz_id')
+    .eq('id', sessionId)
+    .maybeSingle();
+
+  let maxJokers = 1;
+  if (sData?.quiz_id) {
+    const { data: qData } = await supabase
+      .from('quizzes')
+      .select('max_jokers_per_player')
+      .eq('id', sData.quiz_id)
+      .maybeSingle();
+    if (qData?.max_jokers_per_player !== undefined) {
+      maxJokers = Number(qData.max_jokers_per_player);
+    }
+  }
+
+  const { data: allUsedJokers } = await supabase
+    .from('player_jokers')
+    .select('theme_id')
+    .eq('session_id', sessionId)
+    .eq('player_id', playerId);
+
+  const uniqueUsedThemes = new Set((allUsedJokers || []).map((j) => j.theme_id));
+  const nextRemaining = Math.max(0, maxJokers - uniqueUsedThemes.size);
+
+  await supabase
+    .from('players')
+    .update({ jokers_remaining: nextRemaining })
+    .eq('id', playerId);
+
+  return isActivated;
 }
 
 export async function submitDemoAnswer(
@@ -1840,7 +1882,9 @@ export async function findSessionByRoomCode(roomCode: string): Promise<GameSessi
     .from('game_sessions')
     .select('*')
     .eq('room_code', cleanCode)
-    .single();
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
   if (error || !data) return null;
   return data as GameSession;
@@ -2130,6 +2174,7 @@ export async function savePlayerAnswer(
       answer_text: cleanAns,
       is_correct: false,
       awarded_points: 0,
+      bonus_points: 0,
       graded: false,
     },
     'Napaka pri shranjevanju odgovora v tabelo "answers"'
