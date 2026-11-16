@@ -606,12 +606,16 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
     updateLocalSlideField('options', nextOptions);
   };
 
-  // Posodobi polje question_parts in samodejno preračunaj skupne točke slajda
+  // Posodobi polje question_parts in samodejno preračunaj redne točke slajda (brez bonus delov, ki ne štejejo v 2x Joker)
   const updateLocalQuestionParts = (nextParts: QuestionPart[] | null) => {
     if (!currentTheme || !currentSlide) return;
     const cleaned = nextParts && nextParts.length > 0 ? nextParts : null;
-    const sumPoints = cleaned
-      ? roundPoints(cleaned.reduce((acc, p) => acc + Number(p.points || 0), 0))
+    const regularSumPoints = cleaned
+      ? roundPoints(
+          cleaned
+            .filter((p) => !p.is_bonus)
+            .reduce((acc, p) => acc + Number(p.points || 0), 0)
+        )
       : currentSlide.points;
     setSlidesByTheme((prev) => ({
       ...prev,
@@ -620,15 +624,15 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
           ? {
               ...s,
               question_parts: cleaned,
-              points: cleaned ? sumPoints : s.points,
+              points: cleaned ? regularSumPoints : s.points,
             }
           : s
       ),
     }));
   };
 
-  // Dodaj nov del vprašanja (če je trenutno klasično enodelno vprašanje, ustvari Del 1 iz trenutnih nastavitev + Del 2)
-  const handleAddQuestionPart = () => {
+  // Dodaj nov del vprašanja ali bonus vprašanje (če je trenutno klasično enodelno vprašanje, ustvari Del 1 iz trenutnih nastavitev + novi del)
+  const handleAddQuestionPart = (isBonus: boolean = false) => {
     if (!currentSlide) return;
     const existing = currentSlide.question_parts || [];
     if (existing.length === 0) {
@@ -641,7 +645,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
           : 'open_text';
       const part1: QuestionPart = {
         id: crypto.randomUUID(),
-        label: 'Del 1',
+        label: isBonus ? 'Glavno vprašanje' : 'Del 1',
         type: firstType,
         ...(firstType === 'multiple_choice'
           ? {
@@ -655,22 +659,31 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
           : {}),
         correct_answer: currentSlide.correct_answer || '',
         points: roundPoints(currentSlide.points || 1),
+        is_bonus: false,
       };
       const part2: QuestionPart = {
         id: crypto.randomUUID(),
-        label: 'Del 2',
+        label: isBonus ? 'Bonus vprašanje' : 'Del 2',
         type: 'open_text',
         correct_answer: '',
-        points: 1,
+        points: isBonus ? 0.5 : 1,
+        is_bonus: isBonus,
       };
       updateLocalQuestionParts([part1, part2]);
     } else {
+      const regularCount = existing.filter((p) => !p.is_bonus).length;
+      const bonusCount = existing.filter((p) => Boolean(p.is_bonus)).length;
       const nextPart: QuestionPart = {
         id: crypto.randomUUID(),
-        label: `Del ${existing.length + 1}`,
+        label: isBonus
+          ? bonusCount === 0
+            ? 'Bonus vprašanje'
+            : `Bonus vprašanje ${bonusCount + 1}`
+          : `Del ${regularCount + 1}`,
         type: 'open_text',
         correct_answer: '',
-        points: 1,
+        points: isBonus ? 0.5 : 1,
+        is_bonus: isBonus,
       };
       updateLocalQuestionParts([...existing, nextPart]);
     }
@@ -693,8 +706,8 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
     if (!currentSlide || !currentSlide.question_parts) return;
     const remaining = currentSlide.question_parts.filter((p) => p.id !== partId);
     if (remaining.length <= 1) {
-      // Če ostane le še 1 del (ali 0), lahko preklopimo nazaj na klasično enodelno vprašanje
-      if (remaining.length === 1) {
+      // Če ostane le še 1 redni del (brez bonus lastnosti), preklopimo nazaj na klasično enodelno vprašanje
+      if (remaining.length === 1 && !remaining[0].is_bonus) {
         const last = remaining[0];
         if (!currentTheme) return;
         setSlidesByTheme((prev) => ({
@@ -722,8 +735,10 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
         }));
         return;
       }
-      updateLocalQuestionParts(null);
-      return;
+      if (remaining.length === 0) {
+        updateLocalQuestionParts(null);
+        return;
+      }
     }
     updateLocalQuestionParts(remaining);
   };
@@ -1222,6 +1237,11 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                                 {roundPoints(slide.points)} t
                               </span>
                             )}
+                          {slide.question_parts?.some((p) => p.is_bonus) && (
+                            <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-bold">
+                              ⭐ Bonus
+                            </span>
+                          )}
                         </div>
                         <p className="text-xs text-slate-300 truncate">
                           {slide.question_text || (
@@ -1554,13 +1574,13 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                       </>
                     )}
 
-                    {/* VEČDELNA VPRAŠANJA (question_parts) */}
+                    {/* VEČDELNA VPRAŠANJA IN BONUS VPRAŠANJA (question_parts) */}
                     <div className="space-y-3 pt-2 border-t border-slate-800/80">
                       <div className="flex items-center justify-between gap-2 flex-wrap">
                         <div className="flex items-center gap-2">
                           <Layers className="w-4 h-4 text-fuchsia-400" />
                           <span className="text-xs font-bold uppercase tracking-wider text-fuchsia-300">
-                            Večdelno vprašanje (podvprašanja na istem slajdu)
+                            Podvprašanja &amp; ⭐ Bonus vprašanje na slajdu
                           </span>
                         </div>
                         {currentSlide.question_parts &&
@@ -1580,15 +1600,55 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                           <div className="space-y-3">
                             {currentSlide.question_parts.map((part, pIdx) => {
                               const partOpts = part.options || ['', '', '', ''];
+                              const isBonusPart = Boolean(part.is_bonus);
                               return (
                                 <div
                                   key={part.id}
-                                  className="p-3.5 rounded-2xl bg-slate-950/90 border border-fuchsia-500/30 space-y-3"
+                                  className={`p-3.5 rounded-2xl space-y-3 border transition-all ${
+                                    isBonusPart
+                                      ? 'bg-amber-500/10 border-amber-500/50 shadow-md shadow-amber-950/30'
+                                      : 'bg-slate-950/90 border-fuchsia-500/30'
+                                  }`}
                                 >
-                                  <div className="flex items-center justify-between gap-2">
-                                    <span className="px-2 py-0.5 rounded-md bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 text-[11px] font-bold">
-                                      Del #{pIdx + 1}
-                                    </span>
+                                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span
+                                        className={`px-2 py-0.5 rounded-md text-[11px] font-bold border ${
+                                          isBonusPart
+                                            ? 'bg-amber-500 text-slate-950 border-amber-400'
+                                            : 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30'
+                                        }`}
+                                      >
+                                        {isBonusPart
+                                          ? '⭐ BONUS VPRAŠANJE'
+                                          : `Del #${pIdx + 1}`}
+                                      </span>
+                                      <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-200 cursor-pointer select-none px-2 py-0.5 rounded-lg bg-slate-900/90 border border-amber-500/30 hover:border-amber-400">
+                                        <input
+                                          type="checkbox"
+                                          checked={isBonusPart}
+                                          onChange={(e) => {
+                                            const checked = e.target.checked;
+                                            handleUpdateQuestionPart(part.id, {
+                                              is_bonus: checked,
+                                              label:
+                                                checked &&
+                                                (!part.label ||
+                                                  part.label.startsWith('Del '))
+                                                  ? 'Bonus vprašanje'
+                                                  : !checked &&
+                                                    part.label === 'Bonus vprašanje'
+                                                  ? `Del ${pIdx + 1}`
+                                                  : part.label,
+                                            });
+                                          }}
+                                          className="rounded border-amber-500 text-amber-500 focus:ring-amber-500 cursor-pointer"
+                                        />
+                                        <span>
+                                          ⭐ Bonus vprašanje (točke se ne podvojijo z Jokerjem)
+                                        </span>
+                                      </label>
+                                    </div>
                                     <button
                                       type="button"
                                       onClick={() => handleRemoveQuestionPart(part.id)}
@@ -1602,7 +1662,9 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                                   <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
                                     <div className="sm:col-span-5">
                                       <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">
-                                        Oznaka / podvprašanje
+                                        {isBonusPart
+                                          ? 'Besedilo / oznaka bonus vprašanja'
+                                          : 'Oznaka / podvprašanje'}
                                       </label>
                                       <input
                                         type="text"
@@ -1612,8 +1674,16 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                                             label: e.target.value,
                                           })
                                         }
-                                        placeholder={`npr. Del ${pIdx + 1}: Ime dogodka`}
-                                        className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-semibold text-slate-100 focus:outline-none focus:border-fuchsia-500"
+                                        placeholder={
+                                          isBonusPart
+                                            ? 'npr. Bonus: Kdo je zložil glasbo?'
+                                            : `npr. Del ${pIdx + 1}: Ime dogodka`
+                                        }
+                                        className={`w-full px-3 py-2 rounded-xl bg-slate-900 border text-xs font-semibold text-slate-100 focus:outline-none ${
+                                          isBonusPart
+                                            ? 'border-amber-500/40 focus:border-amber-400'
+                                            : 'border-slate-800 focus:border-fuchsia-500'
+                                        }`}
                                       />
                                     </div>
 
@@ -1639,7 +1709,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
                                     <div className="sm:col-span-3">
                                       <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">
-                                        Točke za ta del
+                                        {isBonusPart ? '⭐ Bonus točke' : 'Točke za ta del'}
                                       </label>
                                       <input
                                         type="number"
@@ -1654,7 +1724,11 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                                             ),
                                           })
                                         }
-                                        className="w-full px-2.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-bold text-emerald-400 focus:outline-none focus:border-fuchsia-500"
+                                        className={`w-full px-2.5 py-2 rounded-xl bg-slate-900 border text-xs font-bold focus:outline-none ${
+                                          isBonusPart
+                                            ? 'border-amber-500/40 text-amber-300 focus:border-amber-400'
+                                            : 'border-slate-800 text-emerald-400 focus:border-fuchsia-500'
+                                        }`}
                                       />
                                     </div>
                                   </div>
@@ -1779,15 +1853,27 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                           </div>
                         )}
 
-                      <button
-                        id="add-question-part-btn"
-                        type="button"
-                        onClick={handleAddQuestionPart}
-                        className="w-full py-2.5 px-3.5 rounded-xl text-xs font-semibold bg-fuchsia-500/15 hover:bg-fuchsia-500/25 text-fuchsia-200 border border-fuchsia-500/35 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
-                      >
-                        <Plus className="w-4 h-4 text-fuchsia-300" />
-                        <span>+ Dodaj dodaten del vprašanja (podvprašanje)</span>
-                      </button>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <button
+                          id="add-question-part-btn"
+                          type="button"
+                          onClick={() => handleAddQuestionPart(false)}
+                          className="w-full py-2.5 px-3 rounded-xl text-xs font-semibold bg-fuchsia-500/15 hover:bg-fuchsia-500/25 text-fuchsia-200 border border-fuchsia-500/35 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                        >
+                          <Plus className="w-4 h-4 text-fuchsia-300 shrink-0" />
+                          <span>+ Dodaj dodaten del vprašanja (podvprašanje)</span>
+                        </button>
+
+                        <button
+                          id="add-bonus-question-part-btn"
+                          type="button"
+                          onClick={() => handleAddQuestionPart(true)}
+                          className="w-full py-2.5 px-3 rounded-xl text-xs font-bold bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/50 flex items-center justify-center gap-1.5 shadow-md shadow-amber-950/30 transition-all cursor-pointer"
+                        >
+                          <Sparkles className="w-4 h-4 text-amber-300 shrink-0" />
+                          <span>+ ⭐ Dodaj bonus vprašanje (ne šteje v 2x Joker)</span>
+                        </button>
+                      </div>
                     </div>
                   </>
                 )}
@@ -1800,7 +1886,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                     <span>
                       {currentSlide.question_parts &&
                       currentSlide.question_parts.length > 0
-                        ? 'Skupaj točk slajda (vsota delov)'
+                        ? 'Redne točke slajda (brez bonus vprašanja)'
                         : 'Točke za pravilen odgovor'}
                     </span>
                   </label>
@@ -1823,7 +1909,7 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                     className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-sm font-bold text-emerald-400 disabled:opacity-70 focus:outline-none focus:border-indigo-500"
                   />
                   <p className="text-[11px] text-slate-500">
-                    Korak 0.25 točke. Ob aktiviranem Jokerju v tej temi se točke podvojijo (2x).
+                    Korak 0.25 točke. Ob aktiviranem Jokerju v tej temi se podvojijo (2x) samo redne točke, ⭐ bonus vprašanje pa ne.
                   </p>
                 </div>
 

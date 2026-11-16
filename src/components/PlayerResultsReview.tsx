@@ -3,6 +3,7 @@ import {
   calculateDateDiffDays,
   formatDaysDeviationLabel,
   formatSloveneDate,
+  getSlideRegularPointsSum,
   isMultiPartSlide,
   parseMultiPartAnswer,
 } from '../lib/questionUtils';
@@ -50,7 +51,7 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
           0
         );
         const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
-        const maxSum = questions.reduce((acc, q) => acc + Number(q.points ?? 0), 0);
+        const maxSum = questions.reduce((acc, q) => acc + getSlideRegularPointsSum(q), 0);
 
         return (
           <div key={theme.id} className="space-y-2.5">
@@ -103,6 +104,7 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
                     {multiPart && q.question_parts ? (
                       <div className="space-y-1.5 pt-0.5">
                         {q.question_parts.map((part, pIdx) => {
+                          const isBonus = Boolean(part.is_bonus);
                           const rawAns = parsedMulti?.values[part.id] || '';
                           const partPts = parsedMulti?.partScores[part.id];
                           const displayAns = rawAns
@@ -123,15 +125,32 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
                           return (
                             <div
                               key={part.id}
-                              className="p-2 rounded-xl bg-slate-900/80 border border-slate-800/80 space-y-1"
+                              className={`p-2 rounded-xl border space-y-1 ${
+                                isBonus
+                                  ? 'bg-amber-950/35 border-amber-400/50'
+                                  : 'bg-slate-900/80 border-slate-800/80'
+                              }`}
                             >
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="font-bold text-fuchsia-300">
-                                  {part.label || `Del ${pIdx + 1}`}
+                              <div className="flex items-center justify-between gap-2 flex-wrap">
+                                <span
+                                  className={`font-bold flex items-center gap-1.5 flex-wrap ${
+                                    isBonus ? 'text-amber-200' : 'text-fuchsia-300'
+                                  }`}
+                                >
+                                  {isBonus && (
+                                    <span className="px-1.5 py-0.2 rounded bg-amber-400 text-slate-950 text-[9px] font-black uppercase">
+                                      ⭐ BONUS VPRAŠANJE
+                                    </span>
+                                  )}
+                                  <span>{part.label || `Del ${pIdx + 1}`}</span>
                                 </span>
-                                <span className="font-mono-code font-bold text-emerald-400">
+                                <span
+                                  className={`font-mono-code font-bold ${
+                                    isBonus ? 'text-amber-300' : 'text-emerald-400'
+                                  }`}
+                                >
                                   {partPts !== undefined ? `${fmt(partPts)} / ` : ''}
-                                  {fmt(part.points)} t
+                                  {fmt(part.points)} t{isBonus ? ' ⭐' : ''}
                                 </span>
                               </div>
                               <div className="flex justify-between gap-2">

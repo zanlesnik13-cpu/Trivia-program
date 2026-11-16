@@ -115,11 +115,17 @@ function normalizeQuestionParts(raw: unknown): QuestionPart[] | null {
     }
     parts.push({
       id: typeof obj.id === 'string' && obj.id.trim() ? obj.id.trim() : `part-${idx + 1}`,
-      label: typeof obj.label === 'string' ? obj.label : `Del ${idx + 1}`,
+      label:
+        typeof obj.label === 'string'
+          ? obj.label
+          : obj.is_bonus
+          ? 'Bonus vprašanje'
+          : `Del ${idx + 1}`,
       type,
       ...(options ? { options } : {}),
       correct_answer: typeof obj.correct_answer === 'string' ? obj.correct_answer : '',
-      points: roundPoints(obj.points !== undefined ? Number(obj.points) : 1),
+      points: roundPoints(obj.points !== undefined ? Number(obj.points) : obj.is_bonus ? 0.5 : 1),
+      ...(obj.is_bonus !== undefined ? { is_bonus: Boolean(obj.is_bonus) } : {}),
     });
   });
   return parts.length > 0 ? parts : null;
@@ -1476,13 +1482,14 @@ export async function autoPreGradeTheme(
     answerText: string;
     isCorrect: boolean;
     awardedPoints: number;
+    bonusPoints?: number;
   }> = [];
 
   for (const slide of questionSlides) {
     const slideAnswers = existingAnswers.filter((a) => a.slide_id === slide.id);
     if (slideAnswers.length === 0) continue;
 
-    // 1. Večdelno vprašanje (question_parts)
+    // 1. Večdelno vprašanje (question_parts) — vključuje redne in opcijske bonus dele (is_bonus: true)
     if (isMultiPartSlide(slide) && slide.question_parts) {
       const parts = slide.question_parts;
       // Za dele tipa closest_number in closest_date najprej izračunaj minimalno razliko med vsemi igralci
@@ -1523,14 +1530,17 @@ export async function autoPreGradeTheme(
         }
       }
 
+      const hasAnyBonusPart = parts.some((p) => Boolean(p.is_bonus));
+
       for (const ans of slideAnswers) {
         if (ans.graded) continue;
         const { values, partScores: existingPartScores } = parseMultiPartAnswer(ans.answer_text);
         const computedPartScores: Record<string, number> = { ...existingPartScores };
-        let totalAwarded = 0;
+        let totalRegularAwarded = 0;
+        let totalBonusAwarded = 0;
 
         for (const part of parts) {
-          const partMaxPts = roundPoints(part.points ?? 1);
+          const partMaxPts = roundPoints(part.points ?? (part.is_bonus ? 0.5 : 1));
           const rawVal = (values[part.id] || '').trim();
           const partCorrect = (part.correct_answer || '').trim();
           let partScore = 0;
@@ -1568,17 +1578,23 @@ export async function autoPreGradeTheme(
           }
 
           computedPartScores[part.id] = roundPoints(partScore);
-          totalAwarded += computedPartScores[part.id];
+          if (part.is_bonus) {
+            totalBonusAwarded += computedPartScores[part.id];
+          } else {
+            totalRegularAwarded += computedPartScores[part.id];
+          }
         }
 
-        const finalAwarded = roundPoints(totalAwarded);
+        const finalRegularAwarded = roundPoints(totalRegularAwarded);
+        const finalBonusAwarded = roundPoints(totalBonusAwarded);
         const updatedJson = serializeMultiPartAnswer(values, computedPartScores);
         updatesToSave.push({
           playerId: ans.player_id,
           slideId: slide.id,
           answerText: updatedJson,
-          isCorrect: finalAwarded > 0,
-          awardedPoints: finalAwarded,
+          isCorrect: finalRegularAwarded > 0 || finalBonusAwarded > 0,
+          awardedPoints: finalRegularAwarded,
+          ...(hasAnyBonusPart ? { bonusPoints: finalBonusAwarded } : {}),
         });
       }
       continue;
@@ -1699,7 +1715,9 @@ export async function autoPreGradeTheme(
       item.slideId,
       item.answerText,
       item.isCorrect,
-      item.awardedPoints
+      item.awardedPoints,
+      undefined,
+      item.bonusPoints
     );
   }
 }

@@ -286,22 +286,21 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   // AKCIJE DALJINSKEGA UPRAVLJALNIKA
   // ---------------------------------------------------------------------------
 
-  // 1. Iz Lobbyja -> Začni 1. tematiko (theme_intro)
+  // 1. Iz Lobbyja -> Začni 1. tematiko (vedno prični pri 1. slajdu po order_index = 0!)
   const handleStartFirstTheme = async () => {
     if (!data) return;
     const firstTheme = data.themes[0] || null;
     const firstThemeSlides = firstTheme ? data.slidesByTheme[firstTheme.id] || [] : [];
-    const introSlide =
-      firstThemeSlides.find((s) => s.slide_type === 'theme_intro') ||
-      firstThemeSlides[0] ||
-      null;
+    const firstSlide = firstThemeSlides[0] || null;
+    const initialStatus: GameSessionStatus =
+      firstSlide?.slide_type === 'theme_intro' ? 'theme_intro' : 'active_theme';
 
     setActionLoading(true);
     try {
       await updateGameSession(sessionId, {
-        status: 'theme_intro',
+        status: initialStatus,
         current_theme_id: firstTheme?.id || null,
-        current_slide_id: introSlide?.id || null,
+        current_slide_id: firstSlide?.id || null,
         max_slide_index_reached: 0,
         timer_started_at: null,
         timer_duration: 0,
@@ -314,40 +313,32 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // 2. Iz theme_intro -> Začni z vprašanji tematike (active_theme)
+  // 2. Iz theme_intro -> Naprej na naslednji slajd v tematiki (ali zaključi tematiko, če je to zadnji slajd)
   const handleStartThemeQuestions = async () => {
     if (!data || !data.currentTheme) return;
     const slides = data.slidesByTheme[data.currentTheme.id] || [];
-    // Če je 1. slajd tipa 'theme_intro' in obstaja naslednji slajd, odpri 1. vprašanje, sicer 1. slajd
-    const firstQuestionIndex =
-      slides.length > 1 && slides[0].slide_type === 'theme_intro' ? 1 : 0;
-    const targetSlide = slides[firstQuestionIndex] || slides[0] || null;
+    const nextIndex = currentSlideIndex >= 0 ? currentSlideIndex + 1 : 0;
 
-    setActionLoading(true);
-    try {
-      await updateGameSession(sessionId, {
-        status: 'active_theme',
-        current_slide_id: targetSlide?.id || null,
-        max_slide_index_reached: firstQuestionIndex,
-        timer_started_at: null,
-        timer_duration: 0,
-      });
-      await loadData();
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Napaka pri prehodu na vprašanja.');
-    } finally {
-      setActionLoading(false);
+    if (nextIndex >= slides.length) {
+      await handleFinishThemeAndGrade();
+      return;
     }
+
+    await handleGoToSlide(nextIndex);
   };
 
-  // 3. Premik na prejšnji ali naslednji slajd v active_theme
+  // 3. Premik na prejšnji ali naslednji slajd (avtomatsko preklopi med 'theme_intro' in 'active_theme' glede na slide_type)
   const handleGoToSlide = async (targetIndex: number) => {
     if (targetIndex < 0 || targetIndex >= currentThemeSlides.length || !data) return;
     const targetSlide = currentThemeSlides[targetIndex];
+    const nextStatus: GameSessionStatus =
+      targetSlide.slide_type === 'theme_intro' ? 'theme_intro' : 'active_theme';
+
     setActionLoading(true);
     try {
       const maxIndex = Math.max(data.session.max_slide_index_reached, targetIndex);
       await updateGameSession(sessionId, {
+        status: nextStatus,
         current_slide_id: targetSlide.id,
         max_slide_index_reached: maxIndex,
         timer_started_at: null,
@@ -522,7 +513,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // Ocenjevanje posameznega podvprašanja pri večdelnem slajdu (question_parts)
+  // Ocenjevanje posameznega podvprašanja pri večdelnem slajdu (question_parts — redni deli gredo v awarded_points, is_bonus deli gredo v bonus_points)
   const handleGradeQuestionPart = async (
     playerId: string,
     slide: Slide,
@@ -540,8 +531,14 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     );
     nextPartScores[partId] = safePartPts;
 
-    const totalAwarded = roundPoints(
-      parts.reduce((sum, p) => sum + roundPoints(Number(nextPartScores[p.id] ?? 0)), 0)
+    const regularParts = parts.filter((p) => !p.is_bonus);
+    const bonusParts = parts.filter((p) => Boolean(p.is_bonus));
+
+    const totalRegularAwarded = roundPoints(
+      regularParts.reduce((sum, p) => sum + roundPoints(Number(nextPartScores[p.id] ?? 0)), 0)
+    );
+    const totalBonusAwarded = roundPoints(
+      bonusParts.reduce((sum, p) => sum + roundPoints(Number(nextPartScores[p.id] ?? 0)), 0)
     );
     const updatedAnswerText = serializeMultiPartAnswer(parsed.values, nextPartScores);
 
@@ -549,10 +546,10 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       playerId,
       slide,
       existingAnswer,
-      totalAwarded > 0,
-      totalAwarded,
+      totalRegularAwarded > 0 || totalBonusAwarded > 0,
+      totalRegularAwarded,
       undefined,
-      undefined,
+      bonusParts.length > 0 ? totalBonusAwarded : undefined,
       updatedAnswerText
     );
   };
@@ -616,7 +613,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // 8. Nadaljuj na naslednjo tematiko ali zaključi kviz
+  // 8. Nadaljuj na naslednjo tematiko ali zaključi kviz (vedno začni pri 1. slajdu po order_index = 0!)
   const handleNextThemeOrFinish = async (forceFinish: boolean = false) => {
     if (!data) return;
     const currentThemeIndex = data.themes.findIndex((t) => t.id === data.currentTheme?.id);
@@ -638,15 +635,16 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
 
     const nextSlides = data.slidesByTheme[nextTheme.id] || [];
-    const introSlide =
-      nextSlides.find((s) => s.slide_type === 'theme_intro') || nextSlides[0] || null;
+    const firstSlide = nextSlides[0] || null;
+    const nextStatus: GameSessionStatus =
+      firstSlide?.slide_type === 'theme_intro' ? 'theme_intro' : 'active_theme';
 
     setActionLoading(true);
     try {
       await updateGameSession(sessionId, {
-        status: 'theme_intro',
+        status: nextStatus,
         current_theme_id: nextTheme.id,
-        current_slide_id: introSlide?.id || null,
+        current_slide_id: firstSlide?.id || null,
         max_slide_index_reached: 0,
         timer_started_at: null,
         timer_duration: 0,
@@ -943,21 +941,38 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         {session.status === 'theme_intro' && currentTheme && (
           <div className="space-y-4">
             <div className="bg-slate-900/80 backdrop-blur-xl border border-amber-500/40 rounded-2xl p-5 space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 text-xs font-bold">
                   <Sparkles className="w-3.5 h-3.5" />
                   <span>Tematika {currentThemeIndex + 1} od {data.themes.length}</span>
                 </span>
-                <span className="text-xs text-slate-400 font-semibold">
-                  Joker korak (2x točke)
-                </span>
+                <div className="flex items-center gap-2">
+                  {currentThemeSlides.length > 0 && (
+                    <span className="px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-[11px] font-mono-code font-bold text-slate-300">
+                      Slajd {Math.max(1, currentSlideIndex + 1)} / {currentThemeSlides.length}
+                    </span>
+                  )}
+                  <span className="text-xs text-amber-300 font-semibold">
+                    🃏 Joker korak (2x točke)
+                  </span>
+                </div>
               </div>
+
+              {currentSlide?.slide_image_url && (
+                <div className="w-full h-36 rounded-xl bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center">
+                  <img
+                    src={currentSlide.slide_image_url}
+                    alt={`Slajd ${currentSlideIndex + 1}`}
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+              )}
 
               <h2 className="text-xl font-bold text-slate-100">
                 {currentTheme.title}
               </h2>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Na glavnem zaslonu je prikazan uvod v tematiko. Igralci lahko samo v tem
+                Na glavnem zaslonu je prikazan uvod v tematiko. Igralci lahko v tem
                 koraku na svojih telefonih aktivirajo <strong>Jokerja</strong> za dvojne točke!
               </p>
             </div>
@@ -1014,16 +1029,36 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
               )}
             </div>
 
-            {/* Velik gumb: Začni z vprašanji tematike */}
-            <button
-              id="remote-start-theme-questions-btn"
-              disabled={actionLoading}
-              onClick={handleStartThemeQuestions}
-              className="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-black text-base shadow-xl shadow-indigo-600/30 flex items-center justify-center gap-2.5 transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50"
-            >
-              <span>Začni z vprašanji tematike</span>
-              <ArrowRight className="w-5 h-5" />
-            </button>
+            {/* Navigacija iz theme_intro: Prejšnji slajd (če je pred Jokerjem npr. info_only naslovnica) + Naprej na naslednji slajd */}
+            <div className={`grid gap-3 ${currentSlideIndex > 0 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+              {currentSlideIndex > 0 && (
+                <button
+                  id="remote-prev-from-intro-btn"
+                  type="button"
+                  disabled={actionLoading}
+                  onClick={() => handleGoToSlide(currentSlideIndex - 1)}
+                  className="py-4 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 text-slate-200 font-bold text-sm flex items-center justify-center gap-1.5 border border-slate-700 active:scale-[0.98] transition-all cursor-pointer"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                  <span>Prejšnji slajd</span>
+                </button>
+              )}
+
+              <button
+                id="remote-start-theme-questions-btn"
+                type="button"
+                disabled={actionLoading}
+                onClick={handleStartThemeQuestions}
+                className="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-black text-base shadow-xl shadow-indigo-600/30 flex items-center justify-center gap-2.5 transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50"
+              >
+                <span>
+                  {currentSlideIndex < currentThemeSlides.length - 1
+                    ? 'Začni z vprašanji tematike'
+                    : 'Zaključi tematiko in oceni'}
+                </span>
+                <ArrowRight className="w-5 h-5" />
+              </button>
+            </div>
           </div>
         )}
 
@@ -1038,9 +1073,15 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-xs font-bold font-mono-code">
                   Slajd {currentSlideIndex + 1} / {currentThemeSlides.length}
                 </span>
-                <span className="text-xs font-semibold text-slate-400">
-                  Točke: <strong className="text-emerald-400">{currentSlide.points} t</strong>
-                </span>
+                {currentSlide.slide_type === 'info_only' ? (
+                  <span className="px-2.5 py-1 rounded-lg bg-cyan-500/15 border border-cyan-500/30 text-xs font-bold text-cyan-300">
+                    Info / Naslovni slajd (brez odgovora)
+                  </span>
+                ) : (
+                  <span className="text-xs font-semibold text-slate-400">
+                    Točke: <strong className="text-emerald-400">{currentSlide.points} t</strong>
+                  </span>
+                )}
               </div>
 
               {/* Majhen predogled trenutnega slajda */}
@@ -1054,15 +1095,17 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 </div>
               )}
 
-              {/* Besedilo vprašanja */}
+              {/* Besedilo vprašanja ali info slajda */}
               <div className="space-y-1">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  Vprašanje na slajdu
+                  {currentSlide.slide_type === 'info_only'
+                    ? 'Besedilo / naslov na slajdu'
+                    : 'Vprašanje na slajdu'}
                 </span>
                 <p className="text-sm font-semibold text-slate-100 leading-snug">
                   {currentSlide.question_text || (
                     <span className="italic text-slate-400">
-                      Vprašanje je prikazano na sliki slajda
+                      Vsebina je prikazana na sliki slajda
                     </span>
                   )}
                 </p>
@@ -1106,24 +1149,40 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                     </span>
                   </div>
                   <div className="space-y-1.5">
-                    {(currentSlide.question_parts || []).map((part, pIdx) => (
-                      <div
-                        key={part.id}
-                        className="flex items-center justify-between gap-2 text-xs px-2.5 py-1.5 rounded-lg bg-slate-950/70 border border-slate-800"
-                      >
-                        <span className="text-slate-200 font-semibold truncate">
-                          {part.label || `Del ${pIdx + 1}`}{' '}
-                          <span className="text-[10px] text-slate-400">
-                            ({part.points} t)
+                    {(currentSlide.question_parts || []).map((part, pIdx) => {
+                      const isBonus = Boolean(part.is_bonus);
+                      return (
+                        <div
+                          key={part.id}
+                          className={`flex items-center justify-between gap-2 text-xs px-2.5 py-1.5 rounded-lg border ${
+                            isBonus
+                              ? 'bg-amber-950/40 border-amber-500/40'
+                              : 'bg-slate-950/70 border-slate-800'
+                          }`}
+                        >
+                          <span className="text-slate-200 font-semibold truncate flex items-center gap-1.5">
+                            {isBonus && (
+                              <span className="px-1.5 py-0.2 rounded bg-amber-400 text-slate-950 text-[9px] font-black uppercase shrink-0">
+                                ⭐ BONUS
+                              </span>
+                            )}
+                            <span>{part.label || `Del ${pIdx + 1}`}</span>
+                            <span
+                              className={`text-[10px] ${
+                                isBonus ? 'text-amber-300 font-bold' : 'text-slate-400'
+                              }`}
+                            >
+                              ({part.points} t{isBonus ? ' brez 2x' : ''})
+                            </span>
                           </span>
-                        </span>
-                        <span className="font-mono-code font-black text-emerald-400 shrink-0">
-                          {part.type === 'closest_date'
-                            ? formatSloveneDate(part.correct_answer)
-                            : part.correct_answer || '—'}
-                        </span>
-                      </div>
-                    ))}
+                          <span className="font-mono-code font-black text-emerald-400 shrink-0">
+                            {part.type === 'closest_date'
+                              ? formatSloveneDate(part.correct_answer)
+                              : part.correct_answer || '—'}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               ) : (
@@ -1145,152 +1204,158 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
               )}
             </div>
 
-            {/* Števec oddanih odgovorov na trenutni slajd v živo */}
-            <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl p-4 flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-                  <CheckCircle2 className="w-5 h-5" />
+            {/* Števec oddanih odgovorov na trenutni slajd v živo (prikaži samo, če ni info_only) */}
+            {currentSlide.slide_type !== 'info_only' &&
+              currentSlide.slide_type !== 'theme_intro' && (
+                <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl p-4 flex items-center justify-between">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-9 h-9 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                      <CheckCircle2 className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <p className="text-xs font-bold text-slate-200">
+                        Oddani odgovori na ta slajd
+                      </p>
+                      <p className="text-[11px] text-slate-400">
+                        Ocenjevanje sledi ob zaključku sklopa
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl font-mono-code font-black text-emerald-400">
+                      {answersForCurrentSlide.length} / {players.length}
+                    </span>
+                    {players.length > 0 &&
+                      answersForCurrentSlide.length < players.length && (
+                        <button
+                          type="button"
+                          onClick={handleSimulateAnswersForSlide}
+                          className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-indigo-300 border border-slate-700 cursor-pointer"
+                          title="Simuliraj odgovore igralcev za test ocenjevanja"
+                        >
+                          + Test odgovori
+                        </button>
+                      )}
+                  </div>
                 </div>
-                <div>
-                  <p className="text-xs font-bold text-slate-200">
-                    Oddani odgovori na ta slajd
-                  </p>
-                  <p className="text-[11px] text-slate-400">
-                    Ocenjevanje sledi ob zaključku sklopa
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-xl font-mono-code font-black text-emerald-400">
-                  {answersForCurrentSlide.length} / {players.length}
-                </span>
-                {players.length > 0 &&
-                  answersForCurrentSlide.length < players.length && (
-                    <button
-                      type="button"
-                      onClick={handleSimulateAnswersForSlide}
-                      className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-indigo-300 border border-slate-700 cursor-pointer"
-                      title="Simuliraj odgovore igralcev za test ocenjevanja"
-                    >
-                      + Test odgovori
-                    </button>
-                  )}
-              </div>
-            </div>
+              )}
 
             {/* Nadzor časovnika (Hitri gumbi: 30s, 60s, privzeti in Ustavi) */}
-            <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-300">
-                  <Clock className="w-4 h-4 text-indigo-400" />
-                  <span>Nadzor časovnika (Timer)</span>
-                </div>
-                {timeLeft !== null && session.timer_duration && session.timer_duration > 0 ? (
-                  <span
-                    className={`px-2.5 py-0.5 rounded-full text-xs font-mono-code font-black ${
-                      timeLeft <= 5
-                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse'
-                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                    }`}
-                  >
-                    Odštevanje: {timeLeft}s
-                  </span>
-                ) : (
-                  <span className="text-xs text-slate-500">Časovnik miruje</span>
-                )}
-              </div>
+            {currentSlide.slide_type !== 'info_only' &&
+              currentSlide.slide_type !== 'theme_intro' && (
+                <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-300">
+                      <Clock className="w-4 h-4 text-indigo-400" />
+                      <span>Nadzor časovnika (Timer)</span>
+                    </div>
+                    {timeLeft !== null && session.timer_duration && session.timer_duration > 0 ? (
+                      <span
+                        className={`px-2.5 py-0.5 rounded-full text-xs font-mono-code font-black ${
+                          timeLeft <= 5
+                            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse'
+                            : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        }`}
+                      >
+                        Odštevanje: {timeLeft}s
+                      </span>
+                    ) : (
+                      <span className="text-xs text-slate-500">Časovnik miruje</span>
+                    )}
+                  </div>
 
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  id="remote-timer-30s-btn"
-                  type="button"
-                  disabled={actionLoading}
-                  onClick={() => handleTriggerTimer(30)}
-                  className="py-3 px-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-200 font-bold text-xs flex flex-col items-center justify-center gap-0.5 active:scale-95 transition-all cursor-pointer"
-                >
-                  <span>Sproži 30s</span>
-                  <span className="text-[10px] text-indigo-400">timer</span>
-                </button>
-
-                <button
-                  id="remote-timer-60s-btn"
-                  type="button"
-                  disabled={actionLoading}
-                  onClick={() => handleTriggerTimer(60)}
-                  className="py-3 px-2 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-violet-200 font-bold text-xs flex flex-col items-center justify-center gap-0.5 active:scale-95 transition-all cursor-pointer"
-                >
-                  <span>Sproži 60s</span>
-                  <span className="text-[10px] text-violet-400">timer</span>
-                </button>
-
-                <button
-                  id="remote-timer-stop-btn"
-                  type="button"
-                  disabled={actionLoading}
-                  onClick={handleStopTimer}
-                  className="py-3 px-2 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 font-bold text-xs flex flex-col items-center justify-center gap-0.5 active:scale-95 transition-all cursor-pointer"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  <span>Ustavi timer</span>
-                </button>
-              </div>
-
-              {/* Podaljšanje časa v živo */}
-              <div className="pt-2 border-t border-slate-800 space-y-2">
-                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                  Podaljšaj čas
-                </span>
-                <div className="grid grid-cols-3 gap-2">
-                  {[
-                    { label: '+15s', sec: 15 },
-                    { label: '+30s', sec: 30 },
-                    { label: '+1 min', sec: 60 },
-                  ].map((b) => (
+                  <div className="grid grid-cols-3 gap-2">
                     <button
-                      key={b.label}
+                      id="remote-timer-30s-btn"
                       type="button"
                       disabled={actionLoading}
-                      onClick={() => handleExtendTimer(b.sec)}
-                      className="py-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-200 font-bold text-xs active:scale-95 transition-all cursor-pointer"
+                      onClick={() => handleTriggerTimer(30)}
+                      className="py-3 px-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-200 font-bold text-xs flex flex-col items-center justify-center gap-0.5 active:scale-95 transition-all cursor-pointer"
                     >
-                      {b.label}
+                      <span>Sproži 30s</span>
+                      <span className="text-[10px] text-indigo-400">timer</span>
                     </button>
-                  ))}
+
+                    <button
+                      id="remote-timer-60s-btn"
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={() => handleTriggerTimer(60)}
+                      className="py-3 px-2 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-violet-200 font-bold text-xs flex flex-col items-center justify-center gap-0.5 active:scale-95 transition-all cursor-pointer"
+                    >
+                      <span>Sproži 60s</span>
+                      <span className="text-[10px] text-violet-400">timer</span>
+                    </button>
+
+                    <button
+                      id="remote-timer-stop-btn"
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={handleStopTimer}
+                      className="py-3 px-2 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 font-bold text-xs flex flex-col items-center justify-center gap-0.5 active:scale-95 transition-all cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Ustavi timer</span>
+                    </button>
+                  </div>
+
+                  {/* Podaljšanje časa v živo */}
+                  <div className="pt-2 border-t border-slate-800 space-y-2">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      Podaljšaj čas
+                    </span>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { label: '+15s', sec: 15 },
+                        { label: '+30s', sec: 30 },
+                        { label: '+1 min', sec: 60 },
+                      ].map((b) => (
+                        <button
+                          key={b.label}
+                          type="button"
+                          disabled={actionLoading}
+                          onClick={() => handleExtendTimer(b.sec)}
+                          className="py-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-200 font-bold text-xs active:scale-95 transition-all cursor-pointer"
+                        >
+                          {b.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="remote-extend-custom-input"
+                        type="number"
+                        min={1}
+                        value={customExtend}
+                        onChange={(e) => setCustomExtend(e.target.value)}
+                        placeholder="Število"
+                        className="w-20 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-xs focus:outline-none focus:border-emerald-500"
+                      />
+                      <select
+                        value={customExtendUnit}
+                        onChange={(e) => setCustomExtendUnit(e.target.value as 'sec' | 'min')}
+                        className="px-2 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-xs"
+                      >
+                        <option value="sec">sekund</option>
+                        <option value="min">minut</option>
+                      </select>
+                      <button
+                        id="remote-extend-custom-btn"
+                        type="button"
+                        disabled={actionLoading || !customExtend}
+                        onClick={() => {
+                          const n = parseFloat(customExtend);
+                          handleExtendTimer(customExtendUnit === 'min' ? n * 60 : n);
+                          setCustomExtend('');
+                        }}
+                        className="flex-1 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs cursor-pointer"
+                      >
+                        Dodaj čas
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="remote-extend-custom-input"
-                    type="number"
-                    min={1}
-                    value={customExtend}
-                    onChange={(e) => setCustomExtend(e.target.value)}
-                    placeholder="Število"
-                    className="w-20 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 text-xs focus:outline-none focus:border-emerald-500"
-                  />
-                  <select
-                    value={customExtendUnit}
-                    onChange={(e) => setCustomExtendUnit(e.target.value as 'sec' | 'min')}
-                    className="px-2 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-xs"
-                  >
-                    <option value="sec">sekund</option>
-                    <option value="min">minut</option>
-                  </select>
-                  <button
-                    id="remote-extend-custom-btn"
-                    type="button"
-                    disabled={actionLoading || !customExtend}
-                    onClick={() => {
-                      const n = parseFloat(customExtend);
-                      handleExtendTimer(customExtendUnit === 'min' ? n * 60 : n);
-                      setCustomExtend('');
-                    }}
-                    className="flex-1 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs cursor-pointer"
-                  >
-                    Dodaj čas
-                  </button>
-                </div>
-              </div>
-            </div>
+              )}
 
             {/* Velika navigacijska gumba: Prejšnji slajd / Naslednji slajd */}
             <div className="grid grid-cols-2 gap-3 pt-1">
@@ -1369,10 +1434,15 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 {gradableSlides.map((slide, qIdx) => {
                   const multiPart = isMultiPartSlide(slide);
                   const parts = slide.question_parts || [];
+                  const regularParts = parts.filter((p) => !p.is_bonus);
+                  const bonusParts = parts.filter((p) => Boolean(p.is_bonus));
                   const maxPts = roundPoints(
                     multiPart
-                      ? parts.reduce((sum, p) => sum + Number(p.points ?? 1), 0)
+                      ? regularParts.reduce((sum, p) => sum + Number(p.points ?? 1), 0)
                       : Number(slide.points ?? 1)
+                  );
+                  const maxBonusFromParts = roundPoints(
+                    bonusParts.reduce((sum, p) => sum + Number(p.points ?? 0.5), 0)
                   );
                   const slideAnswers = answers.filter((a) => a.slide_id === slide.id);
 
@@ -1435,7 +1505,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                       {/* Naslov vprašanja in pravilen odgovor */}
                       <div className="space-y-1.5 pb-2.5 border-b border-slate-800">
                         <div className="flex items-center justify-between gap-2 flex-wrap">
-                          <span className="inline-flex items-center gap-1 text-xs font-bold text-indigo-400">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-400 flex-wrap">
                             {multiPart ? (
                               <Layers className="w-3.5 h-3.5 text-indigo-400" />
                             ) : (
@@ -1455,8 +1525,9 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                               </>
                             )}
                             <span>
-                              Vprašanje #{qIdx + 1} ({maxPts} t)
-                              {multiPart ? ` • ${parts.length} podvprašanj` : ''}
+                              Vprašanje #{qIdx + 1} ({maxPts} t rednih
+                              {maxBonusFromParts > 0 ? ` + ⭐ ${maxBonusFromParts} t bonus` : ''})
+                              {multiPart ? ` • ${parts.length} delov` : ''}
                             </span>
                           </span>
                           {!multiPart && (
@@ -1539,7 +1610,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                               <div
                                 key={player.id}
                                 className={`p-3 rounded-xl border transition-all space-y-2.5 ${
-                                  isCorrect || awarded > 0
+                                  isCorrect || awarded > 0 || bonusPts > 0
                                     ? 'bg-emerald-500/10 border-emerald-500/40'
                                     : 'bg-slate-950/80 border-slate-800'
                                 }`}
@@ -1565,7 +1636,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                       )}
                                       {bonusPts > 0 && (
                                         <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-400/50 text-[10px] font-bold">
-                                          ⭐ +{bonusPts} bonus
+                                          ⭐ +{bonusPts} bonus (brez 2x)
                                         </span>
                                       )}
                                       {diffLabel && (
@@ -1608,7 +1679,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                           const fullPartScores: Record<string, number> = {};
                                           parts.forEach((p) => {
                                             fullPartScores[p.id] = roundPoints(
-                                              Number(p.points ?? 1)
+                                              Number(p.points ?? (p.is_bonus ? 0.5 : 1))
                                             );
                                           });
                                           handleGradeAnswer(
@@ -1618,7 +1689,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                             true,
                                             maxPts,
                                             undefined,
-                                            undefined,
+                                            bonusParts.length > 0 ? maxBonusFromParts : undefined,
                                             serializeMultiPartAnswer(
                                               parsedMulti.values,
                                               fullPartScores
@@ -1635,7 +1706,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                         }
                                       }}
                                       className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all cursor-pointer ${
-                                        awarded === maxPts && maxPts > 0
+                                        awarded === maxPts &&
+                                        (maxPts > 0 || (maxBonusFromParts > 0 && bonusPts === maxBonusFromParts))
                                           ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/30 font-bold'
                                           : 'bg-slate-800 text-slate-400 hover:text-emerald-400'
                                       }`}
@@ -1658,7 +1730,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                             false,
                                             0,
                                             undefined,
-                                            undefined,
+                                            bonusParts.length > 0 ? 0 : undefined,
                                             serializeMultiPartAnswer(
                                               parsedMulti.values,
                                               zeroPartScores
@@ -1675,7 +1747,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                         }
                                       }}
                                       className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all cursor-pointer ${
-                                        !isCorrect && awarded === 0
+                                        !isCorrect && awarded === 0 && bonusPts === 0
                                           ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30 font-bold'
                                           : 'bg-slate-800 text-slate-400 hover:text-rose-400'
                                       }`}
@@ -1686,12 +1758,15 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                   </div>
                                 </div>
 
-                                {/* VEČDELNO VPRAŠANJE: Ločeno ocenjevanje vsakega podvprašanja */}
+                                {/* VEČDELNO VPRAŠANJE: Ločeno ocenjevanje vsakega podvprašanja in bonus vprašanja */}
                                 {multiPart && parsedMulti && (
                                   <div className="space-y-2 pt-1.5 border-t border-slate-800/80">
                                     {parts.map((part, pIdx) => {
+                                      const isBonus = Boolean(part.is_bonus);
                                       const rawVal = parsedMulti.values[part.id] ?? '';
-                                      const partMaxPts = roundPoints(Number(part.points ?? 1));
+                                      const partMaxPts = roundPoints(
+                                        Number(part.points ?? (isBonus ? 0.5 : 1))
+                                      );
                                       const currentPartScore = roundPoints(
                                         Number(parsedMulti.partScores[part.id] ?? 0)
                                       );
@@ -1730,14 +1805,27 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                       return (
                                         <div
                                           key={part.id}
-                                          className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2"
+                                          className={`p-2.5 rounded-xl border space-y-2 ${
+                                            isBonus
+                                              ? 'bg-amber-950/35 border-amber-400/50'
+                                              : 'bg-slate-900/90 border-slate-800'
+                                          }`}
                                         >
                                           <div className="flex items-start justify-between gap-2">
                                             <div className="min-w-0">
                                               <div className="flex items-center gap-1.5 flex-wrap">
-                                                <span className="text-[11px] font-bold text-indigo-300">
+                                                {isBonus && (
+                                                  <span className="px-1.5 py-0.5 rounded bg-amber-400 text-slate-950 text-[9px] font-black uppercase tracking-wider">
+                                                    ⭐ Bonus vprašanje (ne šteje v 2x Joker)
+                                                  </span>
+                                                )}
+                                                <span
+                                                  className={`text-[11px] font-bold ${
+                                                    isBonus ? 'text-amber-200' : 'text-indigo-300'
+                                                  }`}
+                                                >
                                                   {part.label || `Del ${pIdx + 1}`} ({partMaxPts}{' '}
-                                                  t)
+                                                  t{isBonus ? ' ⭐' : ''})
                                                 </span>
                                                 <span className="text-[10px] font-mono-code text-emerald-300/90 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/25">
                                                   Pravilno:{' '}
@@ -1794,12 +1882,16 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                                       ? ptsVal === 0
                                                         ? 'bg-rose-500/30 text-rose-200 border border-rose-500/50'
                                                         : ptsVal >= partMaxPts
-                                                        ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                                                        ? isBonus
+                                                          ? 'bg-amber-400 text-slate-950 shadow-sm'
+                                                          : 'bg-emerald-500 text-slate-950 shadow-sm'
                                                         : 'bg-amber-500/30 text-amber-200 border border-amber-500/50'
                                                       : 'bg-slate-950 text-slate-400 hover:bg-slate-800 border border-slate-800'
                                                   }`}
                                                 >
-                                                  {ptsVal === 0 ? '0' : `+${ptsVal}`}
+                                                  {ptsVal === 0
+                                                    ? '0'
+                                                    : `+${ptsVal}${isBonus ? ' ⭐' : ''}`}
                                                 </button>
                                               ))}
                                             </div>
@@ -1836,7 +1928,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                                     val
                                                   );
                                                 }}
-                                                className="w-14 px-1.5 py-0.5 rounded-lg bg-slate-950 border border-slate-700 text-right font-mono-code font-bold text-xs text-emerald-400 focus:outline-none focus:border-indigo-500"
+                                                className={`w-14 px-1.5 py-0.5 rounded-lg bg-slate-950 border text-right font-mono-code font-bold text-xs focus:outline-none ${
+                                                  isBonus
+                                                    ? 'border-amber-500/50 text-amber-300 focus:border-amber-400'
+                                                    : 'border-slate-700 text-emerald-400 focus:border-indigo-500'
+                                                }`}
                                               />
                                               <button
                                                 type="button"

@@ -920,31 +920,41 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               </div>
             )}
 
-            {/* VSEBINA VPRAŠANJA */}
-            <div className="bg-slate-900/85 backdrop-blur-xl border border-slate-800 rounded-3xl p-5 space-y-3 shadow-xl">
-              <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-xs font-bold font-mono-code">
-                  Vprašanje {viewingSlideIndex + 1} od {currentThemeSlides.length}
-                </span>
-                <span className="text-xs font-bold text-emerald-400">
-                  {roundPoints(currentViewingSlide.points)}{' '}
-                  {roundPoints(currentViewingSlide.points) === 1 ? 'točka' : 'točke'}
-                  {hasJokerInCurrentTheme && ' (2x Joker!)'}
-                </span>
-              </div>
+            {/* VSEBINA VPRAŠANJA (samo če slajd NI info_only ali theme_intro) */}
+            {currentViewingSlide.slide_type !== 'info_only' &&
+              currentViewingSlide.slide_type !== 'theme_intro' && (
+                <div className="bg-slate-900/85 backdrop-blur-xl border border-slate-800 rounded-3xl p-5 space-y-3 shadow-xl">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-xs font-bold font-mono-code">
+                      Slajd {viewingSlideIndex + 1} od {currentThemeSlides.length}
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs font-bold text-emerald-400">
+                        {roundPoints(currentViewingSlide.points)}{' '}
+                        {roundPoints(currentViewingSlide.points) === 1 ? 'točka' : 'točke'}
+                        {hasJokerInCurrentTheme && ' (2x Joker!)'}
+                      </span>
+                      {currentViewingSlide.question_parts?.some((p) => p.is_bonus) && (
+                        <span className="px-2 py-0.5 rounded-lg bg-amber-500/20 border border-amber-500/40 text-[10px] font-bold text-amber-300">
+                          ⭐ +Bonus
+                        </span>
+                      )}
+                    </div>
+                  </div>
 
-              {currentViewingSlide.question_text ? (
-                <p className="text-base font-bold text-slate-100 leading-snug">
-                  {currentViewingSlide.question_text}
-                </p>
-              ) : (
-                <p className="text-xs italic text-slate-400">
-                  Vprašanje je prikazano na glavnem zaslonu / sliki slajda.
-                </p>
+                  {currentViewingSlide.question_text ? (
+                    <p className="text-base font-bold text-slate-100 leading-snug">
+                      {currentViewingSlide.question_text}
+                    </p>
+                  ) : (
+                    <p className="text-xs italic text-slate-400">
+                      Vprašanje je prikazano na glavnem zaslonu / sliki slajda.
+                    </p>
+                  )}
+                </div>
               )}
-            </div>
 
-            {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA (ali večdelno vprašanje) */}
+            {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA (ali večdelno / bonus vprašanje) */}
             {isTimerExpiredOnCurrentHostSlide ? (
               <div className="p-5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-center space-y-1">
                 <Lock className="w-6 h-6 text-rose-400 mx-auto" />
@@ -955,20 +965,33 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               </div>
             ) : currentViewingSlide.slide_type === 'info_only' ||
               currentViewingSlide.slide_type === 'theme_intro' ? (
-              <div className="p-6 rounded-2xl bg-slate-900/80 border border-slate-800 text-center space-y-2">
-                <Info className="w-7 h-7 text-sky-400 mx-auto" />
-                <p className="text-sm font-bold text-slate-200">Samo info slajd</p>
+              <div className="p-6 rounded-3xl bg-slate-900/85 border border-sky-500/30 text-center space-y-2.5 shadow-xl">
+                <div className="w-12 h-12 rounded-2xl bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 mx-auto">
+                  <Info className="w-6 h-6" />
+                </div>
+                <p className="text-base font-black text-slate-100">
+                  Spremljaj glavni zaslon
+                </p>
+                {currentViewingSlide.question_text && (
+                  <p className="text-xs font-semibold text-indigo-300">
+                    {currentViewingSlide.question_text}
+                  </p>
+                )}
                 <p className="text-xs text-slate-400">
-                  Spremljaj navodila ali razlago na glavnem zaslonu.
+                  Na tem slajdu ni vnosa odgovora. Počakaj, da gostitelj nadaljuje na naslednji slajd.
                 </p>
               </div>
             ) : isMultiPartSlide(currentViewingSlide) && currentViewingSlide.question_parts ? (
-              /* VEČDELNO VPRAŠANJE (question_parts) */
+              /* VEČDELNO VPRAŠANJE IN/ALI ⭐ BONUS VPRAŠANJE (question_parts) */
               <div className="space-y-4">
                 <div className="flex items-center justify-between px-1">
                   <span className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-fuchsia-300">
                     <Layers className="w-3.5 h-3.5 text-fuchsia-400" />
-                    <span>Večdelno vprašanje ({currentViewingSlide.question_parts.length} deli)</span>
+                    <span>
+                      {currentViewingSlide.question_parts.some((p) => p.is_bonus)
+                        ? 'Vprašanje + ⭐ Bonus vprašanje'
+                        : `Večdelno vprašanje (${currentViewingSlide.question_parts.length} deli)`}
+                    </span>
                   </span>
                 </div>
 
@@ -997,18 +1020,45 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                         const partDraft = getPartDraft(part.id);
                         const partInputKey = `${currentViewingSlide.id}:${part.id}`;
                         const partOpts = part.options || ['', '', '', ''];
+                        const isBonusPart = Boolean(part.is_bonus);
 
                         return (
                           <div
                             key={partInputKey}
-                            className="bg-slate-900/85 border border-slate-800 rounded-3xl p-4 space-y-3 shadow-md"
+                            className={`rounded-3xl p-4 space-y-3 shadow-md transition-all ${
+                              isBonusPart
+                                ? 'bg-gradient-to-b from-amber-500/20 via-slate-900/95 to-slate-950 border-2 border-amber-400/60 shadow-amber-950/40'
+                                : 'bg-slate-900/85 border border-slate-800'
+                            }`}
                           >
+                            {isBonusPart && (
+                              <div className="flex items-center justify-between gap-2 pb-1 border-b border-amber-500/30">
+                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500 text-slate-950 text-[10px] font-black uppercase tracking-wider">
+                                  ⭐ BONUS VPRAŠANJE
+                                </span>
+                                <span className="text-[10px] font-semibold text-amber-200/90">
+                                  Ne podvoji se z Jokerjem
+                                </span>
+                              </div>
+                            )}
+
                             <div className="flex items-center justify-between gap-2">
-                              <span className="text-xs font-bold text-fuchsia-300">
-                                {part.label || `Del ${pIdx + 1}`}
+                              <span
+                                className={`text-xs font-bold ${
+                                  isBonusPart ? 'text-amber-200 text-sm' : 'text-fuchsia-300'
+                                }`}
+                              >
+                                {part.label ||
+                                  (isBonusPart ? 'Bonus vprašanje' : `Del ${pIdx + 1}`)}
                               </span>
-                              <span className="text-[11px] font-mono-code font-bold text-emerald-400">
-                                {roundPoints(part.points)} t
+                              <span
+                                className={`text-[11px] font-mono-code font-bold shrink-0 ${
+                                  isBonusPart ? 'text-amber-300' : 'text-emerald-400'
+                                }`}
+                              >
+                                {isBonusPart
+                                  ? `+${roundPoints(part.points)} ⭐`
+                                  : `${roundPoints(part.points)} t`}
                               </span>
                             </div>
 
@@ -1105,8 +1155,16 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                                     [partInputKey]: val,
                                   }));
                                 }}
-                                placeholder="Vpiši odgovor..."
-                                className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-slate-100 font-semibold text-sm focus:outline-none focus:border-emerald-500"
+                                placeholder={
+                                  isBonusPart
+                                    ? 'Vpiši odgovor na bonus vprašanje...'
+                                    : 'Vpiši odgovor...'
+                                }
+                                className={`w-full px-3.5 py-3 rounded-2xl bg-slate-950 border text-slate-100 font-semibold text-sm focus:outline-none ${
+                                  isBonusPart
+                                    ? 'border-amber-500/40 focus:border-amber-400'
+                                    : 'border-slate-800 focus:border-emerald-500'
+                                }`}
                               />
                             )}
                           </div>
@@ -1311,10 +1369,19 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                             : val || '—';
                         return (
                           <div key={part.id} className="flex items-center justify-between gap-2">
-                            <span className="text-slate-400 truncate">
-                              {part.label || `Del ${pIdx + 1}`}:
+                            <span
+                              className={`truncate ${
+                                part.is_bonus ? 'text-amber-300 font-semibold' : 'text-slate-400'
+                              }`}
+                            >
+                              {part.is_bonus ? '⭐ ' : ''}
+                              {part.label || (part.is_bonus ? 'Bonus vprašanje' : `Del ${pIdx + 1}`)}:
                             </span>
-                            <span className="font-mono-code font-bold text-emerald-400">
+                            <span
+                              className={`font-mono-code font-bold ${
+                                part.is_bonus ? 'text-amber-300' : 'text-emerald-400'
+                              }`}
+                            >
                               {formatted}
                             </span>
                           </div>
@@ -1410,10 +1477,23 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                                   key={part.id}
                                   className="flex items-center justify-between text-[11px]"
                                 >
-                                  <span className="text-slate-400">
-                                    {part.label || `Del ${pIdx + 1}`}:
+                                  <span
+                                    className={
+                                      part.is_bonus
+                                        ? 'text-amber-300 font-semibold'
+                                        : 'text-slate-400'
+                                    }
+                                  >
+                                    {part.is_bonus ? '⭐ ' : ''}
+                                    {part.label ||
+                                      (part.is_bonus ? 'Bonus vprašanje' : `Del ${pIdx + 1}`)}
+                                    :
                                   </span>
-                                  <span className="font-mono-code font-bold text-emerald-400">
+                                  <span
+                                    className={`font-mono-code font-bold ${
+                                      part.is_bonus ? 'text-amber-300' : 'text-emerald-400'
+                                    }`}
+                                  >
                                     {displayVal}
                                   </span>
                                 </div>

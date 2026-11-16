@@ -738,51 +738,80 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             ) : (
               /* Tekstovna kartica, če slika ni naložena */
               <div className="w-full max-w-4xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center">
-                <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
-                  <HelpCircle className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>
-                    Vprašanje • {currentSlide.points}{' '}
-                    {currentSlide.points === 1 ? 'točka' : 'točke'}
-                  </span>
-                </div>
+                {currentSlide.slide_type === 'info_only' ? (
+                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-xs font-semibold">
+                    <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Predstavitveni slajd</span>
+                  </div>
+                ) : (
+                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
+                    <HelpCircle className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>
+                      Vprašanje • {currentSlide.points}{' '}
+                      {currentSlide.points === 1 ? 'točka' : 'točke'}
+                    </span>
+                  </div>
+                )}
 
                 <h3 className="text-2xl sm:text-4xl font-bold text-slate-100 leading-snug">
-                  {currentSlide.question_text || 'Vprašanje se bo prikazalo tukaj.'}
+                  {currentSlide.question_text ||
+                    (currentSlide.slide_type === 'info_only'
+                      ? currentTheme?.title || quiz.title
+                      : 'Vprašanje se bo prikazalo tukaj.')}
                 </h3>
 
                 {/* Če je večdelno vprašanje */}
                 {currentSlide.question_parts && currentSlide.question_parts.length > 0 ? (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
-                    {currentSlide.question_parts.map((part, pIdx) => (
-                      <div
-                        key={part.id}
-                        className="p-4 rounded-2xl bg-slate-950/85 border border-fuchsia-500/35 space-y-2"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="px-2.5 py-0.5 rounded-lg bg-fuchsia-500/20 text-fuchsia-300 border border-fuchsia-500/30 text-xs font-bold">
-                            {part.label || `Del ${pIdx + 1}`}
-                          </span>
-                          <span className="text-xs font-bold text-emerald-400">
-                            {part.points} t
-                          </span>
-                        </div>
-                        {part.type === 'multiple_choice' && part.options && (
-                          <div className="grid grid-cols-2 gap-1.5 pt-1">
-                            {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => (
-                              <div
-                                key={letter}
-                                className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-200 font-semibold truncate"
-                              >
-                                <span className="text-indigo-400 font-bold mr-1.5">
-                                  {letter}:
-                                </span>
-                                {part.options?.[lIdx] || `Možnost ${letter}`}
-                              </div>
-                            ))}
+                    {currentSlide.question_parts.map((part, pIdx) => {
+                      const isBonusPart = Boolean(part.is_bonus);
+                      return (
+                        <div
+                          key={part.id}
+                          className={`p-4 rounded-2xl space-y-2 border ${
+                            isBonusPart
+                              ? 'bg-amber-500/10 border-amber-500/50 shadow-lg shadow-amber-950/30'
+                              : 'bg-slate-950/85 border-fuchsia-500/35'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span
+                              className={`px-2.5 py-0.5 rounded-lg text-xs font-bold border ${
+                                isBonusPart
+                                  ? 'bg-amber-500 text-slate-950 border-amber-400'
+                                  : 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30'
+                              }`}
+                            >
+                              {isBonusPart
+                                ? `⭐ BONUS VPRAŠANJE: ${part.label || 'Bonus'}`
+                                : part.label || `Del ${pIdx + 1}`}
+                            </span>
+                            <span
+                              className={`text-xs font-bold ${
+                                isBonusPart ? 'text-amber-300' : 'text-emerald-400'
+                              }`}
+                            >
+                              {isBonusPart ? `+${part.points} ⭐` : `${part.points} t`}
+                            </span>
                           </div>
-                        )}
-                      </div>
-                    ))}
+                          {part.type === 'multiple_choice' && part.options && (
+                            <div className="grid grid-cols-2 gap-1.5 pt-1">
+                              {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => (
+                                <div
+                                  key={letter}
+                                  className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-200 font-semibold truncate"
+                                >
+                                  <span className="text-indigo-400 font-bold mr-1.5">
+                                    {letter}:
+                                  </span>
+                                  {part.options?.[lIdx] || `Možnost ${letter}`}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 ) : (
                   /* Če je izbirni A/B/C/D tip slajda */

@@ -153,3 +153,38 @@ export function hasAnyMultiPartValue(answerText: string | null | undefined): boo
   const { values } = parseMultiPartAnswer(answerText);
   return Object.values(values).some((v) => v && v.trim().length > 0);
 }
+
+/**
+ * Vrne vsoto rednih točk slajda (brez bonus delov, ki imajo is_bonus === true).
+ */
+export function getSlideRegularPointsSum(slide: Slide | null | undefined): number {
+  if (!slide) return 0;
+  if (isMultiPartSlide(slide) && slide.question_parts) {
+    return roundPoints(
+      slide.question_parts
+        .filter((p) => !p.is_bonus)
+        .reduce((acc, p) => acc + Number(p.points ?? 0), 0)
+    );
+  }
+  return roundPoints(Number(slide.points ?? 0));
+}
+
+/**
+ * Vrne vsoto vnaprej določenih bonus točk slajda (deli z is_bonus === true).
+ */
+export function getSlideBonusPointsSum(slide: Slide | null | undefined): number {
+  if (!slide || !isMultiPartSlide(slide) || !slide.question_parts) return 0;
+  return roundPoints(
+    slide.question_parts
+      .filter((p) => Boolean(p.is_bonus))
+      .reduce((acc, p) => acc + Number(p.points ?? 0), 0)
+  );
+}
+
+/**
+ * Preveri, ali ima slajd kakšen bonus del vprašanja (is_bonus === true).
+ */
+export function hasBonusQuestionPart(slide: Slide | null | undefined): boolean {
+  if (!slide || !isMultiPartSlide(slide) || !slide.question_parts) return false;
+  return slide.question_parts.some((p) => Boolean(p.is_bonus));
+}

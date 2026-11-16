@@ -19,6 +19,7 @@ export interface QuestionPart {
   options?: string[];
   correct_answer: string;
   points: number;
+  is_bonus?: boolean;
 }
 
 export type GameSessionStatus =
