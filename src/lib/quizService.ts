@@ -1,4 +1,4 @@
-import { compressImageBlobToDataUrl } from './pdfConverter';
+import { compressImageBlobToDataUrl, convertPdfToImages } from './pdfConverter';
 import { generateSlideSvgDataUrl } from './demoQuiz';
 import { requireSupabaseClient } from './supabase';
 import {
@@ -70,13 +70,21 @@ export function subscribeToDemoUpdates(_callback: (event: { type: string; sessio
 }
 
 function normalizeOptions(raw: unknown): SlideOptions {
+  if (Array.isArray(raw)) {
+    return {
+      A: raw[0] !== undefined && raw[0] !== null ? String(raw[0]) : '',
+      B: raw[1] !== undefined && raw[1] !== null ? String(raw[1]) : '',
+      C: raw[2] !== undefined && raw[2] !== null ? String(raw[2]) : '',
+      D: raw[3] !== undefined && raw[3] !== null ? String(raw[3]) : '',
+    };
+  }
   if (raw && typeof raw === 'object') {
     const obj = raw as Record<string, unknown>;
     return {
-      A: typeof obj.A === 'string' ? obj.A : '',
-      B: typeof obj.B === 'string' ? obj.B : '',
-      C: typeof obj.C === 'string' ? obj.C : '',
-      D: typeof obj.D === 'string' ? obj.D : '',
+      A: typeof obj.A === 'string' ? obj.A : obj.A !== undefined && obj.A !== null ? String(obj.A) : '',
+      B: typeof obj.B === 'string' ? obj.B : obj.B !== undefined && obj.B !== null ? String(obj.B) : '',
+      C: typeof obj.C === 'string' ? obj.C : obj.C !== undefined && obj.C !== null ? String(obj.C) : '',
+      D: typeof obj.D === 'string' ? obj.D : obj.D !== undefined && obj.D !== null ? String(obj.D) : '',
     };
   }
   return { A: '', B: '', C: '', D: '' };
@@ -123,7 +131,10 @@ function normalizeQuestionParts(raw: unknown): QuestionPart[] | null {
           : `Del ${idx + 1}`,
       type,
       ...(options ? { options } : {}),
-      correct_answer: typeof obj.correct_answer === 'string' ? obj.correct_answer : '',
+      correct_answer:
+        obj.correct_answer !== undefined && obj.correct_answer !== null
+          ? String(obj.correct_answer)
+          : '',
       points: roundPoints(obj.points !== undefined ? Number(obj.points) : obj.is_bonus ? 0.5 : 1),
       ...(obj.is_bonus !== undefined ? { is_bonus: Boolean(obj.is_bonus) } : {}),
     });
@@ -2182,3 +2193,317 @@ export async function savePlayerAnswer(
 }
 
 export { createMegaDemoQuiz, generateSlideSvgDataUrl } from './demoQuiz';
+
+export interface ImportedSlideJson {
+  page_index: number;
+  slide_type: SlideType;
+  question_text: string;
+  options: SlideOptions;
+  correct_answer: string;
+  points: number;
+  timer_seconds: number;
+  question_parts: QuestionPart[] | null;
+}
+
+export interface ImportedThemeJson {
+  title: string;
+  slides: ImportedSlideJson[];
+}
+
+export interface ParsedImportQuizJson {
+  title: string;
+  max_jokers_per_player: number;
+  themes: ImportedThemeJson[];
+  totalSlides: number;
+  maxPageIndex: number;
+}
+
+const VALID_IMPORT_SLIDE_TYPES: SlideType[] = [
+  'info_only',
+  'theme_intro',
+  'multiple_choice',
+  'open_text',
+  'closest_number',
+  'closest_date',
+];
+
+/**
+ * Odstrani morebitne markdown ```json ... ``` oznake in razčleni ter validira uvozno JSON shemo kviza.
+ */
+export function parseImportQuizJson(rawJsonText: string): ParsedImportQuizJson {
+  let cleaned = rawJsonText.trim();
+  if (!cleaned) {
+    throw new Error('Polje za JSON konfiguracijo je prazno. Prilepite JSON iz vašega AI pomočnika.');
+  }
+
+  // Samodejno odstrani markdown ```json ... ``` ovitek, če ga je uporabnik kopiral skupaj s kodo
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Neveljavna JSON sintaksa';
+    throw new Error(`Neveljaven JSON zapis: ${msg}`);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Korenski element JSON-a mora biti objekt `{ "title": "...", "themes": [...] }`.');
+  }
+
+  const root = parsed as Record<string, unknown>;
+  const title = typeof root.title === 'string' && root.title.trim() ? root.title.trim() : '';
+  if (!title) {
+    throw new Error('JSON mora vsebovati neprazno polje `"title"` (naslov kviza).');
+  }
+
+  const rawMaxJokers =
+    root.max_jokers_per_player !== undefined && root.max_jokers_per_player !== null
+      ? Number(root.max_jokers_per_player)
+      : 2;
+  if (!Number.isFinite(rawMaxJokers) || rawMaxJokers < 0) {
+    throw new Error('Polje `"max_jokers_per_player"` mora biti nenegativno število (npr. 2).');
+  }
+
+  if (!Array.isArray(root.themes) || root.themes.length === 0) {
+    throw new Error('JSON mora vsebovati neprazno polje `"themes"` (seznam tematik).');
+  }
+
+  let totalSlides = 0;
+  let maxPageIndex = -1;
+
+  const themes: ImportedThemeJson[] = root.themes.map((rawTheme, tIdx) => {
+    if (!rawTheme || typeof rawTheme !== 'object' || Array.isArray(rawTheme)) {
+      throw new Error(`Tematika #${tIdx + 1} v polju "themes" mora biti JSON objekt.`);
+    }
+    const tObj = rawTheme as Record<string, unknown>;
+    const themeTitle =
+      typeof tObj.title === 'string' && tObj.title.trim()
+        ? tObj.title.trim()
+        : `${tIdx + 1}. sklop`;
+
+    if (!Array.isArray(tObj.slides) || tObj.slides.length === 0) {
+      throw new Error(`Tematika "${themeTitle}" (#${tIdx + 1}) mora vsebovati vsaj en slajd v polju "slides".`);
+    }
+
+    const slides: ImportedSlideJson[] = tObj.slides.map((rawSlide, sIdx) => {
+      if (!rawSlide || typeof rawSlide !== 'object' || Array.isArray(rawSlide)) {
+        throw new Error(`Slajd #${sIdx + 1} v tematiki "${themeTitle}" mora biti JSON objekt.`);
+      }
+      const sObj = rawSlide as Record<string, unknown>;
+      const pageIndex = Number(sObj.page_index);
+      if (!Number.isInteger(pageIndex) || pageIndex < 0) {
+        throw new Error(
+          `Slajd #${sIdx + 1} v tematiki "${themeTitle}" ima neveljaven "page_index" (mora biti celo število >= 0, kjer je 1. stran PDF-ja 0).`
+        );
+      }
+
+      const rawType = String(sObj.slide_type || '').trim() as SlideType;
+      if (!VALID_IMPORT_SLIDE_TYPES.includes(rawType)) {
+        throw new Error(
+          `Slajd #${sIdx + 1} (page_index: ${pageIndex}) v tematiki "${themeTitle}" ima neveljaven "slide_type": "${rawType}". Dovoljene vrednosti so: ${VALID_IMPORT_SLIDE_TYPES.join(', ')}.`
+        );
+      }
+
+      const normalizedParts = normalizeQuestionParts(sObj.question_parts);
+      const isNonGradable = rawType === 'info_only' || rawType === 'theme_intro';
+      const defaultPoints = isNonGradable ? 0 : 1;
+      const computedPoints = normalizedParts
+        ? roundPoints(
+            normalizedParts
+              .filter((p) => !p.is_bonus)
+              .reduce((sum, p) => sum + Number(p.points || 0), 0)
+          )
+        : roundPoints(
+            sObj.points !== undefined && sObj.points !== null
+              ? Number(sObj.points)
+              : defaultPoints
+          );
+
+      const timerSeconds =
+        sObj.timer_seconds !== undefined && sObj.timer_seconds !== null
+          ? Math.max(0, Math.round(Number(sObj.timer_seconds)))
+          : isNonGradable
+          ? 0
+          : 30;
+
+      if (pageIndex > maxPageIndex) maxPageIndex = pageIndex;
+      totalSlides += 1;
+
+      return {
+        page_index: pageIndex,
+        slide_type: rawType,
+        question_text:
+          sObj.question_text !== undefined && sObj.question_text !== null
+            ? String(sObj.question_text)
+            : '',
+        options: normalizeOptions(sObj.options),
+        correct_answer:
+          sObj.correct_answer !== undefined && sObj.correct_answer !== null
+            ? String(sObj.correct_answer)
+            : '',
+        points: computedPoints,
+        timer_seconds: Number.isFinite(timerSeconds) ? timerSeconds : 0,
+        question_parts: normalizedParts,
+      };
+    });
+
+    return {
+      title: themeTitle,
+      slides,
+    };
+  });
+
+  return {
+    title,
+    max_jokers_per_player: Math.round(rawMaxJokers),
+    themes,
+    totalSlides,
+    maxPageIndex,
+  };
+}
+
+export interface ImportQuizProgress {
+  message: string;
+  current: number;
+  total: number;
+}
+
+export interface ImportQuizResult {
+  quiz: Quiz;
+  themeCount: number;
+  slideCount: number;
+  pdfPageCount: number;
+}
+
+/**
+ * Uvozi celoten kviz iz PDF datoteke (vsi slajdi predstavitve) in JSON konfiguracije
+ * neposredno v račun trenutnega gostitelja (host_id).
+ */
+export async function importQuizFromPdfAndJson(
+  hostId: string,
+  pdfFile: File,
+  rawJsonText: string,
+  onProgress?: (progress: ImportQuizProgress) => void
+): Promise<ImportQuizResult> {
+  const effectiveHostId = resolveHostId(hostId);
+  const parsed = parseImportQuizJson(rawJsonText);
+
+  onProgress?.({
+    message: 'Branje in pretvorba PDF strani v slike (pdfjs-dist)...',
+    current: 0,
+    total: 1,
+  });
+
+  const renderedPages = await convertPdfToImages(
+    pdfFile,
+    (curr, total) => {
+      onProgress?.({
+        message: `Pretvarjanje PDF strani ${curr} od ${total} v sliko...`,
+        current: curr,
+        total,
+      });
+    },
+    'image/jpeg'
+  );
+
+  if (renderedPages.length === 0) {
+    throw new Error('Naložena PDF datoteka ne vsebuje nobene strani.');
+  }
+
+  // Preveri, da vsi page_index v JSON-u dejansko obstajajo v naloženem PDF-ju
+  for (const theme of parsed.themes) {
+    for (const slide of theme.slides) {
+      if (slide.page_index < 0 || slide.page_index >= renderedPages.length) {
+        throw new Error(
+          `JSON navaja "page_index": ${slide.page_index} v tematiki "${theme.title}", vendar ima PDF le ${renderedPages.length} strani (veljavni indeksi so od 0 do ${renderedPages.length - 1}).`
+        );
+      }
+    }
+  }
+
+  const quizId = crypto.randomUUID();
+  const quiz: Quiz = {
+    id: quizId,
+    host_id: effectiveHostId,
+    title: parsed.title,
+    max_jokers_per_player: parsed.max_jokers_per_player,
+    created_at: new Date().toISOString(),
+  };
+
+  const themes: Theme[] = [];
+  const slidesByTheme: Record<string, Slide[]> = {};
+  const uploadedUrlByPageIndex = new Map<number, string>();
+
+  let processedSlides = 0;
+
+  for (let tIdx = 0; tIdx < parsed.themes.length; tIdx++) {
+    const tDef = parsed.themes[tIdx];
+    const themeId = crypto.randomUUID();
+
+    themes.push({
+      id: themeId,
+      quiz_id: quizId,
+      title: tDef.title,
+      order_index: tIdx,
+    });
+
+    const themeSlides: Slide[] = [];
+
+    for (let sIdx = 0; sIdx < tDef.slides.length; sIdx++) {
+      const sDef = tDef.slides[sIdx];
+      processedSlides += 1;
+
+      onProgress?.({
+        message: `Nalaganje slike za slajd ${processedSlides} od ${parsed.totalSlides} (PDF stran ${sDef.page_index + 1})...`,
+        current: processedSlides,
+        total: parsed.totalSlides,
+      });
+
+      let imageUrl = uploadedUrlByPageIndex.get(sDef.page_index);
+      if (!imageUrl) {
+        const page = renderedPages[sDef.page_index];
+        imageUrl = await uploadSlideImage(
+          quizId,
+          themeId,
+          page.blob,
+          `page_${page.pageNumber}.jpg`
+        );
+        uploadedUrlByPageIndex.set(sDef.page_index, imageUrl);
+      }
+
+      themeSlides.push({
+        id: crypto.randomUUID(),
+        theme_id: themeId,
+        order_index: sIdx,
+        slide_image_url: imageUrl,
+        slide_type: sDef.slide_type,
+        question_text: sDef.question_text,
+        options: sDef.options,
+        correct_answer: sDef.correct_answer,
+        points: sDef.points,
+        timer_seconds: sDef.timer_seconds,
+        question_parts: sDef.question_parts,
+      });
+    }
+
+    slidesByTheme[themeId] = themeSlides;
+  }
+
+  onProgress?.({
+    message: 'Shranjevanje kviza, tematik in slajdov v vaš račun (Supabase)...',
+    current: parsed.totalSlides,
+    total: parsed.totalSlides,
+  });
+
+  const savedQuiz = await upsertFullQuiz(quiz, themes, slidesByTheme, effectiveHostId);
+
+  return {
+    quiz: savedQuiz,
+    themeCount: themes.length,
+    slideCount: parsed.totalSlides,
+    pdfPageCount: renderedPages.length,
+  };
+}

@@ -7,6 +7,7 @@ import {
   Copy,
   Edit3,
   ExternalLink,
+  FileUp,
   FolderKanban,
   Layers,
   Loader2,
@@ -33,9 +34,11 @@ import {
   deleteQuiz,
   fetchHostActiveSessions,
   fetchHostQuizzes,
+  type ImportQuizResult,
 } from '../lib/quizService';
 import { appendSupabaseConfigToUrl } from '../lib/supabase';
 import type { GameSession, QuizWithStats } from '../types/quiz';
+import { ImportQuizModal } from './ImportQuizModal';
 
 interface HostDashboardProps {
   hostId: string;
@@ -71,6 +74,8 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
 
   // Modal za nov kviz
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importSuccess, setImportSuccess] = useState<ImportQuizResult | null>(null);
   const [newTitle, setNewTitle] = useState('');
   const [newMaxJokers, setNewMaxJokers] = useState(1);
   const [creating, setCreating] = useState(false);
@@ -287,6 +292,19 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
           </button>
 
           <button
+            id="import-quiz-pdf-json-btn"
+            onClick={() => {
+              setImportSuccess(null);
+              setShowImportModal(true);
+            }}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 hover:border-sky-400/70 transition-all cursor-pointer"
+            title="Uvozi celoten kviz iz PDF predstavitve in JSON konfiguracije v svoj račun"
+          >
+            <FileUp className="w-4 h-4 text-sky-400" />
+            <span>📥 Uvozi kviz (PDF + JSON)</span>
+          </button>
+
+          <button
             id="create-new-quiz-btn"
             onClick={() => setShowCreateModal(true)}
             className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white shadow-lg shadow-indigo-600/30 transition-all cursor-pointer"
@@ -296,6 +314,43 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Obvestilo o uspešnem uvozu kviza */}
+      {importSuccess && (
+        <div className="p-5 rounded-2xl bg-emerald-950/80 border border-emerald-500/50 text-emerald-100 shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
+              <Check className="w-5 h-5" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-sm sm:text-base font-bold text-emerald-300">
+                ✅ Kviz &ldquo;{importSuccess.quiz.title}&rdquo; uspešno uvožen v vaš račun!
+              </h3>
+              <p className="text-xs text-emerald-100/80">
+                Ustvarjenih <strong>{importSuccess.themeCount}</strong> tematik in{' '}
+                <strong>{importSuccess.slideCount}</strong> slajdov iz PDF-ja ({importSuccess.pdfPageCount}{' '}
+                strani). Kviz je viden izključno v vašem računu in je pripravljen za urejanje ali zagon v živo.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => onEditQuiz(importSuccess.quiz.id)}
+              className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold cursor-pointer"
+            >
+              Odpri v urejevalniku
+            </button>
+            <button
+              type="button"
+              onClick={() => setImportSuccess(null)}
+              className="p-2 rounded-xl text-emerald-300/70 hover:text-white hover:bg-emerald-500/20 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Velik rdeč okvir za prikaz točne Supabase napake (message + details + hint) */}
       {error && (
@@ -636,6 +691,19 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {/* Modal za uvoz kviza (PDF + JSON) */}
+      {showImportModal && (
+        <ImportQuizModal
+          hostId={hostId}
+          onClose={() => setShowImportModal(false)}
+          onImportSuccess={async (result) => {
+            setShowImportModal(false);
+            setImportSuccess(result);
+            await loadDashboardData();
+          }}
+        />
       )}
 
       {/* =====================================================================
