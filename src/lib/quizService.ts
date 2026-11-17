@@ -1,9 +1,10 @@
 import { compressImageBlobToDataUrl, convertPdfToImages } from './pdfConverter';
 import { generateSlideSvgDataUrl } from './demoQuiz';
-import { getSupabaseConfig, requireSupabaseClient } from './supabase';
+import { calibrateServerClockFromIso, getSupabaseConfig, requireSupabaseClient } from './supabase';
 import {
   calculateDateDiffDays,
   isMultiPartSlide,
+  isMultipleChoiceMatch,
   parseMultiPartAnswer,
   roundPoints,
   serializeMultiPartAnswer,
@@ -596,10 +597,13 @@ export async function fetchQuizDetails(quizId: string): Promise<{
     .from('quizzes')
     .select('*')
     .eq('id', quizId)
-    .single();
+    .maybeSingle();
 
   if (quizErr || !quiz) {
-    throw formatSupabaseError(quizErr, `Kviz z ID "${quizId}" ni bil najden v Supabase tabeli "quizzes"`);
+    throw formatSupabaseError(
+      quizErr || new Error(`Kviz z ID "${quizId}" ni bil najden.`),
+      `Kviz z ID "${quizId}" ni bil najden v Supabase tabeli "quizzes"`
+    );
   }
 
   const { data: themesData, error: themesErr } = await supabase
@@ -977,6 +981,7 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
       locked_slide_ids: [],
     };
 
+    const reqStartedAt = Date.now();
     let { data, error } = await supabase
       .from('game_sessions')
       .insert(fullPayload)
@@ -996,6 +1001,11 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
     }
 
     if (!error && data) {
+      calibrateServerClockFromIso(
+        (data as GameSession).created_at,
+        4000,
+        Date.now() - reqStartedAt
+      );
       return normalizeGameSession(data as GameSession);
     }
 
@@ -1097,7 +1107,7 @@ export async function fetchGameSession(sessionId: string): Promise<GameSession |
     .from('game_sessions')
     .select('*')
     .eq('id', sessionId)
-    .single();
+    .maybeSingle();
 
   if (error || !data) return null;
   return normalizeGameSession(data as GameSession);
@@ -1109,12 +1119,12 @@ export async function fetchGameSession(sessionId: string): Promise<GameSession |
 export async function fetchPresentationData(sessionId: string): Promise<PresentationData> {
   const supabase = requireSupabaseClient();
 
-  // 1. Preberi sejo direktno iz Supabase: supabase.from('game_sessions').select('*').eq('id', sessionId).single()
+  // 1. Preberi sejo direktno iz Supabase
   const { data: session, error: sErr } = await supabase
     .from('game_sessions')
     .select('*')
     .eq('id', sessionId)
-    .single();
+    .maybeSingle();
 
   if (sErr || !session) {
     throw formatSupabaseError(
@@ -1128,7 +1138,7 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
     .from('quizzes')
     .select('*')
     .eq('id', session.quiz_id)
-    .single();
+    .maybeSingle();
 
   if (qErr || !quiz) {
     throw formatSupabaseError(
@@ -1197,7 +1207,8 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
     .from('players')
     .select('*')
     .eq('session_id', sessionId)
-    .order('total_score', { ascending: false });
+    .order('total_score', { ascending: false })
+    .order('created_at', { ascending: true });
 
   const { data: jokersData } = await supabase
     .from('player_jokers')
@@ -1248,6 +1259,12 @@ export function deduplicateAnswers(rawAnswers: Answer[]): Answer[] {
  * samodejno shranjevanje (debounce) in takojšnje praznjenje nikoli ne prehitita.
  */
 const answerSaveQueues = new Map<string, Promise<unknown>>();
+
+export async function waitForPendingAnswerSaves(): Promise<void> {
+  while (answerSaveQueues.size > 0) {
+    await Promise.allSettled(Array.from(answerSaveQueues.values()));
+  }
+}
 
 /**
  * Varno shrani ali posodobi odgovor za (session_id, player_id, slide_id):
@@ -1499,6 +1516,25 @@ export async function addDemoPlayer(
 ): Promise<Player> {
   const supabase = requireSupabaseClient();
 
+  let initialJokers = 1;
+  const { data: sData } = await supabase
+    .from('game_sessions')
+    .select('quiz_id')
+    .eq('id', sessionId)
+    .maybeSingle();
+
+  if (sData?.quiz_id) {
+    const { data: qData } = await supabase
+      .from('quizzes')
+      .select('max_jokers_per_player')
+      .eq('id', sData.quiz_id)
+      .maybeSingle();
+    if (qData?.max_jokers_per_player !== undefined) {
+      initialJokers = Number(qData.max_jokers_per_player);
+    }
+  }
+
+  const reqStartedAt = Date.now();
   const { data, error } = await supabase
     .from('players')
     .insert({
@@ -1507,7 +1543,7 @@ export async function addDemoPlayer(
       nickname: nickname.trim(),
       reconnect_token: crypto.randomUUID(),
       total_score: 0,
-      jokers_remaining: 1,
+      jokers_remaining: initialJokers,
     })
     .select('*')
     .single();
@@ -1515,6 +1551,11 @@ export async function addDemoPlayer(
   if (error || !data) {
     throw formatSupabaseError(error, 'Napaka pri dodajanju igralca v tabelo "players"');
   }
+  calibrateServerClockFromIso(
+    (data as Player).created_at,
+    4000,
+    Date.now() - reqStartedAt
+  );
   return data as Player;
 }
 
@@ -1535,17 +1576,32 @@ export async function togglePlayerJoker(
   let isActivated = false;
   if (existingRows && existingRows.length > 0) {
     const ids = existingRows.map((r) => r.id);
-    await supabase.from('player_jokers').delete().in('id', ids);
+    const { error: delErr } = await supabase.from('player_jokers').delete().in('id', ids);
+    if (delErr) {
+      throw formatSupabaseError(delErr, 'Napaka pri izklopu Jokerja v tabeli "player_jokers"');
+    }
     isActivated = false;
   } else {
-    const { error } = await supabase.from('player_jokers').insert({
-      id: crypto.randomUUID(),
-      session_id: sessionId,
-      player_id: playerId,
-      theme_id: themeId,
-    });
-    if (error) {
+    const reqStartedAt = Date.now();
+    const { data: inserted, error } = await supabase
+      .from('player_jokers')
+      .insert({
+        id: crypto.randomUUID(),
+        session_id: sessionId,
+        player_id: playerId,
+        theme_id: themeId,
+      })
+      .select('*')
+      .maybeSingle();
+    if (error && error.code !== '23505') {
       throw formatSupabaseError(error, 'Napaka pri vklopu Jokerja v tabeli "player_jokers"');
+    }
+    if (!error && inserted) {
+      calibrateServerClockFromIso(
+        (inserted as PlayerJoker).created_at,
+        4000,
+        Date.now() - reqStartedAt
+      );
     }
     isActivated = true;
   }
@@ -1734,14 +1790,7 @@ export async function autoPreGradeTheme(
           let partScore = 0;
 
           if (part.type === 'multiple_choice') {
-            const normAns = rawVal.toUpperCase();
-            const normCorr = partCorrect.toUpperCase();
-            const isMatch =
-              partCorrect !== '' &&
-              normAns !== '' &&
-              (normAns === normCorr ||
-                normCorr.startsWith(normAns) ||
-                normAns.startsWith(normCorr));
+            const isMatch = isMultipleChoiceMatch(rawVal, partCorrect);
             partScore = isMatch ? partMaxPts : 0;
           } else if (part.type === 'open_text') {
             const isExact =
@@ -1795,14 +1844,7 @@ export async function autoPreGradeTheme(
     if (slide.slide_type === 'multiple_choice') {
       for (const ans of slideAnswers) {
         if (ans.graded) continue;
-        const normAns = ans.answer_text.trim().toUpperCase();
-        const normCorrect = correctRaw.toUpperCase();
-        const isMatch =
-          correctRaw !== '' &&
-          normAns !== '' &&
-          (normAns === normCorrect ||
-            normCorrect.startsWith(normAns) ||
-            normAns.startsWith(normCorrect));
+        const isMatch = isMultipleChoiceMatch(ans.answer_text, correctRaw);
         updatesToSave.push({
           playerId: ans.player_id,
           slideId: slide.id,
@@ -1923,13 +1965,17 @@ export async function confirmThemeGradesAndShowLeaderboard(
   sessionId: string
 ): Promise<void> {
   const supabase = requireSupabaseClient();
+  await waitForPendingAnswerSaves();
   let presData = await fetchPresentationData(sessionId);
 
   // Če v trenutni tematiki še obstaja kakšen neocenjen odgovor, ga pred-oceni
   if (presData.currentTheme) {
     const curThemeId = presData.currentTheme.id;
     const curSlides = presData.slidesByTheme[curThemeId] || [];
-    const curAnswers = presData.answers.filter((a) => a.theme_id === curThemeId);
+    const curSlideIdSet = new Set(curSlides.map((s) => s.id));
+    const curAnswers = presData.answers.filter(
+      (a) => a.theme_id === curThemeId || curSlideIdSet.has(a.slide_id)
+    );
     if (curAnswers.some((a) => !a.graded)) {
       await autoPreGradeTheme(sessionId, curThemeId, curSlides, curAnswers);
       presData = await fetchPresentationData(sessionId);
@@ -1970,8 +2016,12 @@ export async function confirmThemeGradesAndShowLeaderboard(
     if (!playerThemeSums[ans.player_id][resolvedThemeId]) {
       playerThemeSums[ans.player_id][resolvedThemeId] = { regular: 0, bonus: 0 };
     }
-    playerThemeSums[ans.player_id][resolvedThemeId].regular += regularPts;
-    playerThemeSums[ans.player_id][resolvedThemeId].bonus += bonusPts;
+    playerThemeSums[ans.player_id][resolvedThemeId].regular = roundPoints(
+      playerThemeSums[ans.player_id][resolvedThemeId].regular + regularPts
+    );
+    playerThemeSums[ans.player_id][resolvedThemeId].bonus = roundPoints(
+      playerThemeSums[ans.player_id][resolvedThemeId].bonus + bonusPts
+    );
   }
 
   for (const player of players) {
@@ -1981,14 +2031,14 @@ export async function confirmThemeGradesAndShowLeaderboard(
       const hasJoker = jokerSet.has(`${player.id}_${tId}`);
       const redneTocke = sums.regular;
       const bonusTocke = sums.bonus;
-      const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
-      total += tockeTeme;
+      const tockeTeme = roundPoints((hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke);
+      total = roundPoints(total + tockeTeme);
     }
     newScoresByPlayer[player.id] = roundPoints(total);
   }
 
   // Posodobi total_score za vsakega igralca v Supabase
-  await Promise.all(
+  const playerUpdateResults = await Promise.all(
     players.map((p) =>
       supabase
         .from('players')
@@ -1996,6 +2046,13 @@ export async function confirmThemeGradesAndShowLeaderboard(
         .eq('id', p.id)
     )
   );
+  const failedUpdate = playerUpdateResults.find((res) => res.error);
+  if (failedUpdate?.error) {
+    throw formatSupabaseError(
+      failedUpdate.error,
+      'Napaka pri shranjevanju skupnih točk igralcev v tabelo "players"'
+    );
+  }
 
   // Prestavi status seje v 'leaderboard'
   const { error } = await supabase
@@ -2051,16 +2108,24 @@ export async function findPlayerByNicknameInSession(
     .from('players')
     .select('*')
     .eq('session_id', sessionId)
+    .order('total_score', { ascending: false })
     .order('created_at', { ascending: true });
 
   if (error || !rows || rows.length === 0) {
     return null;
   }
 
-  const matched = (rows as Player[]).find(
+  const matches = (rows as Player[]).filter(
     (p) => (p.nickname || '').trim().toLowerCase() === normalizedTarget
   );
-  return matched || null;
+  if (matches.length === 0) return null;
+
+  matches.sort((a, b) => {
+    const scoreDiff = Number(b.total_score ?? 0) - Number(a.total_score ?? 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    return (a.created_at || '').localeCompare(b.created_at || '');
+  });
+  return matches[0];
 }
 
 /**
@@ -2085,19 +2150,20 @@ export async function joinSessionAsPlayer(sessionId: string, nickname: string): 
     .from('game_sessions')
     .select('quiz_id')
     .eq('id', sessionId)
-    .single();
+    .maybeSingle();
 
   if (sData?.quiz_id) {
     const { data: qData } = await supabase
       .from('quizzes')
       .select('max_jokers_per_player')
       .eq('id', sData.quiz_id)
-      .single();
-    if (qData?.max_jokers_per_player !== undefined) {
-      initialJokers = Number(qData.max_jokers_per_player);
+      .maybeSingle();
+    if (qData?.max_jokers_per_player !== undefined && qData?.max_jokers_per_player !== null) {
+      initialJokers = Math.max(0, Number(qData.max_jokers_per_player));
     }
   }
 
+  const reqStartedAt = Date.now();
   const { data: created, error } = await supabase
     .from('players')
     .insert({
@@ -2109,11 +2175,23 @@ export async function joinSessionAsPlayer(sessionId: string, nickname: string): 
       jokers_remaining: initialJokers,
     })
     .select('*')
-    .single();
+    .maybeSingle();
+
+  if (error?.code === '23505') {
+    const raceExisting = await findPlayerByNicknameInSession(sessionId, cleanNick);
+    if (raceExisting) {
+      return raceExisting;
+    }
+  }
 
   if (error || !created) {
     throw formatSupabaseError(error, 'Napaka pri vpisu igralca v Supabase tabelo "players"');
   }
+  calibrateServerClockFromIso(
+    (created as Player).created_at,
+    4000,
+    Date.now() - reqStartedAt
+  );
   return created as Player;
 }
 
@@ -2158,7 +2236,7 @@ export async function fetchPlayerGameData(
     .from('players')
     .select('*')
     .eq('id', playerId)
-    .single();
+    .maybeSingle();
 
   if (pErr || !player) {
     throw formatSupabaseError(pErr, 'Igralec v Supabase bazi ni bil najden');
@@ -2168,7 +2246,7 @@ export async function fetchPlayerGameData(
     .from('game_sessions')
     .select('*')
     .eq('id', sessionId)
-    .single();
+    .maybeSingle();
 
   if (sErr || !session) {
     throw formatSupabaseError(sErr, 'Seja v Supabase bazi ni bila najdena');
@@ -2178,7 +2256,7 @@ export async function fetchPlayerGameData(
     .from('quizzes')
     .select('*')
     .eq('id', session.quiz_id)
-    .single();
+    .maybeSingle();
 
   if (qErr || !quiz) {
     throw formatSupabaseError(qErr, 'Kviz v Supabase bazi ni bil najden');
@@ -2237,6 +2315,14 @@ export async function fetchPlayerGameData(
     .eq('session_id', sessionId)
     .eq('player_id', playerId);
 
+  const playerJokersList = (playerJokersData || []) as PlayerJoker[];
+  const uniqueUsedThemes = new Set(playerJokersList.map((pj) => pj.theme_id));
+  const maxJokers = Math.max(0, Number((quiz as Quiz).max_jokers_per_player ?? 1));
+  const reconciledPlayer: Player = {
+    ...(player as Player),
+    jokers_remaining: Math.max(0, maxJokers - uniqueUsedThemes.size),
+  };
+
   const { data: myAnswersData } = await supabase
     .from('answers')
     .select('*')
@@ -2253,7 +2339,8 @@ export async function fetchPlayerGameData(
     .from('players')
     .select('id, nickname, total_score')
     .eq('session_id', sessionId)
-    .order('total_score', { ascending: false });
+    .order('total_score', { ascending: false })
+    .order('created_at', { ascending: true });
 
   const leaderboard = (allPlayersData || []).map((p, idx) => ({
     id: p.id,
@@ -2263,14 +2350,14 @@ export async function fetchPlayerGameData(
   }));
 
   return {
-    player: player as Player,
+    player: reconciledPlayer,
     session: normalizeGameSession(session as GameSession),
     quiz: quiz as Quiz,
     themes,
     slidesByTheme,
     currentTheme,
     currentSlide,
-    playerJokers: (playerJokersData || []) as PlayerJoker[],
+    playerJokers: playerJokersList,
     myAnswers,
     leaderboard,
   };
@@ -2286,45 +2373,78 @@ export async function playerActivateJoker(
 ): Promise<{ success: boolean; jokersRemaining: number }> {
   const supabase = requireSupabaseClient();
 
-  const { data: existingRows } = await supabase
-    .from('player_jokers')
-    .select('id')
-    .eq('session_id', sessionId)
-    .eq('player_id', playerId)
-    .eq('theme_id', themeId);
+  let maxJokers = 1;
+  const { data: sData } = await supabase
+    .from('game_sessions')
+    .select('quiz_id')
+    .eq('id', sessionId)
+    .maybeSingle();
 
-  if (existingRows && existingRows.length > 0) {
-    const { data: pData } = await supabase
-      .from('players')
-      .select('jokers_remaining')
-      .eq('id', playerId)
-      .single();
-    return { success: true, jokersRemaining: pData?.jokers_remaining ?? 0 };
+  if (sData?.quiz_id) {
+    const { data: qData } = await supabase
+      .from('quizzes')
+      .select('max_jokers_per_player')
+      .eq('id', sData.quiz_id)
+      .maybeSingle();
+    if (qData?.max_jokers_per_player !== undefined && qData?.max_jokers_per_player !== null) {
+      maxJokers = Math.max(0, Number(qData.max_jokers_per_player));
+    }
   }
 
-  const { data: p } = await supabase
-    .from('players')
-    .select('jokers_remaining')
-    .eq('id', playerId)
-    .single();
+  const { data: usedRows, error: usedErr } = await supabase
+    .from('player_jokers')
+    .select('id, theme_id')
+    .eq('session_id', sessionId)
+    .eq('player_id', playerId);
 
-  const remaining = p?.jokers_remaining ?? 0;
-  if (remaining <= 0) {
+  if (usedErr) {
+    throw formatSupabaseError(usedErr, 'Napaka pri preverjanju Jokerjev v tabeli "player_jokers"');
+  }
+
+  const uniqueUsedThemes = new Set((usedRows || []).map((r) => r.theme_id));
+  if (uniqueUsedThemes.has(themeId)) {
+    const remainingNow = Math.max(0, maxJokers - uniqueUsedThemes.size);
+    await supabase
+      .from('players')
+      .update({ jokers_remaining: remainingNow })
+      .eq('id', playerId);
+    return { success: true, jokersRemaining: remainingNow };
+  }
+
+  if (maxJokers - uniqueUsedThemes.size <= 0) {
+    await supabase
+      .from('players')
+      .update({ jokers_remaining: 0 })
+      .eq('id', playerId);
     return { success: false, jokersRemaining: 0 };
   }
 
-  const { error: insErr } = await supabase.from('player_jokers').insert({
-    id: crypto.randomUUID(),
-    session_id: sessionId,
-    player_id: playerId,
-    theme_id: themeId,
-  });
+  const reqStartedAt = Date.now();
+  const { data: inserted, error: insErr } = await supabase
+    .from('player_jokers')
+    .insert({
+      id: crypto.randomUUID(),
+      session_id: sessionId,
+      player_id: playerId,
+      theme_id: themeId,
+    })
+    .select('*')
+    .maybeSingle();
 
-  if (insErr) {
+  if (insErr && insErr.code !== '23505') {
     throw formatSupabaseError(insErr, 'Napaka pri aktivaciji Jokerja v tabeli "player_jokers"');
   }
 
-  const nextRemaining = remaining - 1;
+  if (!insErr && inserted) {
+    calibrateServerClockFromIso(
+      (inserted as PlayerJoker).created_at,
+      4000,
+      Date.now() - reqStartedAt
+    );
+  }
+
+  uniqueUsedThemes.add(themeId);
+  const nextRemaining = Math.max(0, maxJokers - uniqueUsedThemes.size);
   await supabase
     .from('players')
     .update({ jokers_remaining: nextRemaining })

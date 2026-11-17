@@ -25,7 +25,7 @@ import {
   Type,
 } from 'lucide-react';
 import { convertPdfToImages } from '../lib/pdfConverter';
-import { formatSloveneDate, roundPoints } from '../lib/questionUtils';
+import { formatSloveneDate, isMultipleChoiceMatch, roundPoints } from '../lib/questionUtils';
 import {
   createSlide,
   createTheme,
@@ -1467,14 +1467,10 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
 
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                               {(['A', 'B', 'C', 'D'] as const).map((letter) => {
-                                const isCorrect =
-                                  currentSlide.correct_answer === letter ||
-                                  Boolean(
-                                    currentSlide.correct_answer
-                                      ?.trim()
-                                      .toUpperCase()
-                                      .startsWith(letter)
-                                  );
+                                const isCorrect = isMultipleChoiceMatch(
+                                  currentSlide.correct_answer,
+                                  letter
+                                );
                                 return (
                                   <div
                                     key={letter}
@@ -1737,8 +1733,10 @@ export const QuizBuilder: React.FC<QuizBuilderProps> = ({ quizId, onBack }) => {
                                   {part.type === 'multiple_choice' && (
                                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
                                       {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => {
-                                        const isCorr =
-                                          part.correct_answer.trim().toUpperCase() === letter;
+                                        const isCorr = isMultipleChoiceMatch(
+                                          part.correct_answer,
+                                          letter
+                                        );
                                         return (
                                           <div
                                             key={letter}

@@ -63,6 +63,67 @@ export function cleanSupabaseAnonKey(rawKey: string | undefined | null): string 
   return rawKey.trim().replace(/^["']+|["']+$/g, '');
 }
 
+const CLOCK_OFFSET_STORAGE_KEY = 'trivia_server_clock_offset_ms';
+
+let serverClockOffsetMs: number = (() => {
+  if (typeof window === 'undefined') return 0;
+  try {
+    const raw = window.sessionStorage.getItem(CLOCK_OFFSET_STORAGE_KEY);
+    if (raw) {
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  } catch {
+    // ignore sessionStorage errors
+  }
+  return 0;
+})();
+
+/**
+ * Umeri odmik lokalne ure naprave glede na strežniški čas (Supabase Postgres DEFAULT now() ali HTTP Date glava),
+ * da odštevalniki in trajno zaklepanje časovnikov tečejo usklajeno na vseh napravah.
+ */
+export function calibrateServerClockFromIso(
+  serverIso: string | null | undefined,
+  maxRttMs: number = 4000,
+  rttMs: number = 0
+): void {
+  if (!serverIso) return;
+  if (rttMs > maxRttMs) return;
+  const serverMs = new Date(serverIso).getTime();
+  if (!Number.isFinite(serverMs)) return;
+
+  const estimatedServerNow = serverMs + Math.max(0, rttMs) / 2;
+  const rawOffset = estimatedServerNow - Date.now();
+  // Manjše omrežno nihanje (<= 1.5 s) prezremo, večji zamik naprave pa shranimo
+  const nextOffset = Math.abs(rawOffset) <= 1500 ? 0 : Math.round(rawOffset);
+
+  if (
+    serverClockOffsetMs === 0 ||
+    Math.abs(nextOffset - serverClockOffsetMs) > 1000 ||
+    nextOffset === 0
+  ) {
+    serverClockOffsetMs = nextOffset;
+    if (typeof window !== 'undefined') {
+      try {
+        window.sessionStorage.setItem(CLOCK_OFFSET_STORAGE_KEY, String(serverClockOffsetMs));
+      } catch {
+        // ignore storage errors
+      }
+    }
+  }
+}
+
+export function getSynchronizedNowMs(): number {
+  return Date.now() + serverClockOffsetMs;
+}
+
+export function getSynchronizedNowIso(): string {
+  return new Date(getSynchronizedNowMs()).toISOString();
+}
+
 export function getSupabaseConfig() {
   let localUrl = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_URL_KEY) : null;
   let localKey = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_ANON_KEY) : null;
@@ -104,8 +165,9 @@ export function getSupabaseConfig() {
   if (!url || url.includes('your-project-id')) {
     url = DEFAULT_SUPABASE_URL;
   }
+
   let anonKey = cleanSupabaseAnonKey(rawKey);
-  if (anonKey === 'your-supabase-anon-key') {
+  if (isPlaceholderKey(anonKey)) {
     anonKey = DEFAULT_SUPABASE_ANON_KEY;
   }
 
@@ -114,7 +176,7 @@ export function getSupabaseConfig() {
       anonKey &&
       url.startsWith('http') &&
       !url.includes('your-project-id') &&
-      anonKey !== 'your-supabase-anon-key'
+      !isPlaceholderKey(anonKey)
   );
 
   return { url, anonKey, isConfigured };
@@ -163,6 +225,21 @@ export function clearSupabaseConfig() {
   cachedClientKey = '';
 }
 
+const supabaseClockFetch: typeof fetch = async (input, init) => {
+  const startedAt = Date.now();
+  const response = await fetch(input, init);
+  const rttMs = Date.now() - startedAt;
+  try {
+    const serverDate = response.headers?.get?.('date');
+    if (serverDate) {
+      calibrateServerClockFromIso(serverDate, 2500, rttMs);
+    }
+  } catch {
+    // ignore header errors
+  }
+  return response;
+};
+
 let cachedClient: SupabaseClient | null = null;
 let cachedClientUrl = '';
 let cachedClientKey = '';
@@ -178,6 +255,9 @@ export function getSupabaseClient(): SupabaseClient | null {
       auth: {
         persistSession: true,
         autoRefreshToken: true,
+      },
+      global: {
+        fetch: supabaseClockFetch,
       },
     });
     cachedClientUrl = url;

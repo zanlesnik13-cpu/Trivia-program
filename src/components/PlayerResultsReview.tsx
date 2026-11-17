@@ -6,6 +6,7 @@ import {
   getSlideRegularPointsSum,
   isMultiPartSlide,
   parseMultiPartAnswer,
+  roundPoints,
 } from '../lib/questionUtils';
 import type { PlayerFullData, Theme } from '../types/quiz';
 
@@ -42,16 +43,22 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
             s.slide_type === 'closest_date'
         );
         const hasJoker = jokerThemes.has(theme.id);
-        const redneTocke = questions.reduce(
-          (acc, q) => acc + Number(myAnswers[q.id]?.awarded_points ?? 0),
-          0
+        const redneTocke = roundPoints(
+          questions.reduce(
+            (acc, q) => acc + roundPoints(myAnswers[q.id]?.awarded_points ?? 0),
+            0
+          )
         );
-        const bonusTocke = questions.reduce(
-          (acc, q) => acc + Number(myAnswers[q.id]?.bonus_points ?? 0),
-          0
+        const bonusTocke = roundPoints(
+          questions.reduce(
+            (acc, q) => acc + roundPoints(myAnswers[q.id]?.bonus_points ?? 0),
+            0
+          )
         );
-        const tockeTeme = (hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke;
-        const maxSum = questions.reduce((acc, q) => acc + getSlideRegularPointsSum(q), 0);
+        const tockeTeme = roundPoints((hasJoker ? redneTocke * 2 : redneTocke) + bonusTocke);
+        const maxSum = roundPoints(
+          questions.reduce((acc, q) => acc + getSlideRegularPointsSum(q), 0)
+        );
 
         return (
           <div key={theme.id} className="space-y-2.5">
@@ -83,6 +90,13 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
               const parsedMulti = multiPart
                 ? parseMultiPartAnswer(ans?.answer_text)
                 : null;
+              const hasLegacyMultiFallback = Boolean(
+                multiPart &&
+                  parsedMulti &&
+                  Object.keys(parsedMulti.values).length === 0 &&
+                  ans?.answer_text?.trim() &&
+                  !ans.answer_text.trim().startsWith('{')
+              );
               const singleDateDiff =
                 !multiPart && q.slide_type === 'closest_date' && ans?.answer_text
                   ? calculateDateDiffDays(ans.answer_text, q.correct_answer)
@@ -103,6 +117,14 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
                   <div className="grid grid-cols-1 gap-1.5 text-[11px]">
                     {multiPart && q.question_parts ? (
                       <div className="space-y-1.5 pt-0.5">
+                        {hasLegacyMultiFallback && (
+                          <div className="p-2 rounded-xl bg-slate-900/90 border border-slate-700/80 text-[11px] text-slate-300">
+                            <span className="text-slate-400">Shranjen odgovor: </span>
+                            <span className="font-mono-code font-bold text-slate-100">
+                              {ans?.answer_text}
+                            </span>
+                          </div>
+                        )}
                         {q.question_parts.map((part, pIdx) => {
                           const isBonus = Boolean(part.is_bonus);
                           const rawAns = parsedMulti?.values[part.id] || '';
@@ -215,7 +237,7 @@ export const PlayerResultsReview: React.FC<PlayerResultsReviewProps> = ({
                       <span className="text-slate-400">Točke:</span>
                       <div className="flex flex-wrap items-center justify-end gap-1.5">
                         <span className="font-mono-code font-bold text-slate-100">
-                          {fmt(pts)} / {fmt(Number(q.points ?? 0))}
+                          {fmt(pts)} / {fmt(getSlideRegularPointsSum(q))}
                           {hasJoker && (
                             <span className="text-amber-400"> → {fmt(pts * 2)} (🃏 ×2)</span>
                           )}

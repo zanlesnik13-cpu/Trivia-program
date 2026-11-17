@@ -40,7 +40,7 @@ import {
   savePlayerAnswerKeepalive,
   subscribeToDemoUpdates,
 } from '../lib/quizService';
-import { getSupabaseClient } from '../lib/supabase';
+import { getSupabaseClient, getSynchronizedNowMs } from '../lib/supabase';
 import type {
   Answer,
   GameSession,
@@ -130,7 +130,7 @@ function getSlideTimerInfo(
   const endMs = startMs + duration * 1000;
   const remainingMs = endMs - nowMs;
   const isExpired = nowMs >= endMs;
-  const timeLeftSecs = isExpired ? 0 : Math.ceil(remainingMs / 1000);
+  const timeLeftSecs = isExpired ? 0 : Math.min(duration, Math.ceil(remainingMs / 1000));
 
   return {
     hasTimer: true,
@@ -219,7 +219,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   const [saveSuccessNotice, setSaveSuccessNotice] = useState(false);
 
   // Časovnik v živo (globalna ura za trajne časovnike po slajdih)
-  const [timerNowMs, setTimerNowMs] = useState<number>(() => Date.now());
+  const [timerNowMs, setTimerNowMs] = useState<number>(() => getSynchronizedNowMs());
 
   // Joker aktivacija
   const [activatingJoker, setActivatingJoker] = useState(false);
@@ -353,6 +353,9 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
     inFlightSaveCountRef.current[slideId] = (inFlightSaveCountRef.current[slideId] || 0) + 1;
     lastLocalSaveTimestampRef.current[slideId] = Date.now();
+    if (lastConfirmedTextRef.current[slideId] === undefined) {
+      lastConfirmedTextRef.current[slideId] = dataNow.myAnswers[slideId]?.answer_text ?? '';
+    }
     pendingKeepalivePayloadRef.current[slideId] = { slide, serialized: cleanVal };
     setSlideAutoSaveStatus(slideId, 'saving');
 
@@ -536,7 +539,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     const dataNow = gameDataRef.current;
     if (!dataNow || !dataNow.currentTheme) return;
     if (dataNow.session.status !== 'active_theme') return;
-    if (isSlideLockedOrExpired(slide, dataNow.session, Date.now())) return;
+    if (isSlideLockedOrExpired(slide, dataNow.session, getSynchronizedNowMs())) return;
 
     const nextDrafts = { ...draftsRef.current, [draftKey]: newValue };
     draftsRef.current = nextDrafts;
@@ -608,7 +611,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               prevLockedSlideIdsRef.current = new Set(
                 normalizeLockedSlideIds(fullData.session.locked_slide_ids)
               );
-              prevExpiredSlideIdsRef.current = collectExpiredSlideIds(fullData.session, Date.now());
+              prevExpiredSlideIdsRef.current = collectExpiredSlideIds(
+                fullData.session,
+                getSynchronizedNowMs()
+              );
               lastSeenSlideIdRef.current = fullData.session.current_slide_id;
               lastSeenThemeIdRef.current = fullData.session.current_theme_id;
               prevStatusRef.current = fullData.session.status;
@@ -638,13 +644,32 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         if (
           dirtySlidesRef.current[sId] ||
           debounceTimersRef.current[sId] ||
-          pendingKeepalivePayloadRef.current[sId]
+          (pendingKeepalivePayloadRef.current[sId] &&
+            (inFlightSaveCountRef.current[sId] || 0) === 0)
         ) {
           void flushSlideById(sId);
         }
       }
     }
     prevLockedSlideIdsRef.current = new Set(lockedIds);
+  };
+
+  // Shrani čakajoče osnutke za slajde, katerih časovnik se je pravkar iztekel
+  const flushNewlyExpiredSlides = (session: GameSession) => {
+    const expiredIds = collectExpiredSlideIds(session, getSynchronizedNowMs());
+    for (const sId of expiredIds) {
+      if (!prevExpiredSlideIdsRef.current.has(sId)) {
+        if (
+          dirtySlidesRef.current[sId] ||
+          debounceTimersRef.current[sId] ||
+          (pendingKeepalivePayloadRef.current[sId] &&
+            (inFlightSaveCountRef.current[sId] || 0) === 0)
+        ) {
+          void flushSlideById(sId);
+        }
+      }
+    }
+    prevExpiredSlideIdsRef.current = expiredIds;
   };
 
   // 2. Osveževanje podatkov o igralcu (brez prepisovanja aktivnega tipkanja!)
@@ -654,8 +679,9 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     try {
       const full = await fetchPlayerGameData(activeSessionId, activePlayerId);
 
-      // Če je gostitelj zaklenil katerega od slajdov, najprej shrani morebiten neshranjen osnutek tega slajda
+      // Če je gostitelj zaklenil katerega od slajdov ali mu je potekel čas, najprej shrani morebiten neshranjen osnutek
       flushNewlyLockedSlides(full.session.locked_slide_ids);
+      flushNewlyExpiredSlides(full.session);
 
       // Preden preklopimo na nov slajd ali zaključimo sklop, takoj shranimo morebitne čakajoče osnutke!
       const newHostSlideId = full.session.current_slide_id;
@@ -704,6 +730,15 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
           delete unverifiedKeepaliveSlidesRef.current[sId];
           dirtySlidesRef.current[sId] = pending.slide;
           void flushSlideById(sId);
+        }
+      }
+
+      // Samodejno ponovno poskusi shraniti neuspele/osirotele osnutke, ko povezava spet deluje
+      if (full.session.status !== 'finished') {
+        for (const sId of Object.keys(dirtySlidesRef.current)) {
+          if (!debounceTimersRef.current[sId] && (inFlightSaveCountRef.current[sId] || 0) === 0) {
+            void flushSlideById(sId);
+          }
         }
       }
 
@@ -770,6 +805,18 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
               if (updatedSession.locked_slide_ids !== undefined) {
                 flushNewlyLockedSlides(updatedSession.locked_slide_ids);
+              }
+              if (
+                gameDataRef.current &&
+                (updatedSession.slide_timers !== undefined ||
+                  updatedSession.timer_started_at !== undefined ||
+                  updatedSession.timer_duration !== undefined)
+              ) {
+                const mergedSessionForTimer = normalizeGameSession({
+                  ...gameDataRef.current.session,
+                  ...updatedSession,
+                });
+                flushNewlyExpiredSlides(mergedSessionForTimer);
               }
 
               // Takojšnje shranjevanje neshranjenih osnutkov pred zaklepanjem ali menjavo slajda!
@@ -910,7 +957,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     };
 
     const tickAll = () => {
-      const now = Date.now();
+      const now = getSynchronizedNowMs();
       const tracked = getTrackedTimers();
       let anyRunning = false;
 
@@ -1077,7 +1124,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
       prevLockedSlideIdsRef.current = new Set(
         normalizeLockedSlideIds(fullData.session.locked_slide_ids)
       );
-      prevExpiredSlideIdsRef.current = collectExpiredSlideIds(fullData.session, Date.now());
+      prevExpiredSlideIdsRef.current = collectExpiredSlideIds(
+        fullData.session,
+        getSynchronizedNowMs()
+      );
       lastSeenSlideIdRef.current = fullData.session.current_slide_id;
       lastSeenThemeIdRef.current = fullData.session.current_theme_id;
       prevStatusRef.current = fullData.session.status;
@@ -1164,7 +1214,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     if (!gameData || !gameData.currentTheme || !targetSlide) return;
     if (
       gameData.session.status !== 'active_theme' ||
-      isSlideLockedOrExpired(targetSlide, gameData.session, Date.now())
+      isSlideLockedOrExpired(targetSlide, gameData.session, getSynchronizedNowMs())
     ) {
       return;
     }

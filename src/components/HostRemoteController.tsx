@@ -33,6 +33,7 @@ import {
   calculateDateDiffDays,
   formatDaysDeviationLabel,
   formatSloveneDate,
+  isMultipleChoiceMatch,
   isMultiPartSlide,
   parseMultiPartAnswer,
   roundPoints,
@@ -51,8 +52,13 @@ import {
   togglePlayerJoker,
   updateGameSession,
   upsertGradedAnswer,
+  waitForPendingAnswerSaves,
 } from '../lib/quizService';
-import { getSupabaseClient } from '../lib/supabase';
+import {
+  getSupabaseClient,
+  getSynchronizedNowIso,
+  getSynchronizedNowMs,
+} from '../lib/supabase';
 import type {
   Answer,
   GameSessionStatus,
@@ -75,6 +81,70 @@ const DEMO_NICKNAMES = [
   'Zadnja Miza',
 ];
 
+interface BufferedNumberInputProps {
+  value: number;
+  step?: string;
+  min?: number;
+  className?: string;
+  onCommit: (val: number) => void;
+}
+
+const BufferedNumberInput: React.FC<BufferedNumberInputProps> = ({
+  value,
+  step = '0.25',
+  min = 0,
+  className = '',
+  onCommit,
+}) => {
+  const [text, setText] = useState<string>(String(value));
+  const focusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusedRef.current) {
+      setText(String(value));
+    }
+  }, [value]);
+
+  return (
+    <input
+      type="number"
+      step={step}
+      min={min}
+      value={text}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onChange={(e) => {
+        const nextText = e.target.value;
+        setText(nextText);
+        if (nextText.trim() === '' || nextText.endsWith('.') || nextText.endsWith(',')) {
+          return;
+        }
+        const parsed = parseFloat(nextText.replace(',', '.'));
+        if (Number.isFinite(parsed) && parsed >= min) {
+          onCommit(roundPoints(parsed));
+        }
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        const trimmed = text.trim();
+        if (trimmed === '') {
+          setText('0');
+          if (value !== 0) onCommit(0);
+          return;
+        }
+        const parsed = parseFloat(trimmed.replace(',', '.'));
+        const safe = Number.isFinite(parsed) ? roundPoints(Math.max(min, parsed)) : value;
+        setText(String(safe));
+        if (safe !== value) {
+          onCommit(safe);
+        }
+      }}
+      className={className}
+    />
+  );
+};
+
 export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   sessionId,
   onExit,
@@ -90,10 +160,16 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const [customExtendUnit, setCustomExtendUnit] = useState<'sec' | 'min'>('sec');
   const [refreshing, setRefreshing] = useState(false);
 
+  // Ref-i za zaščito optimističnih ocen gostitelja pred prekrivanjem ob 3s osveževanju
+  const dataRef = useRef<PresentationData | null>(null);
+  const inFlightGradeCountRef = useRef<Record<string, number>>({});
+  const lastGradeTimestampRef = useRef<Record<string, number>>({});
+
   // Beležimo, za katero temo smo že sprožili avtomatsko pred-ocenjevanje v tem pogledu
   const preGradedThemeRef = useRef<string | null>(null);
 
   const loadData = async () => {
+    const fetchStartedAt = Date.now();
     try {
       const supabase = getSupabaseClient();
       if (!supabase) {
@@ -107,7 +183,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         .from('game_sessions')
         .select('*')
         .eq('id', sessionId)
-        .single();
+        .maybeSingle();
 
       if (sessionErr || !sessionRow) {
         const msg = sessionErr
@@ -117,7 +193,29 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       }
 
       const presData = await fetchPresentationData(sessionId);
-      setData(presData);
+      setData((prev) => {
+        const answerMap = new Map<string, Answer>();
+        for (const srvAns of presData.answers) {
+          answerMap.set(`${srvAns.player_id}:${srvAns.slide_id}`, srvAns);
+        }
+        if (prev) {
+          for (const prevAns of prev.answers) {
+            const gKey = `${prevAns.player_id}:${prevAns.slide_id}`;
+            const isSavingNow = (inFlightGradeCountRef.current[gKey] || 0) > 0;
+            const gradedRecently =
+              (lastGradeTimestampRef.current[gKey] || 0) >= fetchStartedAt - 200;
+            if (isSavingNow || gradedRecently) {
+              answerMap.set(gKey, prevAns);
+            }
+          }
+        }
+        const merged: PresentationData = {
+          ...presData,
+          answers: Array.from(answerMap.values()),
+        };
+        dataRef.current = merged;
+        return merged;
+      });
       setError(null);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Napaka pri nalaganju seje iz Supabase.');
@@ -166,12 +264,14 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 const nextSlide =
                   nextThemeSlides.find((s) => s.id === mergedSession.current_slide_id) ||
                   prev.currentSlide;
-                return {
+                const next = {
                   ...prev,
                   session: mergedSession,
                   currentTheme: nextTheme,
                   currentSlide: nextSlide,
                 };
+                dataRef.current = next;
+                return next;
               });
             }
             loadData();
@@ -272,20 +372,28 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
 
     const startTime = new Date(activeSlideTimerEntry.startedAt).getTime();
+    if (!Number.isFinite(startTime)) {
+      setTimeLeft(null);
+      return;
+    }
     const durationMs = activeSlideTimerEntry.duration * 1000;
     const endTime = startTime + durationMs;
 
+    const computeClampedTimeLeft = () => {
+      const remainingMs = endTime - getSynchronizedNowMs();
+      if (remainingMs <= 0) return 0;
+      return Math.min(activeSlideTimerEntry.duration, Math.ceil(remainingMs / 1000));
+    };
+
     const interval = setInterval(() => {
-      const remainingMs = endTime - Date.now();
-      if (remainingMs <= 0) {
-        setTimeLeft(0);
+      const next = computeClampedTimeLeft();
+      setTimeLeft(next);
+      if (next <= 0) {
         clearInterval(interval);
-      } else {
-        setTimeLeft(Math.ceil(remainingMs / 1000));
       }
     }, 200);
 
-    setTimeLeft(Math.max(0, Math.ceil((endTime - Date.now()) / 1000)));
+    setTimeLeft(computeClampedTimeLeft());
     return () => clearInterval(interval);
   }, [activeSlideTimerEntry?.startedAt, activeSlideTimerEntry?.duration]);
 
@@ -297,16 +405,33 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         data.currentTheme &&
         preGradedThemeRef.current !== data.currentTheme.id
       ) {
-        preGradedThemeRef.current = data.currentTheme.id;
-        const themeSlides = data.slidesByTheme[data.currentTheme.id] || [];
-        const themeAnswers = data.answers.filter((a) => a.theme_id === data.currentTheme?.id);
-        await autoPreGradeTheme(sessionId, data.currentTheme.id, themeSlides, themeAnswers);
-        await loadData();
+        const curThemeId = data.currentTheme.id;
+        preGradedThemeRef.current = curThemeId;
+        try {
+          await waitForPendingAnswerSaves();
+          const freshPres = await fetchPresentationData(sessionId);
+          const themeSlides = freshPres.slidesByTheme[curThemeId] || [];
+          const themeSlideIdSet = new Set(themeSlides.map((s) => s.id));
+          const themeAnswers = freshPres.answers.filter(
+            (a) => a.theme_id === curThemeId || themeSlideIdSet.has(a.slide_id)
+          );
+          if (themeAnswers.some((a) => !a.graded)) {
+            await autoPreGradeTheme(sessionId, curThemeId, themeSlides, themeAnswers);
+          }
+          await loadData();
+        } catch (err: unknown) {
+          preGradedThemeRef.current = null;
+          setError(
+            err instanceof Error
+              ? err.message
+              : 'Napaka pri avtomatskem pred-ocenjevanju odgovorov.'
+          );
+        }
       } else if (data?.session?.status !== 'grading_theme') {
         preGradedThemeRef.current = null;
       }
     };
-    runPreGradeIfNeeded();
+    void runPreGradeIfNeeded();
   }, [data?.session?.status, data?.currentTheme?.id]);
 
   // Seznam slajdov trenutne teme
@@ -373,7 +498,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
     const defaultSecs = Math.round(Number(targetSlide.timer_seconds ?? 0));
     if (defaultSecs > 0) {
-      const nowIso = new Date().toISOString();
+      const nowIso = getSynchronizedNowIso();
       return {
         timer_started_at: nowIso,
         timer_duration: defaultSecs,
@@ -463,7 +588,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const handleTriggerTimer = async (seconds: number) => {
     setActionLoading(true);
     try {
-      const nowIso = new Date().toISOString();
+      const nowIso = getSynchronizedNowIso();
       const curSlide = data?.currentSlide;
       const existingTimers = normalizeSlideTimers(data?.session?.slide_timers);
       const nextSlideTimers =
@@ -503,12 +628,17 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
           ? sess.timer_duration
           : 0;
 
+      const baseEndMs = baseStartedAt
+        ? new Date(baseStartedAt).getTime() + baseDuration * 1000
+        : NaN;
       const running =
         Boolean(baseStartedAt) &&
         baseDuration > 0 &&
-        new Date(baseStartedAt!).getTime() + baseDuration * 1000 > Date.now();
+        Number.isFinite(baseEndMs) &&
+        baseEndMs > getSynchronizedNowMs();
 
-      const nextStartedAt = running && baseStartedAt ? baseStartedAt : new Date().toISOString();
+      const nextStartedAt =
+        running && baseStartedAt ? baseStartedAt : getSynchronizedNowIso();
       const nextDuration = running ? baseDuration + sec : sec;
 
       const nextSlideTimers =
@@ -626,24 +756,35 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // 5. Zaključi tematiko in oceni odgovore (prehod v 'grading_theme' + avtomatsko pred-ocenjevanje)
+  // 5. Zaključi tematiko in oceni odgovore (najprej zaklene in počaka na zadnje osnutke igralcev, nato pred-oceni!)
   const handleFinishThemeAndGrade = async () => {
-    if (!data || !data.currentTheme) return;
+    const activeData = dataRef.current || data;
+    if (!activeData || !activeData.currentTheme) return;
+    const curThemeId = activeData.currentTheme.id;
     setActionLoading(true);
+    preGradedThemeRef.current = curThemeId;
     try {
-      const themeSlides = data.slidesByTheme[data.currentTheme.id] || [];
-      const themeAnswers = data.answers.filter((a) => a.theme_id === data.currentTheme?.id);
-
-      await autoPreGradeTheme(sessionId, data.currentTheme.id, themeSlides, themeAnswers);
-      preGradedThemeRef.current = data.currentTheme.id;
-
       await updateGameSession(sessionId, {
         status: 'grading_theme',
         timer_started_at: null,
         timer_duration: 0,
       });
+
+      // Kratko okno, da telefoni igralcev ob prehodu v grading_theme takoj pošljejo zadnje neshranjene osnutke
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      await waitForPendingAnswerSaves();
+
+      const freshPres = await fetchPresentationData(sessionId);
+      const themeSlides = freshPres.slidesByTheme[curThemeId] || [];
+      const themeSlideIdSet = new Set(themeSlides.map((s) => s.id));
+      const themeAnswers = freshPres.answers.filter(
+        (a) => a.theme_id === curThemeId || themeSlideIdSet.has(a.slide_id)
+      );
+
+      await autoPreGradeTheme(sessionId, curThemeId, themeSlides, themeAnswers);
       await loadData();
     } catch (err: unknown) {
+      preGradedThemeRef.current = null;
       setError(err instanceof Error ? err.message : 'Napaka pri prehodu na ocenjevanje.');
     } finally {
       setActionLoading(false);
@@ -661,7 +802,9 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     bonusPoints?: number,
     overrideAnswerText?: string
   ) => {
-    if (!data?.currentTheme) return;
+    const activeData = dataRef.current || data;
+    if (!activeData?.currentTheme) return;
+    const themeId = activeData.currentTheme.id;
     const safePoints = roundPoints(
       Math.max(0, Number.isNaN(awardedPoints) ? 0 : awardedPoints)
     );
@@ -675,6 +818,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         ? overrideAnswerText
         : existingAnswer?.answer_text ?? '';
 
+    const gradeKey = `${playerId}:${slide.id}`;
+    inFlightGradeCountRef.current[gradeKey] =
+      (inFlightGradeCountRef.current[gradeKey] || 0) + 1;
+    lastGradeTimestampRef.current[gradeKey] = Date.now();
+
     // Optimistična posodobitev v UI za takojšnjo odzivnost na telefonu
     setData((prev) => {
       if (!prev) return prev;
@@ -685,7 +833,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         id: idx >= 0 ? prev.answers[idx].id : `temp-${playerId}-${slide.id}`,
         session_id: sessionId,
         player_id: playerId,
-        theme_id: prev.currentTheme!.id,
+        theme_id: prev.currentTheme?.id || themeId,
         slide_id: slide.id,
         answer_text: ansText,
         is_correct: isCorrect,
@@ -705,14 +853,16 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       } else {
         nextAnswers.push(updatedAns);
       }
-      return { ...prev, answers: nextAnswers };
+      const nextData = { ...prev, answers: nextAnswers };
+      dataRef.current = nextData;
+      return nextData;
     });
 
     try {
-      await upsertGradedAnswer(
+      const savedAns = await upsertGradedAnswer(
         sessionId,
         playerId,
-        data.currentTheme.id,
+        themeId,
         slide.id,
         ansText,
         isCorrect,
@@ -720,9 +870,34 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         hostComment,
         safeBonus
       );
+      lastGradeTimestampRef.current[gradeKey] = Date.now();
+      if ((inFlightGradeCountRef.current[gradeKey] || 0) <= 1) {
+        setData((prev) => {
+          if (!prev) return prev;
+          const idx = prev.answers.findIndex(
+            (a) => a.player_id === playerId && a.slide_id === slide.id
+          );
+          const nextAnswers = [...prev.answers];
+          if (idx >= 0) {
+            nextAnswers[idx] = savedAns;
+          } else {
+            nextAnswers.push(savedAns);
+          }
+          const nextData = { ...prev, answers: nextAnswers };
+          dataRef.current = nextData;
+          return nextData;
+        });
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Napaka pri shranjevanju ocene.');
-      await loadData();
+      if ((inFlightGradeCountRef.current[gradeKey] || 0) <= 1) {
+        await loadData();
+      }
+    } finally {
+      inFlightGradeCountRef.current[gradeKey] = Math.max(
+        0,
+        (inFlightGradeCountRef.current[gradeKey] || 1) - 1
+      );
     }
   };
 
@@ -771,13 +946,19 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const handleConfirmGradesAndLeaderboard = async () => {
     setActionLoading(true);
     try {
-      // Shrani še neshranjene komentarje gostitelja in aktualne bonus_points
+      const latestData = dataRef.current || data;
+      // Shrani še neshranjene komentarje gostitelja iz zadnjega vnosa
       for (const [key, text] of Object.entries(commentDrafts.current)) {
-        const [pid, sid] = key.split(':');
-        const slide = (data?.slidesByTheme?.[data.currentTheme?.id ?? ''] || []).find(
-          (sl) => sl.id === sid
+        const colonIdx = key.indexOf(':');
+        if (colonIdx <= 0) continue;
+        const pid = key.slice(0, colonIdx);
+        const sid = key.slice(colonIdx + 1);
+        const slide = (
+          latestData?.slidesByTheme?.[latestData.currentTheme?.id ?? ''] || []
+        ).find((sl) => sl.id === sid);
+        const ans = latestData?.answers.find(
+          (a) => a.player_id === pid && a.slide_id === sid
         );
-        const ans = data?.answers.find((a) => a.player_id === pid && a.slide_id === sid);
         if (slide && (ans?.host_comment ?? '') !== text) {
           await handleGradeAnswer(
             pid,
@@ -792,30 +973,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       }
       commentDrafts.current = {};
 
-      // Poskrbi, da so vsi spremenjeni bonus_points v trenutni temi zapisani v tabelo answers
-      if (data?.currentTheme) {
-        const curSlides = data.slidesByTheme[data.currentTheme.id] || [];
-        const slideSet = new Set(curSlides.map((s) => s.id));
-        const bonusAnswers = data.answers.filter(
-          (a) => slideSet.has(a.slide_id) && Number(a.bonus_points ?? 0) > 0
-        );
-        for (const ans of bonusAnswers) {
-          const sl = curSlides.find((s) => s.id === ans.slide_id);
-          if (sl) {
-            await upsertGradedAnswer(
-              sessionId,
-              ans.player_id,
-              data.currentTheme.id,
-              sl.id,
-              ans.answer_text ?? '',
-              Boolean(ans.is_correct),
-              roundPoints(Number(ans.awarded_points ?? 0)),
-              ans.host_comment ?? undefined,
-              roundPoints(Number(ans.bonus_points ?? 0))
-            );
-          }
-        }
-      }
+      // Počakaj, da se vsi sproženi zapisi ocen (tudi ob onBlur) varno shranijo v Supabase
+      await waitForPendingAnswerSaves();
 
       await confirmThemeGradesAndShowLeaderboard(sessionId);
       await loadData();
@@ -841,6 +1000,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
           timer_duration: 0,
         });
         await loadData();
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : 'Napaka pri zaključku kviza.');
       } finally {
         setActionLoading(false);
       }
@@ -863,6 +1024,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
         ...timerPatch,
       });
       await loadData();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Napaka pri prehodu na naslednjo tematiko.');
     } finally {
       setActionLoading(false);
     }
@@ -871,75 +1034,91 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   // Pomožne funkcije za hitro simulacijo igralcev/odgovorov med testiranjem
   const handleAddDemoPlayer = async () => {
     if (!data) return;
-    const existing = new Set(data.players.map((p) => p.nickname));
-    const available = DEMO_NICKNAMES.filter((n) => !existing.has(n));
-    const name =
-      available[0] || `Ekipa #${data.players.length + 1}`;
-    await addDemoPlayer(sessionId, name);
-    await loadData();
+    try {
+      const existing = new Set(data.players.map((p) => p.nickname));
+      const available = DEMO_NICKNAMES.filter((n) => !existing.has(n));
+      const name =
+        available[0] || `Ekipa #${data.players.length + 1}`;
+      await addDemoPlayer(sessionId, name);
+      await loadData();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Napaka pri dodajanju testnega igralca.');
+    }
   };
 
   const handleSimulateAnswersForSlide = async () => {
     if (!data || !data.currentTheme || !data.currentSlide) return;
-    const slide = data.currentSlide;
-    for (let i = 0; i < data.players.length; i++) {
-      const p = data.players[i];
-      let sampleAnswer = '';
-      if (isMultiPartSlide(slide)) {
-        const partMap: Record<string, string> = {};
-        (slide.question_parts || []).forEach((part) => {
-          if (part.type === 'multiple_choice') {
-            const choices = ['A', 'B', 'C', 'D'];
-            partMap[part.id] =
-              i === 0 && part.correct_answer ? part.correct_answer : choices[i % 4];
-          } else if (part.type === 'closest_number') {
-            const base = parseFloat(part.correct_answer || '100') || 100;
-            partMap[part.id] = String(base + (i === 0 ? 0 : (i + 1) * 3));
-          } else if (part.type === 'closest_date') {
-            const baseDate = part.correct_answer || '1991-06-25';
-            if (i === 0) {
-              partMap[part.id] = baseDate;
+    try {
+      const slide = data.currentSlide;
+      for (let i = 0; i < data.players.length; i++) {
+        const p = data.players[i];
+        let sampleAnswer = '';
+        if (isMultiPartSlide(slide)) {
+          const partMap: Record<string, string> = {};
+          (slide.question_parts || []).forEach((part) => {
+            if (part.type === 'multiple_choice') {
+              const choices = ['A', 'B', 'C', 'D'];
+              partMap[part.id] =
+                i === 0 && part.correct_answer ? part.correct_answer : choices[i % 4];
+            } else if (part.type === 'closest_number') {
+              const base = parseFloat(part.correct_answer || '100') || 100;
+              partMap[part.id] = String(base + (i === 0 ? 0 : (i + 1) * 3));
+            } else if (part.type === 'closest_date') {
+              const baseDate = part.correct_answer || '1991-06-25';
+              if (i === 0) {
+                partMap[part.id] = baseDate;
+              } else {
+                const d = new Date(`${baseDate}T00:00:00Z`);
+                if (Number.isFinite(d.getTime())) {
+                  d.setUTCDate(d.getUTCDate() + i * 5);
+                  partMap[part.id] = d.toISOString().slice(0, 10);
+                } else {
+                  partMap[part.id] = '1991-06-25';
+                }
+              }
             } else {
-              const d = new Date(`${baseDate}T00:00:00Z`);
-              d.setUTCDate(d.getUTCDate() + i * 5);
-              partMap[part.id] = d.toISOString().slice(0, 10);
+              partMap[part.id] =
+                i === 0 && part.correct_answer
+                  ? part.correct_answer
+                  : `Odgovor (${p.nickname})`;
             }
+          });
+          sampleAnswer = serializeMultiPartAnswer(partMap);
+        } else if (slide.slide_type === 'multiple_choice') {
+          const choices = ['A', 'B', 'C', 'D'];
+          sampleAnswer = i === 0 && slide.correct_answer ? slide.correct_answer : choices[i % 4];
+        } else if (slide.slide_type === 'closest_number') {
+          const base = parseFloat(slide.correct_answer || '1999') || 1999;
+          sampleAnswer = String(base + (i === 0 ? 1 : (i + 1) * 4));
+        } else if (slide.slide_type === 'closest_date') {
+          const baseDate = slide.correct_answer || '1991-06-25';
+          if (i === 0) {
+            sampleAnswer = baseDate;
           } else {
-            partMap[part.id] =
-              i === 0 && part.correct_answer
-                ? part.correct_answer
-                : `Odgovor (${p.nickname})`;
+            const d = new Date(`${baseDate}T00:00:00Z`);
+            if (Number.isFinite(d.getTime())) {
+              d.setUTCDate(d.getUTCDate() + i * 7);
+              sampleAnswer = d.toISOString().slice(0, 10);
+            } else {
+              sampleAnswer = '1991-06-25';
+            }
           }
-        });
-        sampleAnswer = serializeMultiPartAnswer(partMap);
-      } else if (slide.slide_type === 'multiple_choice') {
-        const choices = ['A', 'B', 'C', 'D'];
-        sampleAnswer = i === 0 && slide.correct_answer ? slide.correct_answer : choices[i % 4];
-      } else if (slide.slide_type === 'closest_number') {
-        const base = parseFloat(slide.correct_answer || '1999') || 1999;
-        sampleAnswer = String(base + (i === 0 ? 1 : (i + 1) * 4));
-      } else if (slide.slide_type === 'closest_date') {
-        const baseDate = slide.correct_answer || '1991-06-25';
-        if (i === 0) {
-          sampleAnswer = baseDate;
         } else {
-          const d = new Date(`${baseDate}T00:00:00Z`);
-          d.setUTCDate(d.getUTCDate() + i * 7);
-          sampleAnswer = d.toISOString().slice(0, 10);
+          sampleAnswer =
+            i === 0 && slide.correct_answer ? slide.correct_answer : `Odgovor ekipe ${p.nickname}`;
         }
-      } else {
-        sampleAnswer =
-          i === 0 && slide.correct_answer ? slide.correct_answer : `Odgovor ekipe ${p.nickname}`;
+        await submitDemoAnswer(
+          sessionId,
+          p.id,
+          data.currentTheme.id,
+          slide.id,
+          sampleAnswer
+        );
       }
-      await submitDemoAnswer(
-        sessionId,
-        p.id,
-        data.currentTheme.id,
-        slide.id,
-        sampleAnswer
-      );
+      await loadData();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Napaka pri simulaciji odgovorov.');
     }
-    await loadData();
   };
 
   if (loading) {
@@ -1233,8 +1412,16 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                       <div
                         key={p.id}
                         onClick={async () => {
-                          await togglePlayerJoker(sessionId, p.id, currentTheme.id);
-                          await loadData();
+                          try {
+                            await togglePlayerJoker(sessionId, p.id, currentTheme.id);
+                            await loadData();
+                          } catch (err: unknown) {
+                            setError(
+                              err instanceof Error
+                                ? err.message
+                                : 'Napaka pri preklopu Jokerja.'
+                            );
+                          }
                         }}
                         className={`flex items-center justify-between p-3 rounded-xl border transition-all cursor-pointer ${
                           hasJoker
@@ -1349,11 +1536,10 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                 currentSlide.slide_type === 'multiple_choice' && (
                   <div className="grid grid-cols-2 gap-1.5 text-xs">
                     {(['A', 'B', 'C', 'D'] as const).map((optKey) => {
-                      const isRight =
-                        currentSlide.correct_answer === optKey ||
-                        Boolean(
-                          currentSlide.correct_answer?.trim().toUpperCase().startsWith(optKey)
-                        );
+                      const isRight = isMultipleChoiceMatch(
+                        currentSlide.correct_answer,
+                        optKey
+                      );
                       return (
                         <div
                           key={optKey}
@@ -1683,10 +1869,13 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                       const isLocked = lockedSlideIdSet.has(slide.id);
                       const isCur = slide.id === currentSlide.id;
                       const timerEntry = normalizedSlideTimers[slide.id];
+                      const tStartMs = timerEntry
+                        ? new Date(timerEntry.started_at).getTime()
+                        : NaN;
                       const isTimerDone =
                         Boolean(timerEntry) &&
-                        Date.now() >=
-                          new Date(timerEntry.started_at).getTime() + timerEntry.duration * 1000;
+                        Number.isFinite(tStartMs) &&
+                        getSynchronizedNowMs() >= tStartMs + timerEntry.duration * 1000;
 
                       return (
                         <div
@@ -1841,28 +2030,28 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                     (!multiPart && slide.slide_type === 'closest_date') ||
                     Boolean(datePartForSorting);
 
+                  const dateDiffByPlayerId = new Map<string, number | null>();
+                  if (shouldSortByDate) {
+                    for (const p of players) {
+                      const pAns = slideAnswers.find((a) => a.player_id === p.id);
+                      let diff: number | null = null;
+                      if (!multiPart && slide.slide_type === 'closest_date') {
+                        diff = calculateDateDiffDays(pAns?.answer_text, slide.correct_answer);
+                      } else if (datePartForSorting) {
+                        const parsed = parseMultiPartAnswer(pAns?.answer_text);
+                        diff = calculateDateDiffDays(
+                          parsed.values[datePartForSorting.id],
+                          datePartForSorting.correct_answer
+                        );
+                      }
+                      dateDiffByPlayerId.set(p.id, diff);
+                    }
+                  }
+
                   const sortedPlayersForSlide = shouldSortByDate
                     ? [...players].sort((pA, pB) => {
-                        const ansA = slideAnswers.find((a) => a.player_id === pA.id);
-                        const ansB = slideAnswers.find((a) => a.player_id === pB.id);
-                        let diffA: number | null = null;
-                        let diffB: number | null = null;
-
-                        if (!multiPart && slide.slide_type === 'closest_date') {
-                          diffA = calculateDateDiffDays(ansA?.answer_text, slide.correct_answer);
-                          diffB = calculateDateDiffDays(ansB?.answer_text, slide.correct_answer);
-                        } else if (datePartForSorting) {
-                          const parsedA = parseMultiPartAnswer(ansA?.answer_text);
-                          const parsedB = parseMultiPartAnswer(ansB?.answer_text);
-                          diffA = calculateDateDiffDays(
-                            parsedA.values[datePartForSorting.id],
-                            datePartForSorting.correct_answer
-                          );
-                          diffB = calculateDateDiffDays(
-                            parsedB.values[datePartForSorting.id],
-                            datePartForSorting.correct_answer
-                          );
-                        }
+                        const diffA = dateDiffByPlayerId.get(pA.id) ?? null;
+                        const diffB = dateDiffByPlayerId.get(pB.id) ?? null;
 
                         if (diffA === null && diffB === null) return 0;
                         if (diffA === null) return 1;
@@ -1999,11 +2188,23 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                 <div className="flex items-start justify-between gap-2">
                                   <div className="min-w-0 flex-1">
                                     <div className="flex items-center gap-1.5 flex-wrap">
-                                      {shouldSortByDate && (
-                                        <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono-code text-[10px] font-bold">
-                                          #{sortRankIdx + 1}
-                                        </span>
-                                      )}
+                                      {shouldSortByDate &&
+                                        (() => {
+                                          const playerDateDiff =
+                                            dateDiffByPlayerId.get(player.id) ?? null;
+                                          return playerDateDiff !== null ? (
+                                            <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono-code text-[10px] font-bold">
+                                              #{sortRankIdx + 1}
+                                            </span>
+                                          ) : (
+                                            <span
+                                              className="px-1.5 py-0.2 rounded bg-slate-900 text-slate-500 border border-slate-800 font-mono-code text-[10px] font-bold"
+                                              title="Brez veljavnega datuma"
+                                            >
+                                              #—
+                                            </span>
+                                          );
+                                        })()}
                                       <span className="text-xs font-bold text-slate-200 truncate">
                                         {player.nickname}
                                       </span>
@@ -2142,6 +2343,16 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                 {/* VEČDELNO VPRAŠANJE: Ločeno ocenjevanje vsakega podvprašanja in bonus vprašanja */}
                                 {multiPart && parsedMulti && (
                                   <div className="space-y-2 pt-1.5 border-t border-slate-800/80">
+                                    {Object.keys(parsedMulti.values).length === 0 &&
+                                      ans?.answer_text?.trim() &&
+                                      !ans.answer_text.trim().startsWith('{') && (
+                                        <div className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-700/80 text-xs text-slate-300">
+                                          <span className="text-slate-400">Shranjen odgovor: </span>
+                                          <span className="font-mono-code font-bold text-white break-words">
+                                            {ans.answer_text}
+                                          </span>
+                                        </div>
+                                      )}
                                     {parts.map((part, pIdx) => {
                                       const isBonus = Boolean(part.is_bonus);
                                       const rawVal = parsedMulti.values[part.id] ?? '';
@@ -2294,21 +2505,19 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                               >
                                                 -0.25
                                               </button>
-                                              <input
-                                                type="number"
+                                              <BufferedNumberInput
                                                 step="0.25"
                                                 min={0}
                                                 value={currentPartScore}
-                                                onChange={(e) => {
-                                                  const val = parseFloat(e.target.value || '0');
+                                                onCommit={(val) =>
                                                   handleGradeQuestionPart(
                                                     player.id,
                                                     slide,
                                                     ans,
                                                     part.id,
                                                     val
-                                                  );
-                                                }}
+                                                  )
+                                                }
                                                 className={`w-14 px-1.5 py-0.5 rounded-lg bg-slate-950 border text-right font-mono-code font-bold text-xs focus:outline-none ${
                                                   isBonus
                                                     ? 'border-amber-500/50 text-amber-300 focus:border-amber-400'
@@ -2391,21 +2600,19 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                     >
                                       <Minus className="w-3.5 h-3.5" />
                                     </button>
-                                    <input
-                                      type="number"
+                                    <BufferedNumberInput
                                       step="0.25"
                                       min={0}
                                       value={awarded}
-                                      onChange={(e) => {
-                                        const val = parseFloat(e.target.value || '0');
+                                      onCommit={(val) =>
                                         handleGradeAnswer(
                                           player.id,
                                           slide,
                                           ans,
                                           val > 0,
                                           val
-                                        );
-                                      }}
+                                        )
+                                      }
                                       className="w-16 px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-right font-mono-code font-bold text-xs text-emerald-400 focus:outline-none focus:border-indigo-500"
                                     />
                                     <button
@@ -2471,16 +2678,11 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
                                     <div className="flex items-center gap-1.5">
                                       <span className="text-[11px] text-amber-200/80">Bonus:</span>
-                                      <input
-                                        type="number"
+                                      <BufferedNumberInput
                                         step="0.25"
-                                        min="0"
+                                        min={0}
                                         value={bonusPts}
-                                        onChange={(e) => {
-                                          const rawVal = parseFloat(e.target.value || '0');
-                                          const safeBonusVal = roundPoints(
-                                            Math.max(0, Number.isNaN(rawVal) ? 0 : rawVal)
-                                          );
+                                        onCommit={(safeBonusVal) =>
                                           handleGradeAnswer(
                                             player.id,
                                             slide,
@@ -2489,8 +2691,8 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                                             awarded,
                                             undefined,
                                             safeBonusVal
-                                          );
-                                        }}
+                                          )
+                                        }
                                         className="w-16 px-2 py-1 rounded-lg bg-slate-950 border border-amber-500/40 text-right font-mono-code font-bold text-xs text-amber-300 focus:outline-none focus:border-amber-400"
                                       />
                                     </div>

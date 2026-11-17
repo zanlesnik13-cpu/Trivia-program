@@ -660,9 +660,10 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
                   max={10}
                   required
                   value={newMaxJokers}
-                  onChange={(e) =>
-                    setNewMaxJokers(Math.max(0, parseInt(e.target.value || '0', 10)))
-                  }
+                  onChange={(e) => {
+                    const parsed = parseInt(e.target.value || '0', 10);
+                    setNewMaxJokers(Number.isFinite(parsed) ? Math.max(0, parsed) : 0);
+                  }}
                   className="w-full px-4 py-3 rounded-xl bg-slate-950 border border-slate-800 text-slate-100 focus:outline-none focus:border-indigo-500 text-sm"
                 />
                 <p className="text-xs text-slate-400 mt-1.5">
@@ -833,7 +834,8 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
 
                   <button
                     onClick={() => {
-                      const url = `${window.location.origin}/present/${activeLiveSession.session.id}`;
+                      const base = `${window.location.origin}/present/${activeLiveSession.session.id}`;
+                      const url = appendSupabaseConfigToUrl(base);
                       window.open(url, '_blank', 'noopener,noreferrer');
                     }}
                     className="w-full py-2.5 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"

@@ -29,7 +29,7 @@ import {
   normalizeGameSession,
   subscribeToDemoUpdates,
 } from '../lib/quizService';
-import { appendSupabaseConfigToUrl, getSupabaseClient } from '../lib/supabase';
+import { appendSupabaseConfigToUrl, getSupabaseClient, getSynchronizedNowMs } from '../lib/supabase';
 import type { PresentationData } from '../types/quiz';
 
 interface PresentationViewProps {
@@ -234,22 +234,28 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     }
 
     const startTime = new Date(activeSlideTimerEntry.startedAt).getTime();
+    if (!Number.isFinite(startTime)) {
+      setTimeLeft(null);
+      return;
+    }
     const durationMs = activeSlideTimerEntry.duration * 1000;
     const endTime = startTime + durationMs;
 
+    const computeClampedTimeLeft = () => {
+      const remainingMs = endTime - getSynchronizedNowMs();
+      if (remainingMs <= 0) return 0;
+      return Math.min(activeSlideTimerEntry.duration, Math.ceil(remainingMs / 1000));
+    };
+
     const interval = setInterval(() => {
-      const now = Date.now();
-      const remainingMs = endTime - now;
-      if (remainingMs <= 0) {
-        setTimeLeft(0);
+      const next = computeClampedTimeLeft();
+      setTimeLeft(next);
+      if (next <= 0) {
         clearInterval(interval);
-      } else {
-        setTimeLeft(Math.ceil(remainingMs / 1000));
       }
     }, 200);
 
-    const initialRemaining = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
-    setTimeLeft(initialRemaining);
+    setTimeLeft(computeClampedTimeLeft());
 
     return () => clearInterval(interval);
   }, [activeSlideTimerEntry?.startedAt, activeSlideTimerEntry?.duration]);

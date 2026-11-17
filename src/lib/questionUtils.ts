@@ -22,8 +22,35 @@ export function formatSloveneDate(dateStr: string | null | undefined): string {
   return `${day}. ${month}. ${year}`;
 }
 
+function extractChoicePrefixLetter(val: string): string | null {
+  const upper = val.trim().toUpperCase();
+  if (/^[A-D]$/.test(upper)) return upper;
+  const match = /^([A-D])\s*[).:\s-]/.exec(upper);
+  return match ? match[1] : null;
+}
+
 /**
- * Pretvori YYYY-MM-DD v UTC milisekunde opolnoči. Vrne null, če datum ni veljaven.
+ * Varno primerja odgovor ali pravilno možnost pri vprašanju z izbiro (A / B / C / D),
+ * tako da prepozna "A", "a", "A) Besedilo", "A. Besedilo", NE pa napačno besede "Avstrija" za črko "A".
+ */
+export function isMultipleChoiceMatch(
+  valueA: string | null | undefined,
+  valueB: string | null | undefined
+): boolean {
+  const normA = (valueA || '').trim().toUpperCase();
+  const normB = (valueB || '').trim().toUpperCase();
+  if (!normA || !normB) return false;
+  if (normA === normB) return true;
+  const letterA = extractChoicePrefixLetter(normA);
+  const letterB = extractChoicePrefixLetter(normB);
+  if (letterA && letterB) {
+    return letterA === letterB;
+  }
+  return false;
+}
+
+/**
+ * Pretvori YYYY-MM-DD v UTC milisekunde opolnoči. Vrne null, če datum ni veljaven (npr. 2026-02-31).
  */
 export function parseIsoDateToUtcMs(dateStr: string | null | undefined): number | null {
   if (!dateStr) return null;
@@ -36,6 +63,14 @@ export function parseIsoDateToUtcMs(dateStr: string | null | undefined): number 
   if (month < 1 || month > 12 || day < 1 || day > 31) return null;
   const utc = Date.UTC(year, month - 1, day);
   if (Number.isNaN(utc)) return null;
+  const check = new Date(utc);
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
   return utc;
 }
 
