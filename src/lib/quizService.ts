@@ -1,6 +1,6 @@
 import { compressImageBlobToDataUrl, convertPdfToImages } from './pdfConverter';
 import { generateSlideSvgDataUrl } from './demoQuiz';
-import { requireSupabaseClient } from './supabase';
+import { getSupabaseConfig, requireSupabaseClient } from './supabase';
 import {
   calculateDateDiffDays,
   isMultiPartSlide,
@@ -1192,12 +1192,59 @@ export function deduplicateAnswers(rawAnswers: Answer[]): Answer[] {
 }
 
 /**
+ * Sekvenčna čakalna vrsta po ključu `(sessionId:playerId:slideId)`, da se zaporedno
+ * samodejno shranjevanje (debounce) in takojšnje praznjenje nikoli ne prehitita.
+ */
+const answerSaveQueues = new Map<string, Promise<unknown>>();
+
+/**
  * Varno shrani ali posodobi odgovor za (session_id, player_id, slide_id):
  * 1. Najprej preveri, ali za (session_id, player_id, slide_id) že obstaja vrstica v tabeli answers.
  * 2. Če obstaja, naredi UPDATE na obstoječi vrstici (in izbriše morebitne stare podvojene vrstice).
  * 3. Če še ne obstaja, naredi UPSERT / INSERT.
  */
-async function saveOrUpdateAnswerRecord(
+function saveOrUpdateAnswerRecord(
+  sessionId: string,
+  playerId: string,
+  themeId: string,
+  slideId: string,
+  fields: {
+    answer_text: string;
+    is_correct: boolean;
+    awarded_points: number;
+    bonus_points?: number;
+    graded: boolean;
+    host_comment?: string | null;
+  },
+  errorContext: string
+): Promise<Answer> {
+  const queueKey = `${sessionId}:${playerId}:${slideId}`;
+  const previousTask = answerSaveQueues.get(queueKey) ?? Promise.resolve();
+
+  const currentTask = previousTask
+    .catch(() => undefined)
+    .then(() =>
+      executeSaveOrUpdateAnswerRecord(
+        sessionId,
+        playerId,
+        themeId,
+        slideId,
+        fields,
+        errorContext
+      )
+    );
+
+  const trackedTask = currentTask.finally(() => {
+    if (answerSaveQueues.get(queueKey) === trackedTask) {
+      answerSaveQueues.delete(queueKey);
+    }
+  });
+
+  answerSaveQueues.set(queueKey, trackedTask);
+  return currentTask;
+}
+
+async function executeSaveOrUpdateAnswerRecord(
   sessionId: string,
   playerId: string,
   themeId: string,
@@ -2190,6 +2237,71 @@ export async function savePlayerAnswer(
     },
     'Napaka pri shranjevanju odgovora v tabelo "answers"'
   );
+}
+
+/**
+ * Zanesljivo pošlje čakajoči odgovor z `fetch(..., { keepalive: true })`,
+ * da se zahteva izvede tudi ob zaprtju zavihka ali zaklepanju zaslona telefona.
+ */
+export function savePlayerAnswerKeepalive(
+  sessionId: string,
+  playerId: string,
+  themeId: string,
+  slideId: string,
+  answerText: string,
+  knownAnswerId?: string
+): void {
+  if (typeof window === 'undefined') return;
+  const { url, anonKey, isConfigured } = getSupabaseConfig();
+  if (!isConfigured || !url || !anonKey) return;
+
+  const cleanUrl = url.replace(/\/+$/, '');
+  const cleanAns = answerText.trim();
+  const basePayload = {
+    theme_id: themeId,
+    answer_text: cleanAns,
+    is_correct: false,
+    awarded_points: 0,
+    graded: false,
+  };
+
+  try {
+    if (knownAnswerId && !knownAnswerId.startsWith('local-')) {
+      void fetch(`${cleanUrl}/rest/v1/answers?id=eq.${encodeURIComponent(knownAnswerId)}`, {
+        method: 'PATCH',
+        keepalive: true,
+        headers: {
+          apikey: anonKey,
+          Authorization: `Bearer ${anonKey}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify(basePayload),
+      });
+    } else {
+      void fetch(
+        `${cleanUrl}/rest/v1/answers?on_conflict=session_id,player_id,slide_id`,
+        {
+          method: 'POST',
+          keepalive: true,
+          headers: {
+            apikey: anonKey,
+            Authorization: `Bearer ${anonKey}`,
+            'Content-Type': 'application/json',
+            Prefer: 'resolution=merge-duplicates,return=minimal',
+          },
+          body: JSON.stringify({
+            session_id: sessionId,
+            player_id: playerId,
+            slide_id: slideId,
+            ...basePayload,
+          }),
+        }
+      );
+    }
+  } catch {
+    // ignore synchronous network dispatch error on unload
+  }
 }
 
 export { createMegaDemoQuiz, generateSlideSvgDataUrl } from './demoQuiz';

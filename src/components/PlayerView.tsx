@@ -32,6 +32,7 @@ import {
   playerActivateJoker,
   reconnectPlayer,
   savePlayerAnswer,
+  savePlayerAnswerKeepalive,
   subscribeToDemoUpdates,
 } from '../lib/quizService';
 import { getSupabaseClient } from '../lib/supabase';
@@ -72,7 +73,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
   // Ločeno lokalno stanje osnutkov odgovorov po ID-ju slajda (drafts[slide.id] oz. drafts[`${slide.id}:${part.id}`])
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [savingAnswer, setSavingAnswer] = useState(false);
+  type AutoSaveStatus = 'idle' | 'pending' | 'saving' | 'saved' | 'error';
+  const [autoSaveStatusBySlide, setAutoSaveStatusBySlide] = useState<Record<string, AutoSaveStatus>>({});
   const [saveSuccessNotice, setSaveSuccessNotice] = useState(false);
 
   // Časovnik v živo
@@ -81,10 +83,75 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // Joker aktivacija
   const [activatingJoker, setActivatingJoker] = useState(false);
 
-  // Sledenje zadnjemu videnemu current_slide_id in current_theme_id iz game_sessions
+  // Sledenje zadnjemu videnemu current_slide_id in current_theme_id iz game_sessions ter sinhroni ref-i za auto-save
   const lastSeenSlideIdRef = useRef<string | null>(null);
   const lastSeenThemeIdRef = useRef<string | null>(null);
   const prevStatusRef = useRef<string | null>(null);
+  const draftsRef = useRef<Record<string, string>>({});
+  const gameDataRef = useRef<PlayerFullData | null>(null);
+  const selectedSlideIdRef = useRef<string | null>(null);
+  const timeLeftRef = useRef<number | null>(null);
+  const debounceTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const dirtySlidesRef = useRef<Record<string, Slide>>({});
+  const lastConfirmedTextRef = useRef<Record<string, string>>({});
+  const inFlightSaveCountRef = useRef<Record<string, number>>({});
+  const lastLocalSaveTimestampRef = useRef<Record<string, number>>({});
+  const pendingKeepalivePayloadRef = useRef<Record<string, { slide: Slide; serialized: string }>>({});
+  const unverifiedKeepaliveSlidesRef = useRef<Record<string, { slide: Slide; text: string }>>({});
+  const saveNoticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevTimerExpiredSlideIdRef = useRef<string | null>(null);
+
+  // Ohrani ref-e vedno sinhrone s stanjem
+  useEffect(() => {
+    gameDataRef.current = gameData;
+  }, [gameData]);
+
+  useEffect(() => {
+    selectedSlideIdRef.current = selectedSlideId;
+  }, [selectedSlideId]);
+
+  const setSlideAutoSaveStatus = (slideId: string, status: AutoSaveStatus) => {
+    setAutoSaveStatusBySlide((prev) =>
+      prev[slideId] === status ? prev : { ...prev, [slideId]: status }
+    );
+  };
+
+  // Izračuna končni niz (JSON za večdelna vprašanja ali navaden niz) iz osnutkov
+  const computeSerializedSlideAnswer = (
+    slide: Slide,
+    draftsMap: Record<string, string>,
+    savedAnswersMap: Record<string, Answer>
+  ): string => {
+    if (isMultiPartSlide(slide) && slide.question_parts) {
+      const savedValues = parseMultiPartAnswer(savedAnswersMap[slide.id]?.answer_text).values;
+      const map: Record<string, string> = {};
+      for (const part of slide.question_parts) {
+        const compositeKey = `${slide.id}:${part.id}`;
+        const rawVal =
+          draftsMap[compositeKey] !== undefined
+            ? draftsMap[compositeKey]
+            : savedValues[part.id] ?? '';
+        map[part.id] = rawVal.trim();
+      }
+      const serialized = serializeMultiPartAnswer(map);
+      return hasAnyMultiPartValue(serialized) ? serialized : '';
+    }
+    const rawSingle =
+      draftsMap[slide.id] !== undefined
+        ? draftsMap[slide.id]
+        : savedAnswersMap[slide.id]?.answer_text ?? '';
+    return rawSingle.trim();
+  };
+
+  // Poišče definicijo slajda znotraj trenutno naloženih tematik
+  const findSlideById = (slideId: string, data: PlayerFullData | null): Slide | null => {
+    if (!data?.slidesByTheme) return null;
+    for (const list of Object.values(data.slidesByTheme)) {
+      const found = list.find((s) => s.id === slideId);
+      if (found) return found;
+    }
+    return null;
+  };
 
   // Prenesi shranjene odgovore iz baze v lokalne osnutke SAMO takrat, ko je drafts[key] === undefined
   const seedDraftsFromSavedAnswers = (savedAnswers: Record<string, Answer>) => {
@@ -108,8 +175,275 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
           }
         }
       }
-      return changed ? next : prev;
+      if (changed) {
+        draftsRef.current = next;
+        return next;
+      }
+      return prev;
     });
+
+    // Posodobi referenco potrjenih vrednosti za slajde, ki nimajo aktivnega shranjevanja ali neshranjenih sprememb
+    for (const [sId, ans] of Object.entries(savedAnswers)) {
+      if (
+        ans?.answer_text !== undefined &&
+        !dirtySlidesRef.current[sId] &&
+        (inFlightSaveCountRef.current[sId] || 0) === 0
+      ) {
+        lastConfirmedTextRef.current[sId] = ans.answer_text;
+      }
+    }
+  };
+
+  // Izvede dejanski zapis v Supabase tabelo answers (brez spreminjanja vnosnih osnutkov!)
+  const performSaveForSlide = async (
+    slide: Slide,
+    cleanVal: string,
+    options?: { showManualNotice?: boolean }
+  ) => {
+    const dataNow = gameDataRef.current;
+    if (!dataNow) return;
+
+    const slideId = slide.id;
+    const themeId = slide.theme_id || dataNow.currentTheme?.id || dataNow.session.current_theme_id;
+    if (!themeId) return;
+
+    const sessionId = dataNow.session.id;
+    const playerId = dataNow.player.id;
+
+    inFlightSaveCountRef.current[slideId] = (inFlightSaveCountRef.current[slideId] || 0) + 1;
+    lastLocalSaveTimestampRef.current[slideId] = Date.now();
+    pendingKeepalivePayloadRef.current[slideId] = { slide, serialized: cleanVal };
+    setSlideAutoSaveStatus(slideId, 'saving');
+
+    // Optimistična posodobitev myAnswers (nikoli ne spreminja drafts!)
+    setGameData((prev: PlayerFullData | null) => {
+      if (!prev) return prev;
+      const existing = prev.myAnswers[slideId];
+      const optimisticAns: Answer = {
+        id: existing?.id || `local-${slideId}`,
+        session_id: prev.session.id,
+        player_id: prev.player.id,
+        theme_id: themeId,
+        slide_id: slideId,
+        answer_text: cleanVal,
+        is_correct: false,
+        awarded_points: 0,
+        bonus_points: 0,
+        graded: false,
+      };
+      const updated = {
+        ...prev,
+        myAnswers: { ...prev.myAnswers, [slideId]: optimisticAns },
+      };
+      gameDataRef.current = updated;
+      return updated;
+    });
+
+    try {
+      const savedAns = await savePlayerAnswer(
+        sessionId,
+        playerId,
+        themeId,
+        slideId,
+        cleanVal
+      );
+
+      lastConfirmedTextRef.current[slideId] = savedAns.answer_text;
+      lastLocalSaveTimestampRef.current[slideId] = Date.now();
+      delete unverifiedKeepaliveSlidesRef.current[slideId];
+
+      if (pendingKeepalivePayloadRef.current[slideId]?.serialized === cleanVal) {
+        delete pendingKeepalivePayloadRef.current[slideId];
+      }
+
+      setGameData((prev: PlayerFullData | null) => {
+        if (!prev) return prev;
+        // Če je medtem uporabnik že začel shranjevati novejšo vrednost, obdrži novejšo v stanju
+        const currentPending = pendingKeepalivePayloadRef.current[slideId];
+        if (currentPending && currentPending.serialized !== savedAns.answer_text) {
+          return prev;
+        }
+        const updated = {
+          ...prev,
+          myAnswers: { ...prev.myAnswers, [slideId]: savedAns },
+        };
+        gameDataRef.current = updated;
+        return updated;
+      });
+
+      if (options?.showManualNotice) {
+        setSaveSuccessNotice(true);
+        if (saveNoticeTimeoutRef.current) clearTimeout(saveNoticeTimeoutRef.current);
+        saveNoticeTimeoutRef.current = setTimeout(() => setSaveSuccessNotice(false), 2000);
+      }
+    } catch (err: unknown) {
+      // Ob napaki vrni v umazane slajde, da se lahko ob naslednjem poskusu shrani
+      dirtySlidesRef.current[slideId] = slide;
+      setSlideAutoSaveStatus(slideId, 'error');
+      if (options?.showManualNotice) {
+        alert(err instanceof Error ? err.message : 'Napaka pri shranjevanju odgovora.');
+      }
+      return;
+    } finally {
+      inFlightSaveCountRef.current[slideId] = Math.max(
+        0,
+        (inFlightSaveCountRef.current[slideId] || 1) - 1
+      );
+      if (
+        !dirtySlidesRef.current[slideId] &&
+        inFlightSaveCountRef.current[slideId] === 0
+      ) {
+        setSlideAutoSaveStatus(slideId, 'saved');
+      }
+    }
+  };
+
+  // Takojšnje praznjenje čakajočega osnutka za določen slajd
+  const flushSlideById = async (
+    slideId: string,
+    options?: { keepalive?: boolean; forceManual?: boolean }
+  ) => {
+    if (debounceTimersRef.current[slideId]) {
+      clearTimeout(debounceTimersRef.current[slideId]);
+      delete debounceTimersRef.current[slideId];
+    }
+
+    const dataNow = gameDataRef.current;
+    if (!dataNow) return;
+
+    const slide =
+      dirtySlidesRef.current[slideId] ||
+      pendingKeepalivePayloadRef.current[slideId]?.slide ||
+      findSlideById(slideId, dataNow);
+    if (!slide) {
+      delete dirtySlidesRef.current[slideId];
+      return;
+    }
+
+    const serialized = computeSerializedSlideAnswer(slide, draftsRef.current, dataNow.myAnswers);
+    const prevConfirmed =
+      lastConfirmedTextRef.current[slideId] ?? dataNow.myAnswers[slideId]?.answer_text ?? '';
+
+    delete dirtySlidesRef.current[slideId];
+
+    if (!serialized && !prevConfirmed) {
+      if ((inFlightSaveCountRef.current[slideId] || 0) === 0) {
+        setSlideAutoSaveStatus(slideId, 'idle');
+      }
+      return;
+    }
+
+    if (serialized === prevConfirmed && !options?.forceManual && !pendingKeepalivePayloadRef.current[slideId]) {
+      if ((inFlightSaveCountRef.current[slideId] || 0) === 0) {
+        setSlideAutoSaveStatus(slideId, 'saved');
+      }
+      return;
+    }
+
+    if (options?.keepalive) {
+      if (unverifiedKeepaliveSlidesRef.current[slideId]?.text === serialized) {
+        delete pendingKeepalivePayloadRef.current[slideId];
+        return;
+      }
+      const themeId =
+        slide.theme_id || dataNow.currentTheme?.id || dataNow.session.current_theme_id;
+      if (!themeId) return;
+      const knownId = dataNow.myAnswers[slideId]?.id;
+      savePlayerAnswerKeepalive(
+        dataNow.session.id,
+        dataNow.player.id,
+        themeId,
+        slideId,
+        serialized,
+        knownId
+      );
+      unverifiedKeepaliveSlidesRef.current[slideId] = { slide, text: serialized };
+      lastLocalSaveTimestampRef.current[slideId] = Date.now();
+      delete pendingKeepalivePayloadRef.current[slideId];
+      setSlideAutoSaveStatus(slideId, 'saved');
+      return;
+    }
+
+    await performSaveForSlide(slide, serialized, {
+      showManualNotice: Boolean(options?.forceManual),
+    });
+  };
+
+  // Takoj shrani vse neshranjene/čakajoče osnutke (npr. ob menjavi slajda, izteku časa, zaključku sklopa ali zaprtju)
+  const flushAllDirtySlides = async (options?: { keepalive?: boolean }) => {
+    const slideIds = new Set<string>([
+      ...Object.keys(debounceTimersRef.current),
+      ...Object.keys(dirtySlidesRef.current),
+      ...Object.keys(unverifiedKeepaliveSlidesRef.current),
+      ...(options?.keepalive ? Object.keys(pendingKeepalivePayloadRef.current) : []),
+    ]);
+
+    if (slideIds.size === 0) return;
+
+    await Promise.all(
+      Array.from(slideIds).map((sId) => flushSlideById(sId, { keepalive: options?.keepalive }))
+    );
+  };
+
+  // Posodobitev vnosa in sprožitev samodejnega shranjevanja (800 ms debounce ali takojšnje za MC/datum)
+  const handleDraftValueChange = (
+    slide: Slide,
+    draftKey: string,
+    newValue: string,
+    saveMode: 'debounce' | 'immediate'
+  ) => {
+    const nextDrafts = { ...draftsRef.current, [draftKey]: newValue };
+    draftsRef.current = nextDrafts;
+    setDrafts((prev) => ({ ...prev, [draftKey]: newValue }));
+
+    const dataNow = gameDataRef.current;
+    if (!dataNow || !dataNow.currentTheme) return;
+    if (dataNow.session.status !== 'active_theme') return;
+    if (
+      timeLeftRef.current !== null &&
+      timeLeftRef.current <= 0 &&
+      slide.id === dataNow.session.current_slide_id
+    ) {
+      return;
+    }
+
+    delete unverifiedKeepaliveSlidesRef.current[slide.id];
+
+    const serialized = computeSerializedSlideAnswer(slide, nextDrafts, dataNow.myAnswers);
+    const prevConfirmed =
+      lastConfirmedTextRef.current[slide.id] ?? dataNow.myAnswers[slide.id]?.answer_text ?? '';
+
+    if (!serialized && !prevConfirmed) {
+      if (debounceTimersRef.current[slide.id]) {
+        clearTimeout(debounceTimersRef.current[slide.id]);
+        delete debounceTimersRef.current[slide.id];
+      }
+      delete dirtySlidesRef.current[slide.id];
+      if ((inFlightSaveCountRef.current[slide.id] || 0) === 0) {
+        setSlideAutoSaveStatus(slide.id, 'idle');
+      }
+      return;
+    }
+
+    dirtySlidesRef.current[slide.id] = slide;
+
+    if (saveMode === 'immediate') {
+      if (debounceTimersRef.current[slide.id]) {
+        clearTimeout(debounceTimersRef.current[slide.id]);
+        delete debounceTimersRef.current[slide.id];
+      }
+      void flushSlideById(slide.id);
+      return;
+    }
+
+    setSlideAutoSaveStatus(slide.id, 'pending');
+    if (debounceTimersRef.current[slide.id]) {
+      clearTimeout(debounceTimersRef.current[slide.id]);
+    }
+    debounceTimersRef.current[slide.id] = setTimeout(() => {
+      delete debounceTimersRef.current[slide.id];
+      void flushSlideById(slide.id);
+    }, 800);
   };
 
   // 1. Reconnect mehanizem ob zagonu: preveri localStorage
@@ -133,11 +467,13 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               setActiveSessionId(parsed.sessionId);
               setActivePlayerId(parsed.playerId);
               const fullData = await fetchPlayerGameData(parsed.sessionId, parsed.playerId);
+              gameDataRef.current = fullData;
               setGameData(fullData);
               seedDraftsFromSavedAnswers(fullData.myAnswers);
               lastSeenSlideIdRef.current = fullData.session.current_slide_id;
               lastSeenThemeIdRef.current = fullData.session.current_theme_id;
               prevStatusRef.current = fullData.session.status;
+              selectedSlideIdRef.current = fullData.session.current_slide_id;
               setSelectedSlideId(fullData.session.current_slide_id);
               setLoadingGame(false);
               return;
@@ -158,24 +494,66 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // 2. Osveževanje podatkov o igralcu (brez prepisovanja aktivnega tipkanja!)
   const refreshPlayerData = async () => {
     if (!activeSessionId || !activePlayerId) return;
+    const fetchStartedAt = Date.now();
     try {
       const full = await fetchPlayerGameData(activeSessionId, activePlayerId);
-      setGameData(full);
+
+      // Preden preklopimo na nov slajd ali zaključimo sklop, takoj shranimo morebitne čakajoče osnutke!
+      const newHostSlideId = full.session.current_slide_id;
+      const newHostThemeId = full.session.current_theme_id;
+      const hostSlideOrThemeChanged =
+        Boolean(newHostSlideId) &&
+        (newHostSlideId !== lastSeenSlideIdRef.current ||
+          newHostThemeId !== lastSeenThemeIdRef.current);
+      const leavingActiveTheme =
+        prevStatusRef.current === 'active_theme' && full.session.status !== 'active_theme';
+
+      if (hostSlideOrThemeChanged || leavingActiveTheme) {
+        void flushAllDirtySlides();
+      }
+
+      setGameData((prev) => {
+        const mergedMyAnswers: Record<string, Answer> = { ...full.myAnswers };
+        if (prev) {
+          for (const [sId, prevAns] of Object.entries(prev.myAnswers)) {
+            const isSavingNow = (inFlightSaveCountRef.current[sId] || 0) > 0;
+            const savedLocallyRecently =
+              (lastLocalSaveTimestampRef.current[sId] || 0) >= fetchStartedAt - 150;
+            if (isSavingNow || savedLocallyRecently || dirtySlidesRef.current[sId]) {
+              mergedMyAnswers[sId] = prevAns;
+            }
+          }
+        }
+        const nextFull: PlayerFullData = {
+          ...full,
+          myAnswers: mergedMyAnswers,
+        };
+        gameDataRef.current = nextFull;
+        return nextFull;
+      });
 
       // Napolni osnutke SAMO za slajde, kjer je drafts[slideId] === undefined
       seedDraftsFromSavedAnswers(full.myAnswers);
 
+      // Preveri morebitne keepalive zahteve ob preklopu/zaklepu zaslona: če niso v bazi, jih takoj ponovi
+      for (const [sId, pending] of Object.entries(unverifiedKeepaliveSlidesRef.current)) {
+        const dbVal = (full.myAnswers[sId]?.answer_text ?? '').trim();
+        if (dbVal === pending.text) {
+          delete unverifiedKeepaliveSlidesRef.current[sId];
+          lastConfirmedTextRef.current[sId] = dbVal;
+        } else if ((inFlightSaveCountRef.current[sId] || 0) === 0) {
+          delete unverifiedKeepaliveSlidesRef.current[sId];
+          dirtySlidesRef.current[sId] = pending.slide;
+          void flushSlideById(sId);
+        }
+      }
+
       // Samodejno preklopi na nov slajd SAMO takrat, ko se current_slide_id (ali current_theme_id)
       // v game_sessions dejansko spremeni na nov ID!
-      const newHostSlideId = full.session.current_slide_id;
-      const newHostThemeId = full.session.current_theme_id;
-      if (
-        newHostSlideId &&
-        (newHostSlideId !== lastSeenSlideIdRef.current ||
-          newHostThemeId !== lastSeenThemeIdRef.current)
-      ) {
+      if (hostSlideOrThemeChanged && newHostSlideId) {
         lastSeenSlideIdRef.current = newHostSlideId;
         lastSeenThemeIdRef.current = newHostThemeId;
+        selectedSlideIdRef.current = newHostSlideId;
         setSelectedSlideId(newHostSlideId);
       }
 
@@ -221,23 +599,37 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
           (payload) => {
             if (payload.new && typeof payload.new === 'object') {
               const updatedSession = payload.new as Partial<PlayerFullData['session']>;
-              setGameData((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      session: { ...prev.session, ...updatedSession },
-                    }
-                  : prev
-              );
-              if (
+              const hostSlideOrThemeChanged = Boolean(
                 updatedSession.current_slide_id &&
-                (updatedSession.current_slide_id !== lastSeenSlideIdRef.current ||
-                  updatedSession.current_theme_id !== lastSeenThemeIdRef.current)
-              ) {
+                  (updatedSession.current_slide_id !== lastSeenSlideIdRef.current ||
+                    updatedSession.current_theme_id !== lastSeenThemeIdRef.current)
+              );
+              const leavingActiveTheme =
+                prevStatusRef.current === 'active_theme' &&
+                updatedSession.status !== undefined &&
+                updatedSession.status !== 'active_theme';
+
+              // Takojšnje shranjevanje neshranjenih osnutkov pred zaklepanjem ali menjavo slajda!
+              if (hostSlideOrThemeChanged || leavingActiveTheme) {
+                void flushAllDirtySlides();
+              }
+
+              setGameData((prev) => {
+                if (!prev) return prev;
+                const next = {
+                  ...prev,
+                  session: { ...prev.session, ...updatedSession },
+                };
+                gameDataRef.current = next;
+                return next;
+              });
+
+              if (hostSlideOrThemeChanged && updatedSession.current_slide_id) {
                 lastSeenSlideIdRef.current = updatedSession.current_slide_id;
                 if (updatedSession.current_theme_id !== undefined) {
                   lastSeenThemeIdRef.current = updatedSession.current_theme_id;
                 }
+                selectedSlideIdRef.current = updatedSession.current_slide_id;
                 setSelectedSlideId(updatedSession.current_slide_id);
               }
             }
@@ -276,15 +668,36 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     };
     window.addEventListener('trivia_demo_local_update', localHandler);
 
-    // Varnostni fallback ob vrnitvi fokusa ali ponovni povezavi
-    const handleRevalidate = () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-        refreshPlayerData();
+    // Ob zapiranju ali zaklepanju zaslona takoj pošlji čakajoče osnutke; ob vrnitvi pa osveži
+    const handleVisibilityChange = () => {
+      if (typeof document === 'undefined') return;
+      if (document.visibilityState === 'hidden') {
+        void flushAllDirtySlides({ keepalive: true });
+      } else if (document.visibilityState === 'visible') {
+        void refreshPlayerData();
       }
     };
-    window.addEventListener('visibilitychange', handleRevalidate);
-    window.addEventListener('focus', handleRevalidate);
-    window.addEventListener('online', handleRevalidate);
+    const handleFocus = () => {
+      void refreshPlayerData();
+    };
+    const handleOnline = () => {
+      const failedSlideIds = Object.keys(dirtySlidesRef.current).filter(
+        (sId) => !debounceTimersRef.current[sId] && (inFlightSaveCountRef.current[sId] || 0) === 0
+      );
+      if (failedSlideIds.length > 0) {
+        void Promise.all(failedSlideIds.map((sId) => flushSlideById(sId)));
+      }
+      void refreshPlayerData();
+    };
+    const handlePageUnload = () => {
+      void flushAllDirtySlides({ keepalive: true });
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('pagehide', handlePageUnload);
+    window.addEventListener('beforeunload', handlePageUnload);
 
     // Periodični varnostni heartbeat (vsakih 2.5 sekund) proti zamrznitvi
     const fallbackPoll = setInterval(() => {
@@ -297,10 +710,14 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
       }
       unsubDemo();
       window.removeEventListener('trivia_demo_local_update', localHandler);
-      window.removeEventListener('visibilitychange', handleRevalidate);
-      window.removeEventListener('focus', handleRevalidate);
-      window.removeEventListener('online', handleRevalidate);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('pagehide', handlePageUnload);
+      window.removeEventListener('beforeunload', handlePageUnload);
       clearInterval(fallbackPoll);
+      Object.values(debounceTimersRef.current).forEach((t) => clearTimeout(t));
+      debounceTimersRef.current = {};
     };
   }, [activeSessionId, activePlayerId]);
 
@@ -308,6 +725,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   useEffect(() => {
     const session = gameData?.session;
     if (!session || !session.timer_started_at || !session.timer_duration || session.timer_duration <= 0) {
+      timeLeftRef.current = null;
+      prevTimerExpiredSlideIdRef.current = null;
       setTimeLeft(null);
       return;
     }
@@ -316,19 +735,38 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     const durationMs = session.timer_duration * 1000;
     const endTime = startTime + durationMs;
 
-    const interval = setInterval(() => {
+    const tick = () => {
       const remainingMs = endTime - Date.now();
       if (remainingMs <= 0) {
+        timeLeftRef.current = 0;
+        // Preden se polje zaklene zaradi izteka časa, takoj shrani zadnji vnos v bazo!
+        if (prevTimerExpiredSlideIdRef.current !== session.current_slide_id) {
+          prevTimerExpiredSlideIdRef.current = session.current_slide_id;
+          void flushAllDirtySlides();
+        }
         setTimeLeft(0);
-        clearInterval(interval);
+        return false;
       } else {
-        setTimeLeft(Math.ceil(remainingMs / 1000));
+        const secs = Math.ceil(remainingMs / 1000);
+        timeLeftRef.current = secs;
+        prevTimerExpiredSlideIdRef.current = null;
+        setTimeLeft(secs);
+        return true;
+      }
+    };
+
+    const keepRunning = tick();
+    if (!keepRunning) return;
+
+    const interval = setInterval(() => {
+      const stillRunning = tick();
+      if (!stillRunning) {
+        clearInterval(interval);
       }
     }, 200);
 
-    setTimeLeft(Math.max(0, Math.ceil((endTime - Date.now()) / 1000)));
     return () => clearInterval(interval);
-  }, [gameData?.session?.timer_started_at, gameData?.session?.timer_duration]);
+  }, [gameData?.session?.timer_started_at, gameData?.session?.timer_duration, gameData?.session?.current_slide_id]);
 
   // Slajdi trenutne tematike
   const currentThemeSlides: Slide[] = useMemo(() => {
@@ -454,11 +892,13 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
       setActivePlayerId(player.id);
 
       const fullData = await fetchPlayerGameData(session.id, player.id);
+      gameDataRef.current = fullData;
       setGameData(fullData);
       seedDraftsFromSavedAnswers(fullData.myAnswers);
       lastSeenSlideIdRef.current = fullData.session.current_slide_id;
       lastSeenThemeIdRef.current = fullData.session.current_theme_id;
       prevStatusRef.current = fullData.session.status;
+      selectedSlideIdRef.current = fullData.session.current_slide_id;
       setSelectedSlideId(fullData.session.current_slide_id);
     } catch (err: unknown) {
       setJoinError(err instanceof Error ? err.message : 'Napaka pri vstopu v igro.');
@@ -472,16 +912,37 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     const ok = window.confirm('Ali res želite zapustiti igro in se odjaviti?');
     if (!ok) return;
 
+    Object.values(debounceTimersRef.current).forEach((t) => clearTimeout(t));
+    debounceTimersRef.current = {};
+    dirtySlidesRef.current = {};
+    pendingKeepalivePayloadRef.current = {};
+    unverifiedKeepaliveSlidesRef.current = {};
+    lastConfirmedTextRef.current = {};
+    inFlightSaveCountRef.current = {};
+    draftsRef.current = {};
+
     localStorage.removeItem(LOCAL_STORAGE_KEY);
     setActiveSessionId(null);
     setActivePlayerId(null);
+    gameDataRef.current = null;
     setGameData(null);
     setDrafts({});
+    setAutoSaveStatusBySlide({});
     lastSeenSlideIdRef.current = null;
     lastSeenThemeIdRef.current = null;
+    selectedSlideIdRef.current = null;
     setRoomCodeInput('');
     setNicknameInput('');
     if (onExit) onExit();
+  };
+
+  // Ročni preklop na izbrani pretekli slajd (s takojšnjim shranjevanjem prejšnjega osnutka)
+  const handleSelectSlide = (targetSlideId: string) => {
+    if (currentViewingSlide && currentViewingSlide.id !== targetSlideId) {
+      void flushSlideById(currentViewingSlide.id);
+    }
+    selectedSlideIdRef.current = targetSlideId;
+    setSelectedSlideId(targetSlideId);
   };
 
   // Aktivacija Jokerja (samo v 'theme_intro')
@@ -512,65 +973,64 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     }
   };
 
-  // Oddaja odgovora (A/B/C/D ali besedilo / število)
-  const handleSubmitAnswer = async (answerValue: string, explicitSlide?: Slide) => {
+  // Ročna potrditev odgovora (takoj shrani brez čakanja na debounce)
+  const handleManualSaveSlide = async (explicitSlide?: Slide) => {
     const targetSlide = explicitSlide || currentViewingSlide;
-    if (!gameData || !gameData.currentTheme || !targetSlide || savingAnswer) return;
+    if (!gameData || !gameData.currentTheme || !targetSlide) return;
     if (gameData.session.status !== 'active_theme' || isTimerExpiredOnCurrentHostSlide) return;
 
-    const cleanVal = answerValue.trim();
-    const slideId = targetSlide.id;
-    const themeId = targetSlide.theme_id || gameData.currentTheme.id;
+    dirtySlidesRef.current[targetSlide.id] = targetSlide;
+    await flushSlideById(targetSlide.id, { forceManual: true });
+  };
 
-    // Ohrani vnos tudi v lokalnem osnutku za ta slajd
-    setDrafts((prev) => ({ ...prev, [slideId]: answerValue }));
+  // Značka s statusom samodejnega shranjevanja poleg gumba Shrani odgovor
+  const renderAutoSaveBadge = (slide: Slide, extraCompact: boolean = false) => {
+    const status = autoSaveStatusBySlide[slide.id] || 'idle';
+    const savedAns = gameData?.myAnswers[slide.id]?.answer_text;
+    const hasSavedInDb = isMultiPartSlide(slide)
+      ? hasAnyMultiPartValue(savedAns)
+      : Boolean(savedAns);
 
-    // Optimistična posodobitev lokalnega stanja pred klicem v bazo
-    setGameData((prev: PlayerFullData | null) => {
-      if (!prev) return prev;
-      const existing = prev.myAnswers[slideId];
-      const newAns: Answer = {
-        id: existing?.id || `local-${slideId}`,
-        session_id: prev.session.id,
-        player_id: prev.player.id,
-        theme_id: themeId,
-        slide_id: slideId,
-        answer_text: cleanVal,
-        is_correct: false,
-        awarded_points: 0,
-        graded: false,
-      };
-      return {
-        ...prev,
-        myAnswers: { ...prev.myAnswers, [slideId]: newAns },
-      };
-    });
-
-    setSavingAnswer(true);
-    try {
-      const savedAns = await savePlayerAnswer(
-        gameData.session.id,
-        gameData.player.id,
-        themeId,
-        slideId,
-        cleanVal
+    if (status === 'saving' || status === 'pending') {
+      return (
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-xl bg-amber-500/15 border border-amber-500/40 text-amber-300 font-semibold shrink-0 ${
+            extraCompact ? 'px-2.5 py-1 text-[11px]' : 'px-3 py-2 text-xs'
+          }`}
+        >
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400 shrink-0" />
+          <span>💾 Shranjujem...</span>
+        </span>
       );
-
-      setGameData((prev: PlayerFullData | null) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          myAnswers: { ...prev.myAnswers, [slideId]: savedAns },
-        };
-      });
-
-      setSaveSuccessNotice(true);
-      setTimeout(() => setSaveSuccessNotice(false), 2000);
-    } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : 'Napaka pri shranjevanju odgovora.');
-    } finally {
-      setSavingAnswer(false);
     }
+
+    if (status === 'error') {
+      return (
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-300 font-semibold shrink-0 ${
+            extraCompact ? 'px-2.5 py-1 text-[11px]' : 'px-3 py-2 text-xs'
+          }`}
+        >
+          <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+          <span>Napaka shranjevanja</span>
+        </span>
+      );
+    }
+
+    if (status === 'saved' || hasSavedInDb) {
+      return (
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-semibold shrink-0 ${
+            extraCompact ? 'px-2.5 py-1 text-[11px]' : 'px-3 py-2 text-xs'
+          }`}
+        >
+          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+          <span>✅ Samodejno shranjeno</span>
+        </span>
+      );
+    }
+
+    return null;
   };
 
   // ===========================================================================
@@ -878,7 +1338,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                       key={slide.id}
                       type="button"
                       disabled={isLocked}
-                      onClick={() => setSelectedSlideId(slide.id)}
+                      onClick={() => handleSelectSlide(slide.id)}
                       className={`relative min-w-[44px] h-11 rounded-xl font-mono-code font-bold text-xs flex flex-col items-center justify-center transition-all cursor-pointer ${
                         isLocked
                           ? 'bg-slate-900/40 border border-slate-800 text-slate-600 cursor-not-allowed opacity-40'
@@ -968,12 +1428,15 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
             {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA (ali večdelno / bonus vprašanje) */}
             {isTimerExpiredOnCurrentHostSlide ? (
-              <div className="p-5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-center space-y-1">
+              <div className="p-5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-center space-y-2">
                 <Lock className="w-6 h-6 text-rose-400 mx-auto" />
                 <p className="text-sm font-bold text-rose-200">Čas za odgovor je potekel!</p>
                 <p className="text-xs text-slate-400">
                   Oddani odgovor je zaklenjen.
                 </p>
+                <div className="flex justify-center pt-1">
+                  {renderAutoSaveBadge(currentViewingSlide, true)}
+                </div>
               </div>
             ) : currentViewingSlide.slide_type === 'info_only' ||
               currentViewingSlide.slide_type === 'theme_intro' ? (
@@ -1014,17 +1477,17 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                     return drafts[key] !== undefined ? drafts[key] : savedValues[partId] ?? '';
                   };
 
-                  const buildFullMultiPartJson = (overridePartId?: string, overrideVal?: string) => {
+                  const buildFullMultiPartJson = () => {
                     const map: Record<string, string> = {};
                     for (const p of currentViewingSlide.question_parts || []) {
-                      if (overridePartId && p.id === overridePartId) {
-                        map[p.id] = (overrideVal ?? '').trim();
-                      } else {
-                        map[p.id] = getPartDraft(p.id).trim();
-                      }
+                      map[p.id] = getPartDraft(p.id).trim();
                     }
                     return serializeMultiPartAnswer(map);
                   };
+
+                  const canManualSaveMultiPart =
+                    hasAnyMultiPartValue(buildFullMultiPartJson()) ||
+                    hasAnyMultiPartValue(myCurrentAnswer?.answer_text);
 
                   return (
                     <>
@@ -1090,14 +1553,14 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                                     <button
                                       key={key}
                                       type="button"
-                                      onClick={() => {
-                                        setDrafts((prev) => ({
-                                          ...prev,
-                                          [partInputKey]: key,
-                                        }));
-                                        const jsonStr = buildFullMultiPartJson(part.id, key);
-                                        handleSubmitAnswer(jsonStr, currentViewingSlide);
-                                      }}
+                                      onClick={() =>
+                                        handleDraftValueChange(
+                                          currentViewingSlide,
+                                          partInputKey,
+                                          key,
+                                          'immediate'
+                                        )
+                                      }
                                       className={`min-h-[60px] p-3 rounded-2xl flex flex-col justify-between text-left transition-all active:scale-95 cursor-pointer border-2 ${
                                         isSelected
                                           ? `${bg} text-white ${border} shadow-lg`
@@ -1124,13 +1587,14 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                                 step="any"
                                 inputMode="decimal"
                                 value={partDraft}
-                                onChange={(e) => {
-                                  const val = e.target.value;
-                                  setDrafts((prev) => ({
-                                    ...prev,
-                                    [partInputKey]: val,
-                                  }));
-                                }}
+                                onChange={(e) =>
+                                  handleDraftValueChange(
+                                    currentViewingSlide,
+                                    partInputKey,
+                                    e.target.value,
+                                    'debounce'
+                                  )
+                                }
                                 placeholder="Vpiši številko..."
                                 className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-violet-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-violet-500"
                               />
@@ -1142,10 +1606,13 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                                   value={partDraft}
                                   onChange={(e) => {
                                     const val = e.target.value;
-                                    setDrafts((prev) => ({
-                                      ...prev,
-                                      [partInputKey]: val,
-                                    }));
+                                    const isCompleteDate = /^\d{4}-\d{2}-\d{2}$/.test(val);
+                                    handleDraftValueChange(
+                                      currentViewingSlide,
+                                      partInputKey,
+                                      val,
+                                      isCompleteDate ? 'immediate' : 'debounce'
+                                    );
                                   }}
                                   className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-base text-center focus:outline-none focus:border-cyan-500"
                                 />
@@ -1160,13 +1627,14 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                                 key={partInputKey}
                                 type="text"
                                 value={partDraft}
-                                onChange={(e) => {
-                                  const val = e.target.value;
-                                  setDrafts((prev) => ({
-                                    ...prev,
-                                    [partInputKey]: val,
-                                  }));
-                                }}
+                                onChange={(e) =>
+                                  handleDraftValueChange(
+                                    currentViewingSlide,
+                                    partInputKey,
+                                    e.target.value,
+                                    'debounce'
+                                  )
+                                }
                                 placeholder={
                                   isBonusPart
                                     ? 'Vpiši odgovor na bonus vprašanje...'
@@ -1183,28 +1651,33 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                         );
                       })}
 
-                      <button
-                        type="button"
-                        disabled={savingAnswer}
-                        onClick={() => {
-                          const jsonStr = buildFullMultiPartJson();
-                          handleSubmitAnswer(jsonStr, currentViewingSlide);
-                        }}
-                        className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                      >
-                        <Send className="w-4 h-4" />
-                        <span>Shrani vse odgovore</span>
-                      </button>
+                      <div className="flex flex-wrap items-center justify-between gap-2.5">
+                        <button
+                          type="button"
+                          disabled={!canManualSaveMultiPart}
+                          onClick={() => {
+                            void handleManualSaveSlide(currentViewingSlide);
+                          }}
+                          className="flex-1 min-w-[175px] py-3.5 px-4 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                        >
+                          <Send className="w-4 h-4 shrink-0" />
+                          <span>Shrani vse odgovore</span>
+                        </button>
+                        {renderAutoSaveBadge(currentViewingSlide)}
+                      </div>
                     </>
                   );
                 })()}
               </div>
             ) : currentViewingSlide.slide_type === 'multiple_choice' ? (
               /* A / B / C / D Veliki barvni gumbi */
-              <div className="space-y-2">
-                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block px-1">
-                  Izberi odgovor (klik takoj shrani):
-                </span>
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2 px-1">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                    Izberi odgovor (klik takoj shrani):
+                  </span>
+                  {renderAutoSaveBadge(currentViewingSlide, true)}
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   {(
                     [
@@ -1214,14 +1687,21 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                       { key: 'D', bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', border: 'border-emerald-400' },
                     ] as const
                   ).map(({ key, bg, hover, border }) => {
-                    const isSelected = myCurrentAnswer?.answer_text === key;
+                    const isSelected = currentDraft.trim().toUpperCase() === key;
                     const optionText = currentViewingSlide.options[key];
 
                     return (
                       <button
                         key={key}
                         type="button"
-                        onClick={() => handleSubmitAnswer(key)}
+                        onClick={() =>
+                          handleDraftValueChange(
+                            currentViewingSlide,
+                            currentViewingSlide.id,
+                            key,
+                            'immediate'
+                          )
+                        }
                         className={`min-h-[74px] p-3.5 rounded-2xl flex flex-col justify-between text-left transition-all active:scale-95 cursor-pointer border-2 ${
                           isSelected
                             ? `${bg} text-white ${border} shadow-lg ring-4 ring-white/20 scale-102`
@@ -1256,27 +1736,33 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                     step="any"
                     inputMode="decimal"
                     value={currentDraft}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setDrafts((prev) => ({
-                        ...prev,
-                        [currentViewingSlide.id]: val,
-                      }));
-                    }}
+                    onChange={(e) =>
+                      handleDraftValueChange(
+                        currentViewingSlide,
+                        currentViewingSlide.id,
+                        e.target.value,
+                        'debounce'
+                      )
+                    }
                     placeholder="npr. 1999"
                     className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-violet-400 font-mono-code font-bold text-xl text-center focus:outline-none focus:border-violet-500"
                   />
                 </div>
 
-                <button
-                  type="button"
-                  disabled={savingAnswer || !currentDraft.trim()}
-                  onClick={() => handleSubmitAnswer(currentDraft, currentViewingSlide)}
-                  className="w-full py-3.5 rounded-2xl bg-violet-600 hover:bg-violet-500 text-white font-bold text-sm shadow-lg shadow-violet-600/30 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <Send className="w-4 h-4" />
-                  <span>Shrani številko</span>
-                </button>
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <button
+                    type="button"
+                    disabled={!currentDraft.trim() && !myCurrentAnswer?.answer_text}
+                    onClick={() => {
+                      void handleManualSaveSlide(currentViewingSlide);
+                    }}
+                    className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-violet-600 hover:bg-violet-500 text-white font-bold text-sm shadow-lg shadow-violet-600/30 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <Send className="w-4 h-4 shrink-0" />
+                    <span>Shrani številko</span>
+                  </button>
+                  {renderAutoSaveBadge(currentViewingSlide)}
+                </div>
               </div>
             ) : currentViewingSlide.slide_type === 'closest_date' ? (
               /* Ugani datum (closest_date) */
@@ -1293,10 +1779,13 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                     value={currentDraft}
                     onChange={(e) => {
                       const val = e.target.value;
-                      setDrafts((prev) => ({
-                        ...prev,
-                        [currentViewingSlide.id]: val,
-                      }));
+                      const isCompleteDate = /^\d{4}-\d{2}-\d{2}$/.test(val);
+                      handleDraftValueChange(
+                        currentViewingSlide,
+                        currentViewingSlide.id,
+                        val,
+                        isCompleteDate ? 'immediate' : 'debounce'
+                      );
                     }}
                     className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-cyan-500"
                   />
@@ -1309,15 +1798,20 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                   )}
                 </div>
 
-                <button
-                  type="button"
-                  disabled={savingAnswer || !currentDraft.trim()}
-                  onClick={() => handleSubmitAnswer(currentDraft, currentViewingSlide)}
-                  className="w-full py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <Send className="w-4 h-4" />
-                  <span>Shrani datum</span>
-                </button>
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <button
+                    type="button"
+                    disabled={!currentDraft.trim() && !myCurrentAnswer?.answer_text}
+                    onClick={() => {
+                      void handleManualSaveSlide(currentViewingSlide);
+                    }}
+                    className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <Send className="w-4 h-4 shrink-0" />
+                    <span>Shrani datum</span>
+                  </button>
+                  {renderAutoSaveBadge(currentViewingSlide)}
+                </div>
               </div>
             ) : (
               /* Odprto besedilo (open_text) */
@@ -1331,27 +1825,33 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                     id="player-text-answer-input"
                     rows={2}
                     value={currentDraft}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setDrafts((prev) => ({
-                        ...prev,
-                        [currentViewingSlide.id]: val,
-                      }));
-                    }}
+                    onChange={(e) =>
+                      handleDraftValueChange(
+                        currentViewingSlide,
+                        currentViewingSlide.id,
+                        e.target.value,
+                        'debounce'
+                      )
+                    }
                     placeholder="Vpiši svoj odgovor tukaj..."
                     className="w-full px-4 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-slate-100 font-semibold text-sm focus:outline-none focus:border-emerald-500"
                   />
                 </div>
 
-                <button
-                  type="button"
-                  disabled={savingAnswer || !currentDraft.trim()}
-                  onClick={() => handleSubmitAnswer(currentDraft, currentViewingSlide)}
-                  className="w-full py-3.5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <Send className="w-4 h-4" />
-                  <span>Shrani odgovor</span>
-                </button>
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <button
+                    type="button"
+                    disabled={!currentDraft.trim() && !myCurrentAnswer?.answer_text}
+                    onClick={() => {
+                      void handleManualSaveSlide(currentViewingSlide);
+                    }}
+                    className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <Send className="w-4 h-4 shrink-0" />
+                    <span>Shrani odgovor</span>
+                  </button>
+                  {renderAutoSaveBadge(currentViewingSlide)}
+                </div>
               </div>
             )}
 
