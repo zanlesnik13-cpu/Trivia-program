@@ -66,6 +66,11 @@ export interface Slide {
   question_parts?: QuestionPart[] | null;
 }
 
+export interface SlideTimerState {
+  started_at: string;
+  duration: number;
+}
+
 export interface GameSession {
   id: string;
   quiz_id: string;
@@ -76,6 +81,8 @@ export interface GameSession {
   max_slide_index_reached: number;
   timer_started_at: string | null;
   timer_duration: number | null;
+  slide_timers?: Record<string, SlideTimerState>;
+  locked_slide_ids?: string[];
   created_at?: string;
 }
 

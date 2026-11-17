@@ -16,6 +16,7 @@ import {
   Layers,
   ListChecks,
   Loader2,
+  Lock,
   Minus,
   Play,
   Plus,
@@ -24,6 +25,7 @@ import {
   Sparkles,
   Tv,
   Type,
+  Unlock,
   Users,
   X,
 } from 'lucide-react';
@@ -41,6 +43,9 @@ import {
   autoPreGradeTheme,
   confirmThemeGradesAndShowLeaderboard,
   fetchPresentationData,
+  normalizeGameSession,
+  normalizeLockedSlideIds,
+  normalizeSlideTimers,
   submitDemoAnswer,
   subscribeToDemoUpdates,
   togglePlayerJoker,
@@ -48,7 +53,13 @@ import {
   upsertGradedAnswer,
 } from '../lib/quizService';
 import { getSupabaseClient } from '../lib/supabase';
-import type { Answer, GameSessionStatus, PresentationData, Slide } from '../types/quiz';
+import type {
+  Answer,
+  GameSessionStatus,
+  PresentationData,
+  Slide,
+  SlideTimerState,
+} from '../types/quiz';
 
 interface HostRemoteControllerProps {
   sessionId: string;
@@ -141,10 +152,27 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${sessionId}` },
           (payload) => {
             if (payload && payload.new && typeof payload.new === 'object') {
-              const updatedSession = payload.new as PresentationData['session'];
-              setData((prev) =>
-                prev ? { ...prev, session: { ...prev.session, ...updatedSession } } : prev
-              );
+              const updatedSession = payload.new as Partial<PresentationData['session']>;
+              setData((prev) => {
+                if (!prev) return prev;
+                const mergedSession = normalizeGameSession({
+                  ...prev.session,
+                  ...updatedSession,
+                });
+                const nextTheme =
+                  prev.themes.find((t) => t.id === mergedSession.current_theme_id) ||
+                  prev.currentTheme;
+                const nextThemeSlides = nextTheme ? prev.slidesByTheme[nextTheme.id] || [] : [];
+                const nextSlide =
+                  nextThemeSlides.find((s) => s.id === mergedSession.current_slide_id) ||
+                  prev.currentSlide;
+                return {
+                  ...prev,
+                  session: mergedSession,
+                  currentTheme: nextTheme,
+                  currentSlide: nextSlide,
+                };
+              });
             }
             loadData();
           }
@@ -209,16 +237,42 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     };
   }, [sessionId]);
 
+  // Efektivni časovnik za trenutni slajd (vedno upošteva trajni zapis slide_timers[slide.id] z fallbackom)
+  const activeSlideTimerEntry = useMemo(() => {
+    const slide = data?.currentSlide;
+    const sess = data?.session;
+    if (
+      !slide ||
+      !sess ||
+      slide.slide_type === 'info_only' ||
+      slide.slide_type === 'theme_intro'
+    ) {
+      return null;
+    }
+    const perSlide = sess.slide_timers?.[slide.id];
+    if (perSlide && perSlide.started_at && Number(perSlide.duration) > 0) {
+      return { startedAt: perSlide.started_at, duration: Number(perSlide.duration) };
+    }
+    if (sess.timer_started_at && Number(sess.timer_duration) > 0) {
+      return { startedAt: sess.timer_started_at, duration: Number(sess.timer_duration) };
+    }
+    return null;
+  }, [
+    data?.currentSlide,
+    data?.session?.slide_timers,
+    data?.session?.timer_started_at,
+    data?.session?.timer_duration,
+  ]);
+
   // Odštevalnik časa (Timer na telefonu gostitelja)
   useEffect(() => {
-    const session = data?.session;
-    if (!session || !session.timer_started_at || !session.timer_duration || session.timer_duration <= 0) {
+    if (!activeSlideTimerEntry) {
       setTimeLeft(null);
       return;
     }
 
-    const startTime = new Date(session.timer_started_at).getTime();
-    const durationMs = session.timer_duration * 1000;
+    const startTime = new Date(activeSlideTimerEntry.startedAt).getTime();
+    const durationMs = activeSlideTimerEntry.duration * 1000;
     const endTime = startTime + durationMs;
 
     const interval = setInterval(() => {
@@ -233,7 +287,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
     setTimeLeft(Math.max(0, Math.ceil((endTime - Date.now()) / 1000)));
     return () => clearInterval(interval);
-  }, [data?.session?.timer_started_at, data?.session?.timer_duration]);
+  }, [activeSlideTimerEntry?.startedAt, activeSlideTimerEntry?.duration]);
 
   // Če je seja v stanju 'grading_theme', poskrbi za avtomatsko pred-ocenjevanje neocenjenih odgovorov
   useEffect(() => {
@@ -286,6 +340,59 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   // AKCIJE DALJINSKEGA UPRAVLJALNIKA
   // ---------------------------------------------------------------------------
 
+  // Pripravi posodobitev časovnika ob odprtju slajda:
+  // Če ima slajd že svoj zapis v slide_timers, ga NE prepiše (ohrani preostali čas ali stanje izteka).
+  // Če se slajd s timer_seconds > 0 odpre PRVIČ, samodejno zapiše { started_at, duration } v slide_timers.
+  const buildSlideTimerPatch = (
+    targetSlide: Slide | null,
+    existingTimersRaw?: Record<string, SlideTimerState>
+  ): {
+    timer_started_at: string | null;
+    timer_duration: number;
+    slide_timers?: Record<string, SlideTimerState>;
+  } => {
+    const existingTimers = normalizeSlideTimers(existingTimersRaw);
+    if (
+      !targetSlide ||
+      targetSlide.slide_type === 'theme_intro' ||
+      targetSlide.slide_type === 'info_only'
+    ) {
+      return {
+        timer_started_at: null,
+        timer_duration: 0,
+      };
+    }
+
+    const existingEntry = existingTimers[targetSlide.id];
+    if (existingEntry && existingEntry.duration > 0) {
+      return {
+        timer_started_at: existingEntry.started_at,
+        timer_duration: existingEntry.duration,
+      };
+    }
+
+    const defaultSecs = Math.round(Number(targetSlide.timer_seconds ?? 0));
+    if (defaultSecs > 0) {
+      const nowIso = new Date().toISOString();
+      return {
+        timer_started_at: nowIso,
+        timer_duration: defaultSecs,
+        slide_timers: {
+          ...existingTimers,
+          [targetSlide.id]: {
+            started_at: nowIso,
+            duration: defaultSecs,
+          },
+        },
+      };
+    }
+
+    return {
+      timer_started_at: null,
+      timer_duration: 0,
+    };
+  };
+
   // 1. Iz Lobbyja -> Začni 1. tematiko (vedno prični pri 1. slajdu po order_index = 0!)
   const handleStartFirstTheme = async () => {
     if (!data) return;
@@ -297,13 +404,13 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
     setActionLoading(true);
     try {
+      const timerPatch = buildSlideTimerPatch(firstSlide, data.session.slide_timers);
       await updateGameSession(sessionId, {
         status: initialStatus,
         current_theme_id: firstTheme?.id || null,
         current_slide_id: firstSlide?.id || null,
         max_slide_index_reached: 0,
-        timer_started_at: null,
-        timer_duration: 0,
+        ...timerPatch,
       });
       await loadData();
     } catch (err: unknown) {
@@ -337,12 +444,12 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     setActionLoading(true);
     try {
       const maxIndex = Math.max(data.session.max_slide_index_reached, targetIndex);
+      const timerPatch = buildSlideTimerPatch(targetSlide, data.session.slide_timers);
       await updateGameSession(sessionId, {
         status: nextStatus,
         current_slide_id: targetSlide.id,
         max_slide_index_reached: maxIndex,
-        timer_started_at: null,
-        timer_duration: 0,
+        ...timerPatch,
       });
       await loadData();
     } catch (err: unknown) {
@@ -356,9 +463,18 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const handleTriggerTimer = async (seconds: number) => {
     setActionLoading(true);
     try {
+      const nowIso = new Date().toISOString();
+      const curSlide = data?.currentSlide;
+      const existingTimers = normalizeSlideTimers(data?.session?.slide_timers);
+      const nextSlideTimers =
+        curSlide && curSlide.slide_type !== 'info_only' && curSlide.slide_type !== 'theme_intro'
+          ? { ...existingTimers, [curSlide.id]: { started_at: nowIso, duration: seconds } }
+          : existingTimers;
+
       await updateGameSession(sessionId, {
-        timer_started_at: new Date().toISOString(),
+        timer_started_at: nowIso,
         timer_duration: seconds,
+        slide_timers: nextSlideTimers,
       });
       await loadData();
     } catch (err: unknown) {
@@ -368,28 +484,46 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     }
   };
 
-  // Podaljšanje časovnika v živo (tudi če teče ali je pravkar potekel)
+  // Podaljšanje časovnika v živo (tudi če teče ali je že potekel — posodobi tudi slide_timers[slide.id])
   const handleExtendTimer = async (addSeconds: number) => {
     if (!Number.isFinite(addSeconds) || addSeconds <= 0) return;
     const sec = Math.round(addSeconds);
     setActionLoading(true);
     try {
       const sess = data?.session;
+      const curSlide = data?.currentSlide;
+      const existingTimers = normalizeSlideTimers(sess?.slide_timers);
+      const perSlide = curSlide ? existingTimers[curSlide.id] : undefined;
+
+      const baseStartedAt = perSlide?.started_at || sess?.timer_started_at || null;
+      const baseDuration =
+        perSlide && perSlide.duration > 0
+          ? perSlide.duration
+          : sess?.timer_duration && sess.timer_duration > 0
+          ? sess.timer_duration
+          : 0;
+
       const running =
-        sess?.timer_started_at &&
-        sess.timer_duration &&
-        sess.timer_duration > 0 &&
-        new Date(sess.timer_started_at).getTime() + sess.timer_duration * 1000 > Date.now();
-      if (running && sess) {
-        await updateGameSession(sessionId, {
-          timer_duration: (sess.timer_duration || 0) + sec,
-        });
-      } else {
-        await updateGameSession(sessionId, {
-          timer_started_at: new Date().toISOString(),
-          timer_duration: sec,
-        });
-      }
+        Boolean(baseStartedAt) &&
+        baseDuration > 0 &&
+        new Date(baseStartedAt!).getTime() + baseDuration * 1000 > Date.now();
+
+      const nextStartedAt = running && baseStartedAt ? baseStartedAt : new Date().toISOString();
+      const nextDuration = running ? baseDuration + sec : sec;
+
+      const nextSlideTimers =
+        curSlide && curSlide.slide_type !== 'info_only' && curSlide.slide_type !== 'theme_intro'
+          ? {
+              ...existingTimers,
+              [curSlide.id]: { started_at: nextStartedAt, duration: nextDuration },
+            }
+          : existingTimers;
+
+      await updateGameSession(sessionId, {
+        timer_started_at: nextStartedAt,
+        timer_duration: nextDuration,
+        slide_timers: nextSlideTimers,
+      });
       await loadData();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Napaka pri podaljšanju časovnika.');
@@ -401,13 +535,92 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const handleStopTimer = async () => {
     setActionLoading(true);
     try {
+      const curSlide = data?.currentSlide;
+      const existingTimers = normalizeSlideTimers(data?.session?.slide_timers);
+      const nextSlideTimers = { ...existingTimers };
+      if (curSlide?.id) {
+        delete nextSlideTimers[curSlide.id];
+      }
+
       await updateGameSession(sessionId, {
         timer_started_at: null,
         timer_duration: 0,
+        slide_timers: nextSlideTimers,
       });
       await loadData();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Napaka pri ustavitvi časovnika.');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  // 4b. Nadzor zaklepanja vračanja nazaj za igralce (locked_slide_ids)
+  const handleToggleSlideLock = async (targetSlideId: string) => {
+    if (!data) return;
+    setActionLoading(true);
+    try {
+      const currentLocked = normalizeLockedSlideIds(data.session.locked_slide_ids);
+      const isCurrentlyLocked = currentLocked.includes(targetSlideId);
+      const nextLocked = isCurrentlyLocked
+        ? currentLocked.filter((id) => id !== targetSlideId)
+        : [...currentLocked, targetSlideId];
+
+      await updateGameSession(sessionId, {
+        locked_slide_ids: nextLocked,
+      });
+      await loadData();
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Napaka pri preklopu zaklepanja vračanja nazaj.'
+      );
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleLockAllPriorThemeQuestions = async (slideIdsToLock: string[]) => {
+    if (!data || slideIdsToLock.length === 0) return;
+    setActionLoading(true);
+    try {
+      const currentLocked = normalizeLockedSlideIds(data.session.locked_slide_ids);
+      const nextLocked = Array.from(new Set([...currentLocked, ...slideIdsToLock]));
+
+      await updateGameSession(sessionId, {
+        locked_slide_ids: nextLocked,
+      });
+      await loadData();
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Napaka pri zaklepanju dosedanjih vprašanj.'
+      );
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleUnlockAllThemeQuestions = async (slideIdsToUnlock: string[]) => {
+    if (!data || slideIdsToUnlock.length === 0) return;
+    setActionLoading(true);
+    try {
+      const removeSet = new Set(slideIdsToUnlock);
+      const currentLocked = normalizeLockedSlideIds(data.session.locked_slide_ids);
+      const nextLocked = currentLocked.filter((id) => !removeSet.has(id));
+
+      await updateGameSession(sessionId, {
+        locked_slide_ids: nextLocked,
+      });
+      await loadData();
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Napaka pri odklepanju vprašanj v sklopu.'
+      );
     } finally {
       setActionLoading(false);
     }
@@ -641,13 +854,13 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
 
     setActionLoading(true);
     try {
+      const timerPatch = buildSlideTimerPatch(firstSlide, data.session.slide_timers);
       await updateGameSession(sessionId, {
         status: nextStatus,
         current_theme_id: nextTheme.id,
         current_slide_id: firstSlide?.id || null,
         max_slide_index_reached: 0,
-        timer_started_at: null,
-        timer_duration: 0,
+        ...timerPatch,
       });
       await loadData();
     } finally {
@@ -780,6 +993,26 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       s.slide_type === 'closest_number' ||
       s.slide_type === 'closest_date'
   );
+
+  const lockedSlideIdSet = new Set(normalizeLockedSlideIds(session.locked_slide_ids));
+  const normalizedSlideTimers = normalizeSlideTimers(session.slide_timers);
+  const highestOpenedIndex = Math.min(
+    currentThemeSlides.length - 1,
+    Math.max(0, session.max_slide_index_reached, currentSlideIndex)
+  );
+  const openedThemeQuestionSlides = currentThemeSlides
+    .map((slide, idx) => ({ slide, idx }))
+    .filter(
+      ({ slide, idx }) =>
+        idx <= highestOpenedIndex &&
+        slide.slide_type !== 'info_only' &&
+        slide.slide_type !== 'theme_intro'
+    );
+  const priorOpenedQuestionSlideIds = openedThemeQuestionSlides
+    .filter(({ slide }) => slide.id !== currentSlide?.id)
+    .map(({ slide }) => slide.id);
+  const allOpenedQuestionSlideIds = openedThemeQuestionSlides.map(({ slide }) => slide.id);
+  const isCurrentSlideLocked = currentSlide ? lockedSlideIdSet.has(currentSlide.id) : false;
 
   const STATUS_LABELS: Record<GameSessionStatus, { label: string; color: string }> = {
     lobby: { label: 'Čakalnica (Lobby)', color: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40' },
@@ -1249,15 +1482,17 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                       <Clock className="w-4 h-4 text-indigo-400" />
                       <span>Nadzor časovnika (Timer)</span>
                     </div>
-                    {timeLeft !== null && session.timer_duration && session.timer_duration > 0 ? (
+                    {timeLeft !== null && activeSlideTimerEntry ? (
                       <span
                         className={`px-2.5 py-0.5 rounded-full text-xs font-mono-code font-black ${
-                          timeLeft <= 5
+                          timeLeft <= 0
+                            ? 'bg-rose-500/25 text-rose-200 border border-rose-500/50 animate-pulse'
+                            : timeLeft <= 5
                             ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse'
                             : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                         }`}
                       >
-                        Odštevanje: {timeLeft}s
+                        {timeLeft <= 0 ? '⏱️ Čas potekel (0s)' : `Odštevanje: ${timeLeft}s`}
                       </span>
                     ) : (
                       <span className="text-xs text-slate-500">Časovnik miruje</span>
@@ -1356,6 +1591,152 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
                   </div>
                 </div>
               )}
+
+            {/* Nadzor zaklepanja vračanja nazaj za igralce (locked_slide_ids) */}
+            {openedThemeQuestionSlides.length > 0 && (
+              <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-2xl p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-300">
+                    {isCurrentSlideLocked ? (
+                      <Lock className="w-4 h-4 text-rose-400" />
+                    ) : (
+                      <Unlock className="w-4 h-4 text-emerald-400" />
+                    )}
+                    <span>Nadzor vračanja nazaj</span>
+                  </div>
+                  <span className="text-[11px] font-mono-code text-slate-400">
+                    Zaklenjeno:{' '}
+                    <strong className="text-amber-300">
+                      {
+                        openedThemeQuestionSlides.filter(({ slide }) =>
+                          lockedSlideIdSet.has(slide.id)
+                        ).length
+                      }
+                      /{openedThemeQuestionSlides.length}
+                    </strong>
+                  </span>
+                </div>
+
+                {/* Stikalo za trenutni slajd */}
+                {currentSlide.slide_type !== 'info_only' &&
+                  currentSlide.slide_type !== 'theme_intro' && (
+                    <button
+                      id="remote-toggle-current-slide-lock-btn"
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={() => handleToggleSlideLock(currentSlide.id)}
+                      className={`w-full py-3 px-4 rounded-xl border font-bold text-xs flex items-center justify-between transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50 ${
+                        isCurrentSlideLocked
+                          ? 'bg-rose-500/20 hover:bg-rose-500/30 border-rose-500/45 text-rose-200'
+                          : 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/35 text-emerald-200'
+                      }`}
+                    >
+                      <span>
+                        {isCurrentSlideLocked
+                          ? '🔒 Zaklenjeno za vračanje'
+                          : '🔓 Dovoljeno vračanje nazaj'}
+                      </span>
+                      <span className="text-[10px] opacity-80">
+                        {isCurrentSlideLocked ? 'Klikni za odklep' : 'Trenutno vprašanje'}
+                      </span>
+                    </button>
+                  )}
+
+                {/* Gumb za zaklep vseh dosedanjih (prejšnjih) vprašanj v sklopu + hiter odklep */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    id="remote-lock-all-prior-questions-btn"
+                    type="button"
+                    disabled={
+                      actionLoading ||
+                      priorOpenedQuestionSlideIds.length === 0 ||
+                      priorOpenedQuestionSlideIds.every((id) => lockedSlideIdSet.has(id))
+                    }
+                    onClick={() => handleLockAllPriorThemeQuestions(priorOpenedQuestionSlideIds)}
+                    className="flex-1 min-w-[200px] py-2.5 px-3 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-200 font-bold text-xs flex items-center justify-center gap-1.5 transition-all active:scale-[0.99] cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    <span>🔒 Zakleni vsa dosedanja vprašanja v sklopu</span>
+                  </button>
+
+                  {openedThemeQuestionSlides.some(({ slide }) =>
+                    lockedSlideIdSet.has(slide.id)
+                  ) && (
+                    <button
+                      id="remote-unlock-all-theme-questions-btn"
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={() => handleUnlockAllThemeQuestions(allOpenedQuestionSlideIds)}
+                      className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-semibold text-xs cursor-pointer disabled:opacity-45"
+                    >
+                      🔓 Odkleni vsa
+                    </button>
+                  )}
+                </div>
+
+                {/* Hiter seznam že odprtih vprašanj v sklopu */}
+                <div className="space-y-1.5 pt-2 border-t border-slate-800">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                    Odprta vprašanja v tem sklopu
+                  </span>
+                  <div className="space-y-1.5 max-h-52 overflow-y-auto pr-0.5">
+                    {openedThemeQuestionSlides.map(({ slide, idx }) => {
+                      const isLocked = lockedSlideIdSet.has(slide.id);
+                      const isCur = slide.id === currentSlide.id;
+                      const timerEntry = normalizedSlideTimers[slide.id];
+                      const isTimerDone =
+                        Boolean(timerEntry) &&
+                        Date.now() >=
+                          new Date(timerEntry.started_at).getTime() + timerEntry.duration * 1000;
+
+                      return (
+                        <div
+                          key={slide.id}
+                          className={`flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl border text-xs ${
+                            isCur
+                              ? 'bg-indigo-500/10 border-indigo-500/35'
+                              : 'bg-slate-950/70 border-slate-800'
+                          }`}
+                        >
+                          <div className="min-w-0 flex items-center gap-1.5">
+                            <span className="font-mono-code font-bold text-indigo-300 shrink-0">
+                              #{idx + 1}
+                            </span>
+                            <span className="text-slate-200 truncate">
+                              {slide.question_text || `Vprašanje ${idx + 1}`}
+                            </span>
+                            {isCur && (
+                              <span className="px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 text-[9px] font-bold shrink-0">
+                                Trenutni
+                              </span>
+                            )}
+                            {isTimerDone && (
+                              <span className="px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 text-[9px] font-bold shrink-0">
+                                ⏱️ Potekel
+                              </span>
+                            )}
+                          </div>
+
+                          <button
+                            type="button"
+                            disabled={actionLoading}
+                            onClick={() => handleToggleSlideLock(slide.id)}
+                            className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold shrink-0 transition-colors cursor-pointer disabled:opacity-45 ${
+                              isLocked
+                                ? 'bg-rose-500/20 hover:bg-rose-500/30 border-rose-500/40 text-rose-200'
+                                : 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/35 text-emerald-200'
+                            }`}
+                          >
+                            {isLocked
+                              ? '🔒 Zaklenjeno za vračanje'
+                              : '🔓 Dovoljeno vračanje nazaj'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Velika navigacijska gumba: Prejšnji slajd / Naslednji slajd */}
             <div className="grid grid-cols-2 gap-3 pt-1">

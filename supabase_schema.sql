@@ -71,8 +71,14 @@ CREATE TABLE IF NOT EXISTS public.game_sessions (
     max_slide_index_reached INTEGER NOT NULL DEFAULT 0,
     timer_started_at TIMESTAMPTZ,
     timer_duration INTEGER DEFAULT 0,
+    slide_timers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    locked_slide_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Nadgradnja obstoječe tabele game_sessions (trajni časovniki po slajdih in zaklepanje vračanja nazaj)
+ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS slide_timers JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS locked_slide_ids JSONB DEFAULT '[]'::jsonb;
 
 -- 5. Tabela: players (Igralci v posamezni igri)
 CREATE TABLE IF NOT EXISTS public.players (

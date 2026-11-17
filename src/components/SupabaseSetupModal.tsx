@@ -35,6 +35,10 @@ ALTER TABLE public.slides ADD CONSTRAINT slides_slide_type_check CHECK (
     slide_type IN ('theme_intro', 'info_only', 'multiple_choice', 'open_text', 'closest_number', 'closest_date')
 );
 
+-- 1c. Trajni časovniki po slajdih (slide_timers) in zaklepanje vračanja nazaj (locked_slide_ids)
+ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS slide_timers JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS locked_slide_ids JSONB DEFAULT '[]'::jsonb;
+
 -- 2. Izklopi RLS (Row Level Security) na vseh tabelah
 ALTER TABLE public.quizzes DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.themes DISABLE ROW LEVEL SECURITY;

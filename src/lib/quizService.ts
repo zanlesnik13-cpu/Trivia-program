@@ -21,6 +21,7 @@ import type {
   QuizWithStats,
   Slide,
   SlideOptions,
+  SlideTimerState,
   SlideType,
   Theme,
 } from '../types/quiz';
@@ -140,6 +141,42 @@ function normalizeQuestionParts(raw: unknown): QuestionPart[] | null {
     });
   });
   return parts.length > 0 ? parts : null;
+}
+
+export function normalizeSlideTimers(raw: unknown): Record<string, SlideTimerState> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const result: Record<string, SlideTimerState> = {};
+  for (const [slideId, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (!slideId || !val || typeof val !== 'object' || Array.isArray(val)) continue;
+    const obj = val as Record<string, unknown>;
+    const startedAt = typeof obj.started_at === 'string' ? obj.started_at : '';
+    const duration = Number(obj.duration);
+    if (startedAt && Number.isFinite(duration) && duration > 0) {
+      result[slideId] = { started_at: startedAt, duration };
+    }
+  }
+  return result;
+}
+
+export function normalizeLockedSlideIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item === 'string' && item.trim()) {
+      seen.add(item.trim());
+    }
+  }
+  return Array.from(seen);
+}
+
+export function normalizeGameSession(raw: GameSession): GameSession {
+  return {
+    ...raw,
+    slide_timers: normalizeSlideTimers(raw.slide_timers),
+    locked_slide_ids: normalizeLockedSlideIds(raw.locked_slide_ids),
+  };
 }
 
 /**
@@ -921,30 +958,45 @@ export async function createLiveGameSession(quizId: string, hostId?: string): Pr
   }
 
   // KORAK 4: Vstavi novo sejo v tabelo game_sessions z unikatnim UUID in 4-mestnim room_code
-  // Pošljemo SAMO stolpce iz SQL sheme: id, quiz_id, room_code, status, current_theme_id, current_slide_id, max_slide_index_reached, timer_started_at, timer_duration
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     const sessionId = crypto.randomUUID();
     const roomCode = generateNumericRoomCode();
 
-    const { data, error } = await supabase
+    const fullPayload: Record<string, unknown> = {
+      id: sessionId,
+      quiz_id: quizId,
+      room_code: roomCode,
+      status: 'lobby',
+      current_theme_id: firstThemeId,
+      current_slide_id: firstSlideId,
+      max_slide_index_reached: 0,
+      timer_started_at: null,
+      timer_duration: 0,
+      slide_timers: {},
+      locked_slide_ids: [],
+    };
+
+    let { data, error } = await supabase
       .from('game_sessions')
-      .insert({
-        id: sessionId,
-        quiz_id: quizId,
-        room_code: roomCode,
-        status: 'lobby',
-        current_theme_id: firstThemeId,
-        current_slide_id: firstSlideId,
-        max_slide_index_reached: 0,
-        timer_started_at: null,
-        timer_duration: 0,
-      })
+      .insert(fullPayload)
       .select('*')
       .single();
 
+    if (error && /(slide_timers|locked_slide_ids)/i.test(error.message || '')) {
+      console.warn(
+        'Stolpca game_sessions.slide_timers ali game_sessions.locked_slide_ids ne obstajata v bazi. Zaženi Hiter popravek v ⚙️ Nastavitve baze.'
+      );
+      const { slide_timers: _st, locked_slide_ids: _ls, ...fallbackPayload } = fullPayload;
+      ({ data, error } = await supabase
+        .from('game_sessions')
+        .insert(fallbackPayload)
+        .select('*')
+        .single());
+    }
+
     if (!error && data) {
-      return data as GameSession;
+      return normalizeGameSession(data as GameSession);
     }
 
     lastError = error;
@@ -1016,7 +1068,7 @@ export async function fetchHostActiveSessions(
   }
 
   return (sessions as GameSession[]).map((session) => ({
-    session,
+    session: normalizeGameSession(session),
     quizTitle: quizTitleMap.get(session.quiz_id) || 'Kviz v živo',
     playerCount: playerCountBySession[session.id] || 0,
   }));
@@ -1048,7 +1100,7 @@ export async function fetchGameSession(sessionId: string): Promise<GameSession |
     .single();
 
   if (error || !data) return null;
-  return data as GameSession;
+  return normalizeGameSession(data as GameSession);
 }
 
 /**
@@ -1160,7 +1212,7 @@ export async function fetchPresentationData(sessionId: string): Promise<Presenta
   const dedupedAnswers = deduplicateAnswers((answersData || []) as Answer[]);
 
   return {
-    session: session as GameSession,
+    session: normalizeGameSession(session as GameSession),
     quiz: quiz as Quiz,
     themes,
     slidesByTheme,
@@ -1392,17 +1444,53 @@ export async function updateGameSession(
 ): Promise<GameSession> {
   const supabase = requireSupabaseClient();
 
-  const { data, error } = await supabase
+  const cleanUpdates: Record<string, unknown> = { ...updates };
+  if (updates.slide_timers !== undefined) {
+    cleanUpdates.slide_timers = normalizeSlideTimers(updates.slide_timers);
+  }
+  if (updates.locked_slide_ids !== undefined) {
+    cleanUpdates.locked_slide_ids = normalizeLockedSlideIds(updates.locked_slide_ids);
+  }
+
+  let { data, error } = await supabase
     .from('game_sessions')
-    .update(updates)
+    .update(cleanUpdates)
     .eq('id', sessionId)
     .select('*')
     .single();
 
+  const retryUpdates = { ...cleanUpdates };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!error || !/(slide_timers|locked_slide_ids)/i.test(error.message || '')) {
+      break;
+    }
+    console.warn(
+      'Stolpca game_sessions.slide_timers ali game_sessions.locked_slide_ids ne obstajata v bazi. Zaženi: ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS slide_timers JSONB DEFAULT \'{}\'::jsonb; ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS locked_slide_ids JSONB DEFAULT \'[]\'::jsonb;'
+    );
+    const errMsg = error.message || '';
+    if (/slide_timers/i.test(errMsg)) {
+      delete retryUpdates.slide_timers;
+    }
+    if (/locked_slide_ids/i.test(errMsg)) {
+      delete retryUpdates.locked_slide_ids;
+    }
+    if (Object.keys(retryUpdates).length === 0) {
+      throw new Error(
+        'V Supabase tabeli "game_sessions" manjka stolpec "locked_slide_ids" ali "slide_timers". Na nadzorni plošči (/host) odprite ⚙️ Nastavitve baze in zaženite Hiter popravek SQL!'
+      );
+    }
+    ({ data, error } = await supabase
+      .from('game_sessions')
+      .update(retryUpdates)
+      .eq('id', sessionId)
+      .select('*')
+      .single());
+  }
+
   if (error || !data) {
     throw formatSupabaseError(error, 'Napaka pri posodabljanju seje v tabeli "game_sessions"');
   }
-  return data as GameSession;
+  return normalizeGameSession(data as GameSession);
 }
 
 export async function addDemoPlayer(
@@ -1945,15 +2033,50 @@ export async function findSessionByRoomCode(roomCode: string): Promise<GameSessi
     .maybeSingle();
 
   if (error || !data) return null;
-  return data as GameSession;
+  return normalizeGameSession(data as GameSession);
 }
 
 /**
- * Registracija/vstop tekmovalca v sejo. Ustvari nov `reconnect_token` (UUID) in `id` (UUID).
+ * Poišče obstoječega igralca/ekipo v dani seji po normaliziranem imenu (brez razlikovanja velikih/malih črk in presledkov).
+ */
+export async function findPlayerByNicknameInSession(
+  sessionId: string,
+  nickname: string
+): Promise<Player | null> {
+  const supabase = requireSupabaseClient();
+  const normalizedTarget = nickname.trim().toLowerCase();
+  if (!normalizedTarget) return null;
+
+  const { data: rows, error } = await supabase
+    .from('players')
+    .select('*')
+    .eq('session_id', sessionId)
+    .order('created_at', { ascending: true });
+
+  if (error || !rows || rows.length === 0) {
+    return null;
+  }
+
+  const matched = (rows as Player[]).find(
+    (p) => (p.nickname || '').trim().toLowerCase() === normalizedTarget
+  );
+  return matched || null;
+}
+
+/**
+ * Registracija/vstop tekmovalca v sejo.
+ * Če ekipa s tem imenom (`nickname.trim().toLowerCase()`) v tej seji že obstaja,
+ * NE ustvari nove vrstice, temveč vrne obstoječega igralca (id + reconnect_token).
  */
 export async function joinSessionAsPlayer(sessionId: string, nickname: string): Promise<Player> {
   const supabase = requireSupabaseClient();
   const cleanNick = nickname.trim() || 'Neznani tekmovalec';
+
+  const existingPlayer = await findPlayerByNicknameInSession(sessionId, cleanNick);
+  if (existingPlayer) {
+    return existingPlayer;
+  }
+
   const playerId = crypto.randomUUID();
   const reconnectToken = crypto.randomUUID();
 
@@ -2141,7 +2264,7 @@ export async function fetchPlayerGameData(
 
   return {
     player: player as Player,
-    session: session as GameSession,
+    session: normalizeGameSession(session as GameSession),
     quiz: quiz as Quiz,
     themes,
     slidesByTheme,

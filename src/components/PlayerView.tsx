@@ -6,6 +6,8 @@ import {
   Calendar,
   Check,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Info,
   Layers,
@@ -29,6 +31,9 @@ import {
   fetchPlayerGameData,
   findSessionByRoomCode,
   joinSessionAsPlayer,
+  normalizeGameSession,
+  normalizeLockedSlideIds,
+  normalizeSlideTimers,
   playerActivateJoker,
   reconnectPlayer,
   savePlayerAnswer,
@@ -36,7 +41,13 @@ import {
   subscribeToDemoUpdates,
 } from '../lib/quizService';
 import { getSupabaseClient } from '../lib/supabase';
-import type { Answer, PlayerFullData, PlayerJoker, Slide } from '../types/quiz';
+import type {
+  Answer,
+  GameSession,
+  PlayerFullData,
+  PlayerJoker,
+  Slide,
+} from '../types/quiz';
 
 const LOCAL_STORAGE_KEY = 'trivia_player_session_v1';
 
@@ -45,6 +56,136 @@ interface StoredPlayerSession {
   playerId: string;
   reconnectToken: string;
   roomCode: string;
+}
+
+interface SlideTimerInfo {
+  hasTimer: boolean;
+  startedAt: string | null;
+  duration: number;
+  endMs: number | null;
+  timeLeftSecs: number | null;
+  isExpired: boolean;
+}
+
+function getSlideTimerInfo(
+  slide: Slide | null | undefined,
+  session: GameSession | null | undefined,
+  nowMs: number
+): SlideTimerInfo {
+  if (
+    !slide ||
+    !session ||
+    slide.slide_type === 'info_only' ||
+    slide.slide_type === 'theme_intro'
+  ) {
+    return {
+      hasTimer: false,
+      startedAt: null,
+      duration: 0,
+      endMs: null,
+      timeLeftSecs: null,
+      isExpired: false,
+    };
+  }
+
+  const slideTimer = session.slide_timers?.[slide.id];
+  let startedAt: string | null = null;
+  let duration = 0;
+
+  if (slideTimer && slideTimer.started_at && Number(slideTimer.duration) > 0) {
+    startedAt = slideTimer.started_at;
+    duration = Number(slideTimer.duration);
+  } else if (
+    slide.id === session.current_slide_id &&
+    session.timer_started_at &&
+    Number(session.timer_duration) > 0
+  ) {
+    startedAt = session.timer_started_at;
+    duration = Number(session.timer_duration);
+  }
+
+  if (!startedAt || duration <= 0) {
+    return {
+      hasTimer: false,
+      startedAt: null,
+      duration: 0,
+      endMs: null,
+      timeLeftSecs: null,
+      isExpired: false,
+    };
+  }
+
+  const startMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(startMs)) {
+    return {
+      hasTimer: false,
+      startedAt: null,
+      duration: 0,
+      endMs: null,
+      timeLeftSecs: null,
+      isExpired: false,
+    };
+  }
+
+  const endMs = startMs + duration * 1000;
+  const remainingMs = endMs - nowMs;
+  const isExpired = nowMs >= endMs;
+  const timeLeftSecs = isExpired ? 0 : Math.ceil(remainingMs / 1000);
+
+  return {
+    hasTimer: true,
+    startedAt,
+    duration,
+    endMs,
+    timeLeftSecs,
+    isExpired,
+  };
+}
+
+function isSlideLockedByHost(
+  slide: Slide | null | undefined,
+  session: GameSession | null | undefined
+): boolean {
+  if (
+    !slide ||
+    !session ||
+    slide.slide_type === 'info_only' ||
+    slide.slide_type === 'theme_intro'
+  ) {
+    return false;
+  }
+  return normalizeLockedSlideIds(session.locked_slide_ids).includes(slide.id);
+}
+
+function isSlideLockedOrExpired(
+  slide: Slide | null | undefined,
+  session: GameSession | null | undefined,
+  nowMs: number
+): boolean {
+  return isSlideLockedByHost(slide, session) || getSlideTimerInfo(slide, session, nowMs).isExpired;
+}
+
+function collectExpiredSlideIds(session: GameSession, nowMs: number): Set<string> {
+  const expired = new Set<string>();
+  const map = normalizeSlideTimers(session.slide_timers);
+  if (
+    session.current_slide_id &&
+    !map[session.current_slide_id] &&
+    session.timer_started_at &&
+    Number(session.timer_duration) > 0
+  ) {
+    map[session.current_slide_id] = {
+      started_at: session.timer_started_at,
+      duration: Number(session.timer_duration),
+    };
+  }
+  for (const [sId, entry] of Object.entries(map)) {
+    const startMs = new Date(entry.started_at).getTime();
+    if (Number.isFinite(startMs) && entry.duration > 0 && nowMs >= startMs + entry.duration * 1000) {
+      expired.add(sId);
+    }
+  }
+  return expired;
 }
 
 interface PlayerViewProps {
@@ -77,8 +218,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   const [autoSaveStatusBySlide, setAutoSaveStatusBySlide] = useState<Record<string, AutoSaveStatus>>({});
   const [saveSuccessNotice, setSaveSuccessNotice] = useState(false);
 
-  // Časovnik v živo
-  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  // Časovnik v živo (globalna ura za trajne časovnike po slajdih)
+  const [timerNowMs, setTimerNowMs] = useState<number>(() => Date.now());
 
   // Joker aktivacija
   const [activatingJoker, setActivatingJoker] = useState(false);
@@ -90,7 +231,6 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   const draftsRef = useRef<Record<string, string>>({});
   const gameDataRef = useRef<PlayerFullData | null>(null);
   const selectedSlideIdRef = useRef<string | null>(null);
-  const timeLeftRef = useRef<number | null>(null);
   const debounceTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const dirtySlidesRef = useRef<Record<string, Slide>>({});
   const lastConfirmedTextRef = useRef<Record<string, string>>({});
@@ -99,7 +239,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   const pendingKeepalivePayloadRef = useRef<Record<string, { slide: Slide; serialized: string }>>({});
   const unverifiedKeepaliveSlidesRef = useRef<Record<string, { slide: Slide; text: string }>>({});
   const saveNoticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const prevTimerExpiredSlideIdRef = useRef<string | null>(null);
+  const prevExpiredSlideIdsRef = useRef<Set<string>>(new Set());
+  const prevLockedSlideIdsRef = useRef<Set<string>>(new Set());
 
   // Ohrani ref-e vedno sinhrone s stanjem
   useEffect(() => {
@@ -392,20 +533,14 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     newValue: string,
     saveMode: 'debounce' | 'immediate'
   ) => {
-    const nextDrafts = { ...draftsRef.current, [draftKey]: newValue };
-    draftsRef.current = nextDrafts;
-    setDrafts((prev) => ({ ...prev, [draftKey]: newValue }));
-
     const dataNow = gameDataRef.current;
     if (!dataNow || !dataNow.currentTheme) return;
     if (dataNow.session.status !== 'active_theme') return;
-    if (
-      timeLeftRef.current !== null &&
-      timeLeftRef.current <= 0 &&
-      slide.id === dataNow.session.current_slide_id
-    ) {
-      return;
-    }
+    if (isSlideLockedOrExpired(slide, dataNow.session, Date.now())) return;
+
+    const nextDrafts = { ...draftsRef.current, [draftKey]: newValue };
+    draftsRef.current = nextDrafts;
+    setDrafts((prev) => ({ ...prev, [draftKey]: newValue }));
 
     delete unverifiedKeepaliveSlidesRef.current[slide.id];
 
@@ -470,6 +605,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
               gameDataRef.current = fullData;
               setGameData(fullData);
               seedDraftsFromSavedAnswers(fullData.myAnswers);
+              prevLockedSlideIdsRef.current = new Set(
+                normalizeLockedSlideIds(fullData.session.locked_slide_ids)
+              );
+              prevExpiredSlideIdsRef.current = collectExpiredSlideIds(fullData.session, Date.now());
               lastSeenSlideIdRef.current = fullData.session.current_slide_id;
               lastSeenThemeIdRef.current = fullData.session.current_theme_id;
               prevStatusRef.current = fullData.session.status;
@@ -491,12 +630,32 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
   const [refreshing, setRefreshing] = useState(false);
 
+  // Shrani čakajoče osnutke za slajde, ki jih je gostitelj pravkar zaklenil
+  const flushNewlyLockedSlides = (lockedIdsRaw: unknown) => {
+    const lockedIds = normalizeLockedSlideIds(lockedIdsRaw);
+    for (const sId of lockedIds) {
+      if (!prevLockedSlideIdsRef.current.has(sId)) {
+        if (
+          dirtySlidesRef.current[sId] ||
+          debounceTimersRef.current[sId] ||
+          pendingKeepalivePayloadRef.current[sId]
+        ) {
+          void flushSlideById(sId);
+        }
+      }
+    }
+    prevLockedSlideIdsRef.current = new Set(lockedIds);
+  };
+
   // 2. Osveževanje podatkov o igralcu (brez prepisovanja aktivnega tipkanja!)
   const refreshPlayerData = async () => {
     if (!activeSessionId || !activePlayerId) return;
     const fetchStartedAt = Date.now();
     try {
       const full = await fetchPlayerGameData(activeSessionId, activePlayerId);
+
+      // Če je gostitelj zaklenil katerega od slajdov, najprej shrani morebiten neshranjen osnutek tega slajda
+      flushNewlyLockedSlides(full.session.locked_slide_ids);
 
       // Preden preklopimo na nov slajd ali zaključimo sklop, takoj shranimo morebitne čakajoče osnutke!
       const newHostSlideId = full.session.current_slide_id;
@@ -609,6 +768,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                 updatedSession.status !== undefined &&
                 updatedSession.status !== 'active_theme';
 
+              if (updatedSession.locked_slide_ids !== undefined) {
+                flushNewlyLockedSlides(updatedSession.locked_slide_ids);
+              }
+
               // Takojšnje shranjevanje neshranjenih osnutkov pred zaklepanjem ali menjavo slajda!
               if (hostSlideOrThemeChanged || leavingActiveTheme) {
                 void flushAllDirtySlides();
@@ -616,9 +779,13 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
 
               setGameData((prev) => {
                 if (!prev) return prev;
+                const mergedSession = normalizeGameSession({
+                  ...prev.session,
+                  ...updatedSession,
+                });
                 const next = {
                   ...prev,
-                  session: { ...prev.session, ...updatedSession },
+                  session: mergedSession,
                 };
                 gameDataRef.current = next;
                 return next;
@@ -721,52 +888,75 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     };
   }, [activeSessionId, activePlayerId]);
 
-  // 4. Odštevalnik časa (Timer loop) - vedno računa iz timer_started_at in timer_duration
+  // 4. Odštevalnik časa za VSAKI slajd v slide_timers (trajni zaklep ob poteku + samodejno shranjevanje ob poteku)
   useEffect(() => {
     const session = gameData?.session;
-    if (!session || !session.timer_started_at || !session.timer_duration || session.timer_duration <= 0) {
-      timeLeftRef.current = null;
-      prevTimerExpiredSlideIdRef.current = null;
-      setTimeLeft(null);
-      return;
-    }
+    if (!session) return;
 
-    const startTime = new Date(session.timer_started_at).getTime();
-    const durationMs = session.timer_duration * 1000;
-    const endTime = startTime + durationMs;
-
-    const tick = () => {
-      const remainingMs = endTime - Date.now();
-      if (remainingMs <= 0) {
-        timeLeftRef.current = 0;
-        // Preden se polje zaklene zaradi izteka časa, takoj shrani zadnji vnos v bazo!
-        if (prevTimerExpiredSlideIdRef.current !== session.current_slide_id) {
-          prevTimerExpiredSlideIdRef.current = session.current_slide_id;
-          void flushAllDirtySlides();
-        }
-        setTimeLeft(0);
-        return false;
-      } else {
-        const secs = Math.ceil(remainingMs / 1000);
-        timeLeftRef.current = secs;
-        prevTimerExpiredSlideIdRef.current = null;
-        setTimeLeft(secs);
-        return true;
+    const getTrackedTimers = () => {
+      const map = normalizeSlideTimers(session.slide_timers);
+      if (
+        session.current_slide_id &&
+        !map[session.current_slide_id] &&
+        session.timer_started_at &&
+        Number(session.timer_duration) > 0
+      ) {
+        map[session.current_slide_id] = {
+          started_at: session.timer_started_at,
+          duration: Number(session.timer_duration),
+        };
       }
+      return map;
     };
 
-    const keepRunning = tick();
-    if (!keepRunning) return;
+    const tickAll = () => {
+      const now = Date.now();
+      const tracked = getTrackedTimers();
+      let anyRunning = false;
+
+      for (const trackedId of Array.from(prevExpiredSlideIdsRef.current)) {
+        if (!tracked[trackedId]) {
+          prevExpiredSlideIdsRef.current.delete(trackedId);
+        }
+      }
+
+      for (const [sId, entry] of Object.entries(tracked)) {
+        const startMs = new Date(entry.started_at).getTime();
+        if (!Number.isFinite(startMs) || entry.duration <= 0) continue;
+        const endMs = startMs + entry.duration * 1000;
+        if (now >= endMs) {
+          if (!prevExpiredSlideIdsRef.current.has(sId)) {
+            prevExpiredSlideIdsRef.current.add(sId);
+            void flushSlideById(sId);
+          }
+        } else {
+          prevExpiredSlideIdsRef.current.delete(sId);
+          anyRunning = true;
+        }
+      }
+
+      setTimerNowMs(now);
+      return anyRunning;
+    };
+
+    const hasRunning = tickAll();
+    if (!hasRunning) return;
 
     const interval = setInterval(() => {
-      const stillRunning = tick();
+      const stillRunning = tickAll();
       if (!stillRunning) {
         clearInterval(interval);
       }
     }, 200);
 
     return () => clearInterval(interval);
-  }, [gameData?.session?.timer_started_at, gameData?.session?.timer_duration, gameData?.session?.current_slide_id]);
+  }, [
+    gameData?.session?.slide_timers,
+    gameData?.session?.timer_started_at,
+    gameData?.session?.timer_duration,
+    gameData?.session?.current_slide_id,
+    gameData?.session?.status,
+  ]);
 
   // Slajdi trenutne tematike
   const currentThemeSlides: Slide[] = useMemo(() => {
@@ -806,19 +996,11 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     return gameData.playerJokers.some((pj: PlayerJoker) => pj.theme_id === gameData.currentTheme?.id);
   }, [gameData?.currentTheme?.id, gameData?.playerJokers]);
 
-  // Ali je časovnik potekel za trenutni slajd gostitelja?
-  const isTimerExpiredOnCurrentHostSlide = useMemo(() => {
-    if (timeLeft !== null && timeLeft <= 0) {
-      return currentViewingSlide?.id === gameData?.session?.current_slide_id;
-    }
-    return false;
-  }, [timeLeft, currentViewingSlide?.id, gameData?.session?.current_slide_id]);
-
   // ---------------------------------------------------------------------------
   // AKCIJE TEKMOVALCA
   // ---------------------------------------------------------------------------
 
-  // Vstop v igro (Prijava)
+  // Vstop v igro (Prijava ali ponovna prijava pod istim imenom ekipe brez podvajanja)
   const handleJoinGame = async (e: React.FormEvent) => {
     e.preventDefault();
     setJoinError(null);
@@ -860,24 +1042,21 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         return;
       }
 
-      // Če ima naprava v localStorage že shranjen veljaven reconnect_token za to sejo,
-      // obnovi obstoječega igralca, da nikoli ne ustvari podvojenega zapisa v tabeli players.
-      let player = null;
-      try {
-        const existingRaw = localStorage.getItem(LOCAL_STORAGE_KEY);
-        if (existingRaw) {
-          const parsed = JSON.parse(existingRaw) as StoredPlayerSession;
-          if (parsed.sessionId === session.id && parsed.playerId && parsed.reconnectToken) {
-            player = await reconnectPlayer(session.id, parsed.playerId, parsed.reconnectToken);
-          }
-        }
-      } catch {
-        // ignore parse error
-      }
+      // Počisti morebitne predhodne lokalne osnutke pred prijavo/preklopom ekipe
+      Object.values(debounceTimersRef.current).forEach((t) => clearTimeout(t));
+      debounceTimersRef.current = {};
+      dirtySlidesRef.current = {};
+      pendingKeepalivePayloadRef.current = {};
+      unverifiedKeepaliveSlidesRef.current = {};
+      lastConfirmedTextRef.current = {};
+      inFlightSaveCountRef.current = {};
+      draftsRef.current = {};
+      setDrafts({});
+      setAutoSaveStatusBySlide({});
 
-      if (!player) {
-        player = await joinSessionAsPlayer(session.id, cleanNick);
-      }
+      // joinSessionAsPlayer poišče obstoječo ekipo v tej seji (nickname.trim().toLowerCase())
+      // in jo nadaljuje (brez podvojene vrstice) ali ustvari novo, če še ne obstaja.
+      const player = await joinSessionAsPlayer(session.id, cleanNick);
 
       // Shrani v localStorage za odpornost na prekinitev / reload
       const stored: StoredPlayerSession = {
@@ -895,6 +1074,10 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
       gameDataRef.current = fullData;
       setGameData(fullData);
       seedDraftsFromSavedAnswers(fullData.myAnswers);
+      prevLockedSlideIdsRef.current = new Set(
+        normalizeLockedSlideIds(fullData.session.locked_slide_ids)
+      );
+      prevExpiredSlideIdsRef.current = collectExpiredSlideIds(fullData.session, Date.now());
       lastSeenSlideIdRef.current = fullData.session.current_slide_id;
       lastSeenThemeIdRef.current = fullData.session.current_theme_id;
       prevStatusRef.current = fullData.session.status;
@@ -920,6 +1103,8 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
     lastConfirmedTextRef.current = {};
     inFlightSaveCountRef.current = {};
     draftsRef.current = {};
+    prevExpiredSlideIdsRef.current.clear();
+    prevLockedSlideIdsRef.current.clear();
 
     localStorage.removeItem(LOCAL_STORAGE_KEY);
     setActiveSessionId(null);
@@ -977,7 +1162,12 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   const handleManualSaveSlide = async (explicitSlide?: Slide) => {
     const targetSlide = explicitSlide || currentViewingSlide;
     if (!gameData || !gameData.currentTheme || !targetSlide) return;
-    if (gameData.session.status !== 'active_theme' || isTimerExpiredOnCurrentHostSlide) return;
+    if (
+      gameData.session.status !== 'active_theme' ||
+      isSlideLockedOrExpired(targetSlide, gameData.session, Date.now())
+    ) {
+      return;
+    }
 
     dirtySlidesRef.current[targetSlide.id] = targetSlide;
     await flushSlideById(targetSlide.id, { forceManual: true });
@@ -1310,91 +1500,168 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
         {/* ===================================================================
             C. STANJE: ACTIVE_THEME (Reševanje vprašanj + prosto vračanje nazaj)
             =================================================================== */}
-        {session.status === 'active_theme' && currentTheme && currentViewingSlide && (
-          <div className="space-y-4 animate-fadeIn">
-            {/* VRSTICA S ŠTEVILKAMI VPRAŠANJ (Prosto vračanje do max_slide_index_reached) */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs px-1">
-                <span className="font-bold text-slate-400 uppercase tracking-wider text-[10px]">
-                  Vprašanja v temi (klikni za skok nazaj):
-                </span>
-                <span className="font-mono-code font-bold text-indigo-400 text-[11px]">
-                  Odprto do #{maxAllowedIndex + 1}
-                </span>
-              </div>
+        {session.status === 'active_theme' && currentTheme && currentViewingSlide && (() => {
+          const viewedTimerInfo = getSlideTimerInfo(currentViewingSlide, session, timerNowMs);
+          const hostSlide =
+            currentThemeSlides.find((s: Slide) => s.id === session.current_slide_id) || null;
+          const hostTimerInfo = getSlideTimerInfo(hostSlide, session, timerNowMs);
+          const isLockedByHost = isSlideLockedByHost(currentViewingSlide, session);
+          const isTimerExpiredOnViewedSlide = viewedTimerInfo.isExpired;
+          const isInputLocked = isLockedByHost || isTimerExpiredOnViewedSlide;
+          const isQuestionSlide =
+            currentViewingSlide.slide_type !== 'info_only' &&
+            currentViewingSlide.slide_type !== 'theme_intro';
 
-              <div className="flex gap-2 overflow-x-auto pb-1.5 pt-0.5 no-scrollbar">
-                {currentThemeSlides.map((slide: Slide, idx: number) => {
-                  const isLocked = idx > maxAllowedIndex;
-                  const isCurrentViewing = currentViewingSlide.id === slide.id;
-                  const isHostCurrent = session.current_slide_id === slide.id;
-                  const savedAnsText = gameData.myAnswers[slide.id]?.answer_text;
-                  const hasAnswered = isMultiPartSlide(slide)
-                    ? hasAnyMultiPartValue(savedAnsText)
-                    : Boolean(savedAnsText);
+          return (
+            <div className="space-y-4 animate-fadeIn">
+              {/* NAVIGACIJA NAZAJ / NAPREJ + VRSTICA S ŠTEVILKAMI VPRAŠANJ */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    id="player-prev-slide-btn"
+                    type="button"
+                    disabled={viewingSlideIndex <= 0}
+                    onClick={() => {
+                      const prevSlide = currentThemeSlides[viewingSlideIndex - 1];
+                      if (prevSlide) handleSelectSlide(prevSlide.id);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 disabled:opacity-35 text-xs font-bold text-slate-200 cursor-pointer disabled:cursor-not-allowed transition-colors"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Nazaj</span>
+                  </button>
 
-                  return (
-                    <button
-                      key={slide.id}
-                      type="button"
-                      disabled={isLocked}
-                      onClick={() => handleSelectSlide(slide.id)}
-                      className={`relative min-w-[44px] h-11 rounded-xl font-mono-code font-bold text-xs flex flex-col items-center justify-center transition-all cursor-pointer ${
-                        isLocked
-                          ? 'bg-slate-900/40 border border-slate-800 text-slate-600 cursor-not-allowed opacity-40'
-                          : isCurrentViewing
-                          ? 'bg-indigo-600 text-white border-2 border-indigo-400 shadow-lg shadow-indigo-600/30 scale-105'
-                          : hasAnswered
-                          ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300'
-                          : 'bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-700'
-                      }`}
-                      title={
-                        isLocked
-                          ? 'Vprašanje še ni odprto s strani gostitelja'
-                          : `Pojdi na vprašanje #${idx + 1}`
-                      }
-                    >
-                      <span>{idx + 1}</span>
-                      {hasAnswered && !isCurrentViewing && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                      )}
-                      {isHostCurrent && !isCurrentViewing && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-ping absolute -top-1 -right-1" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+                  <span className="font-mono-code font-bold text-indigo-400 text-[11px] text-center">
+                    Slajd {viewingSlideIndex + 1} • odprto do #{maxAllowedIndex + 1}
+                  </span>
 
-            {/* ČASOVNIK (Če teče za trenutni gostiteljev slajd) */}
-            {session.timer_duration && session.timer_duration > 0 && timeLeft !== null && (
-              <div className="p-3 rounded-2xl bg-slate-900/90 border border-slate-800 flex items-center justify-between shadow-md">
-                <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
-                  <Clock
-                    className={`w-4 h-4 ${
-                      timeLeft <= 5 ? 'text-rose-400 animate-bounce' : 'text-indigo-400'
-                    }`}
-                  />
-                  <span>Čas za odgovor:</span>
+                  <button
+                    id="player-next-slide-btn"
+                    type="button"
+                    disabled={viewingSlideIndex >= maxAllowedIndex}
+                    onClick={() => {
+                      const nextSlide = currentThemeSlides[viewingSlideIndex + 1];
+                      if (nextSlide) handleSelectSlide(nextSlide.id);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 disabled:opacity-35 text-xs font-bold text-slate-200 cursor-pointer disabled:cursor-not-allowed transition-colors"
+                  >
+                    <span>Naprej</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
                 </div>
-                <span
-                  className={`font-mono-code font-black text-lg ${
-                    timeLeft <= 5
-                      ? 'text-rose-400 animate-pulse'
-                      : timeLeft <= 10
-                      ? 'text-amber-400'
-                      : 'text-emerald-400'
+
+                <div className="flex gap-2 overflow-x-auto pb-1.5 pt-1 no-scrollbar">
+                  {currentThemeSlides.map((slide: Slide, idx: number) => {
+                    const isUnopened = idx > maxAllowedIndex;
+                    const isCurrentViewing = currentViewingSlide.id === slide.id;
+                    const isHostCurrent = session.current_slide_id === slide.id;
+                    const savedAnsText = gameData.myAnswers[slide.id]?.answer_text;
+                    const hasAnswered = isMultiPartSlide(slide)
+                      ? hasAnyMultiPartValue(savedAnsText)
+                      : Boolean(savedAnsText);
+                    const pillHostLocked = !isUnopened && isSlideLockedByHost(slide, session);
+                    const pillTimerExpired =
+                      !isUnopened && getSlideTimerInfo(slide, session, timerNowMs).isExpired;
+
+                    return (
+                      <button
+                        key={slide.id}
+                        type="button"
+                        disabled={isUnopened}
+                        onClick={() => handleSelectSlide(slide.id)}
+                        className={`relative min-w-[44px] h-11 rounded-xl font-mono-code font-bold text-xs flex flex-col items-center justify-center transition-all cursor-pointer ${
+                          isUnopened
+                            ? 'bg-slate-900/40 border border-slate-800 text-slate-600 cursor-not-allowed opacity-40'
+                            : isCurrentViewing
+                            ? 'bg-indigo-600 text-white border-2 border-indigo-400 shadow-lg shadow-indigo-600/30 scale-105'
+                            : hasAnswered
+                            ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300'
+                            : 'bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-700'
+                        }`}
+                        title={
+                          isUnopened
+                            ? 'Vprašanje še ni odprto s strani gostitelja'
+                            : pillHostLocked
+                            ? `Slajd #${idx + 1} (zaklenjeno za spremembe)`
+                            : pillTimerExpired
+                            ? `Slajd #${idx + 1} (čas je potekel)`
+                            : `Pojdi na slajd #${idx + 1}`
+                        }
+                      >
+                        <span>{idx + 1}</span>
+                        {hasAnswered && !isCurrentViewing && (
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                        )}
+                        {(pillHostLocked || pillTimerExpired) && (
+                          <Lock className="w-2.5 h-2.5 text-amber-300 absolute -top-1 -left-1 bg-slate-950 rounded-full p-0.5 border border-amber-500/50" />
+                        )}
+                        {isHostCurrent && !isCurrentViewing && (
+                          <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-ping absolute -top-1 -right-1" />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* ČASOVNIK ZA TRENUTNO OGLEDAN SLAJD */}
+              {viewedTimerInfo.hasTimer && viewedTimerInfo.timeLeftSecs !== null && (
+                <div
+                  className={`p-3 rounded-2xl border flex items-center justify-between shadow-md ${
+                    viewedTimerInfo.isExpired
+                      ? 'bg-rose-500/10 border-rose-500/40'
+                      : 'bg-slate-900/90 border-slate-800'
                   }`}
                 >
-                  {timeLeft}s
-                </span>
-              </div>
-            )}
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+                    <Clock
+                      className={`w-4 h-4 ${
+                        viewedTimerInfo.isExpired
+                          ? 'text-rose-400'
+                          : viewedTimerInfo.timeLeftSecs <= 5
+                          ? 'text-rose-400 animate-bounce'
+                          : 'text-indigo-400'
+                      }`}
+                    />
+                    <span>
+                      {viewedTimerInfo.isExpired ? 'Čas za to vprašanje:' : 'Čas za odgovor:'}
+                    </span>
+                  </div>
+                  <span
+                    className={`font-mono-code font-black text-lg ${
+                      viewedTimerInfo.isExpired
+                        ? 'text-rose-400'
+                        : viewedTimerInfo.timeLeftSecs <= 5
+                        ? 'text-rose-400 animate-pulse'
+                        : viewedTimerInfo.timeLeftSecs <= 10
+                        ? 'text-amber-400'
+                        : 'text-emerald-400'
+                    }`}
+                  >
+                    {viewedTimerInfo.isExpired ? 'Potekel (0s)' : `${viewedTimerInfo.timeLeftSecs}s`}
+                  </span>
+                </div>
+              )}
 
-            {/* VSEBINA VPRAŠANJA (samo če slajd NI info_only ali theme_intro) */}
-            {currentViewingSlide.slide_type !== 'info_only' &&
-              currentViewingSlide.slide_type !== 'theme_intro' && (
+              {/* HITRO OBVESTILO, ČE GOSTITELJEV TRENUTNI SLAJD ODŠTEVA MEDTEM KO IGRALEC GLEDA PRETEKLO VPRAŠANJE */}
+              {hostSlide &&
+                currentViewingSlide.id !== hostSlide.id &&
+                hostTimerInfo.hasTimer &&
+                !hostTimerInfo.isExpired && (
+                  <button
+                    type="button"
+                    onClick={() => handleSelectSlide(hostSlide.id)}
+                    className="w-full px-3.5 py-2.5 rounded-2xl bg-indigo-500/15 hover:bg-indigo-500/20 border border-indigo-500/40 text-indigo-200 text-xs font-bold flex items-center justify-between gap-2 cursor-pointer transition-colors"
+                  >
+                    <span>
+                      ⏱️ Trenutno vprašanje gostitelja odšteva ({hostTimerInfo.timeLeftSecs}s)
+                    </span>
+                    <span className="text-emerald-300 underline shrink-0">Skoči tja →</span>
+                  </button>
+                )}
+
+              {/* VSEBINA VPRAŠANJA (samo če slajd NI info_only ali theme_intro) */}
+              {isQuestionSlide && (
                 <div className="bg-slate-900/85 backdrop-blur-xl border border-slate-800 rounded-3xl p-5 space-y-3 shadow-xl">
                   <div className="flex items-center justify-between flex-wrap gap-2">
                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-xs font-bold font-mono-code">
@@ -1426,434 +1693,465 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                 </div>
               )}
 
-            {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA (ali večdelno / bonus vprašanje) */}
-            {isTimerExpiredOnCurrentHostSlide ? (
-              <div className="p-5 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-center space-y-2">
-                <Lock className="w-6 h-6 text-rose-400 mx-auto" />
-                <p className="text-sm font-bold text-rose-200">Čas za odgovor je potekel!</p>
-                <p className="text-xs text-slate-400">
-                  Oddani odgovor je zaklenjen.
-                </p>
-                <div className="flex justify-center pt-1">
+              {/* OBVESTILI O ZAKLENJENEM VNOSU (ZAKLEP GOSTITELJA ALI IZTEK ČASOVNIKA) */}
+              {isQuestionSlide && isLockedByHost && (
+                <div
+                  role="status"
+                  className="p-3.5 rounded-2xl bg-amber-500/15 border border-amber-500/40 text-amber-200 text-xs font-bold flex items-center justify-between gap-2 shadow-md"
+                >
+                  <span>🔒 Gostitelj je zaklenil spreminjanje odgovora za to vprašanje.</span>
                   {renderAutoSaveBadge(currentViewingSlide, true)}
                 </div>
-              </div>
-            ) : currentViewingSlide.slide_type === 'info_only' ||
-              currentViewingSlide.slide_type === 'theme_intro' ? (
-              <div className="p-6 rounded-3xl bg-slate-900/85 border border-sky-500/30 text-center space-y-2.5 shadow-xl">
-                <div className="w-12 h-12 rounded-2xl bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 mx-auto">
-                  <Info className="w-6 h-6" />
+              )}
+
+              {isQuestionSlide && isTimerExpiredOnViewedSlide && (
+                <div
+                  role="status"
+                  className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-500/40 text-rose-200 text-xs font-bold flex items-center justify-between gap-2 shadow-md"
+                >
+                  <span>⏱️ Čas za to vprašanje je potekel – odgovarjanje ni več mogoče</span>
+                  {!isLockedByHost && renderAutoSaveBadge(currentViewingSlide, true)}
                 </div>
-                <p className="text-base font-black text-slate-100">
-                  Spremljaj glavni zaslon
-                </p>
-                {currentViewingSlide.question_text && (
-                  <p className="text-xs font-semibold text-indigo-300">
-                    {currentViewingSlide.question_text}
+              )}
+
+              {/* VNOS ODGOVORA GLEDE NA TIP SLAJDA (ali večdelno / bonus vprašanje) */}
+              {!isQuestionSlide ? (
+                <div className="p-6 rounded-3xl bg-slate-900/85 border border-sky-500/30 text-center space-y-2.5 shadow-xl">
+                  <div className="w-12 h-12 rounded-2xl bg-sky-500/15 border border-sky-500/30 flex items-center justify-center text-sky-400 mx-auto">
+                    <Info className="w-6 h-6" />
+                  </div>
+                  <p className="text-base font-black text-slate-100">
+                    Spremljaj glavni zaslon
                   </p>
-                )}
-                <p className="text-xs text-slate-400">
-                  Na tem slajdu ni vnosa odgovora. Počakaj, da gostitelj nadaljuje na naslednji slajd.
-                </p>
-              </div>
-            ) : isMultiPartSlide(currentViewingSlide) && currentViewingSlide.question_parts ? (
-              /* VEČDELNO VPRAŠANJE IN/ALI ⭐ BONUS VPRAŠANJE (question_parts) */
-              <div className="space-y-4">
-                <div className="flex items-center justify-between px-1">
-                  <span className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-fuchsia-300">
-                    <Layers className="w-3.5 h-3.5 text-fuchsia-400" />
-                    <span>
-                      {currentViewingSlide.question_parts.some((p) => p.is_bonus)
-                        ? 'Vprašanje + ⭐ Bonus vprašanje'
-                        : `Večdelno vprašanje (${currentViewingSlide.question_parts.length} deli)`}
-                    </span>
-                  </span>
+                  {currentViewingSlide.question_text && (
+                    <p className="text-xs font-semibold text-indigo-300">
+                      {currentViewingSlide.question_text}
+                    </p>
+                  )}
+                  <p className="text-xs text-slate-400">
+                    Na tem slajdu ni vnosa odgovora. Počakaj, da gostitelj nadaljuje na naslednji slajd.
+                  </p>
                 </div>
+              ) : isMultiPartSlide(currentViewingSlide) && currentViewingSlide.question_parts ? (
+                /* VEČDELNO VPRAŠANJE IN/ALI ⭐ BONUS VPRAŠANJE (question_parts) */
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between px-1">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-fuchsia-300">
+                      <Layers className="w-3.5 h-3.5 text-fuchsia-400" />
+                      <span>
+                        {currentViewingSlide.question_parts.some((p) => p.is_bonus)
+                          ? 'Vprašanje + ⭐ Bonus vprašanje'
+                          : `Večdelno vprašanje (${currentViewingSlide.question_parts.length} deli)`}
+                      </span>
+                    </span>
+                  </div>
 
-                {(() => {
-                  const savedValues = parseMultiPartAnswer(myCurrentAnswer?.answer_text).values;
-                  const getPartDraft = (partId: string) => {
-                    const key = `${currentViewingSlide.id}:${partId}`;
-                    return drafts[key] !== undefined ? drafts[key] : savedValues[partId] ?? '';
-                  };
+                  {(() => {
+                    const savedValues = parseMultiPartAnswer(myCurrentAnswer?.answer_text).values;
+                    const getPartDraft = (partId: string) => {
+                      const key = `${currentViewingSlide.id}:${partId}`;
+                      return drafts[key] !== undefined ? drafts[key] : savedValues[partId] ?? '';
+                    };
 
-                  const buildFullMultiPartJson = () => {
-                    const map: Record<string, string> = {};
-                    for (const p of currentViewingSlide.question_parts || []) {
-                      map[p.id] = getPartDraft(p.id).trim();
-                    }
-                    return serializeMultiPartAnswer(map);
-                  };
+                    const buildFullMultiPartJson = () => {
+                      const map: Record<string, string> = {};
+                      for (const p of currentViewingSlide.question_parts || []) {
+                        map[p.id] = getPartDraft(p.id).trim();
+                      }
+                      return serializeMultiPartAnswer(map);
+                    };
 
-                  const canManualSaveMultiPart =
-                    hasAnyMultiPartValue(buildFullMultiPartJson()) ||
-                    hasAnyMultiPartValue(myCurrentAnswer?.answer_text);
+                    const canManualSaveMultiPart =
+                      hasAnyMultiPartValue(buildFullMultiPartJson()) ||
+                      hasAnyMultiPartValue(myCurrentAnswer?.answer_text);
 
-                  return (
-                    <>
-                      {currentViewingSlide.question_parts.map((part, pIdx) => {
-                        const partDraft = getPartDraft(part.id);
-                        const partInputKey = `${currentViewingSlide.id}:${part.id}`;
-                        const partOpts = part.options || ['', '', '', ''];
-                        const isBonusPart = Boolean(part.is_bonus);
+                    return (
+                      <>
+                        {currentViewingSlide.question_parts.map((part, pIdx) => {
+                          const partDraft = getPartDraft(part.id);
+                          const partInputKey = `${currentViewingSlide.id}:${part.id}`;
+                          const partOpts = part.options || ['', '', '', ''];
+                          const isBonusPart = Boolean(part.is_bonus);
 
-                        return (
-                          <div
-                            key={partInputKey}
-                            className={`rounded-3xl p-4 space-y-3 shadow-md transition-all ${
-                              isBonusPart
-                                ? 'bg-gradient-to-b from-amber-500/20 via-slate-900/95 to-slate-950 border-2 border-amber-400/60 shadow-amber-950/40'
-                                : 'bg-slate-900/85 border border-slate-800'
-                            }`}
-                          >
-                            {isBonusPart && (
-                              <div className="flex items-center justify-between gap-2 pb-1 border-b border-amber-500/30">
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500 text-slate-950 text-[10px] font-black uppercase tracking-wider">
-                                  ⭐ BONUS VPRAŠANJE
+                          return (
+                            <div
+                              key={partInputKey}
+                              className={`rounded-3xl p-4 space-y-3 shadow-md transition-all ${
+                                isBonusPart
+                                  ? 'bg-gradient-to-b from-amber-500/20 via-slate-900/95 to-slate-950 border-2 border-amber-400/60 shadow-amber-950/40'
+                                  : 'bg-slate-900/85 border border-slate-800'
+                              }`}
+                            >
+                              {isBonusPart && (
+                                <div className="flex items-center justify-between gap-2 pb-1 border-b border-amber-500/30">
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500 text-slate-950 text-[10px] font-black uppercase tracking-wider">
+                                    ⭐ BONUS VPRAŠANJE
+                                  </span>
+                                  <span className="text-[10px] font-semibold text-amber-200/90">
+                                    Ne podvoji se z Jokerjem
+                                  </span>
+                                </div>
+                              )}
+
+                              <div className="flex items-center justify-between gap-2">
+                                <span
+                                  className={`text-xs font-bold ${
+                                    isBonusPart ? 'text-amber-200 text-sm' : 'text-fuchsia-300'
+                                  }`}
+                                >
+                                  {part.label ||
+                                    (isBonusPart ? 'Bonus vprašanje' : `Del ${pIdx + 1}`)}
                                 </span>
-                                <span className="text-[10px] font-semibold text-amber-200/90">
-                                  Ne podvoji se z Jokerjem
+                                <span
+                                  className={`text-[11px] font-mono-code font-bold shrink-0 ${
+                                    isBonusPart ? 'text-amber-300' : 'text-emerald-400'
+                                  }`}
+                                >
+                                  {isBonusPart
+                                    ? `+${roundPoints(part.points)} ⭐`
+                                    : `${roundPoints(part.points)} t`}
                                 </span>
                               </div>
-                            )}
 
-                            <div className="flex items-center justify-between gap-2">
-                              <span
-                                className={`text-xs font-bold ${
-                                  isBonusPart ? 'text-amber-200 text-sm' : 'text-fuchsia-300'
-                                }`}
-                              >
-                                {part.label ||
-                                  (isBonusPart ? 'Bonus vprašanje' : `Del ${pIdx + 1}`)}
-                              </span>
-                              <span
-                                className={`text-[11px] font-mono-code font-bold shrink-0 ${
-                                  isBonusPart ? 'text-amber-300' : 'text-emerald-400'
-                                }`}
-                              >
-                                {isBonusPart
-                                  ? `+${roundPoints(part.points)} ⭐`
-                                  : `${roundPoints(part.points)} t`}
-                              </span>
-                            </div>
-
-                            {part.type === 'multiple_choice' ? (
-                              <div className="grid grid-cols-2 gap-2.5">
-                                {(
-                                  [
-                                    { key: 'A', idx: 0, bg: 'bg-rose-500', hover: 'hover:bg-rose-400', border: 'border-rose-400' },
-                                    { key: 'B', idx: 1, bg: 'bg-indigo-600', hover: 'hover:bg-indigo-500', border: 'border-indigo-400' },
-                                    { key: 'C', idx: 2, bg: 'bg-amber-500', hover: 'hover:bg-amber-400', border: 'border-amber-400' },
-                                    { key: 'D', idx: 3, bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', border: 'border-emerald-400' },
-                                  ] as const
-                                ).map(({ key, idx, bg, hover, border }) => {
-                                  const isSelected = partDraft.trim().toUpperCase() === key;
-                                  const optText = partOpts[idx];
-                                  return (
-                                    <button
-                                      key={key}
-                                      type="button"
-                                      onClick={() =>
-                                        handleDraftValueChange(
-                                          currentViewingSlide,
-                                          partInputKey,
-                                          key,
-                                          'immediate'
-                                        )
-                                      }
-                                      className={`min-h-[60px] p-3 rounded-2xl flex flex-col justify-between text-left transition-all active:scale-95 cursor-pointer border-2 ${
-                                        isSelected
-                                          ? `${bg} text-white ${border} shadow-lg`
-                                          : `bg-slate-950/90 text-slate-200 border-slate-800 ${hover}`
-                                      }`}
-                                    >
-                                      <div className="flex items-center justify-between w-full">
-                                        <span className="font-mono-code font-black text-base">
-                                          {key}
+                              {part.type === 'multiple_choice' ? (
+                                <div className="grid grid-cols-2 gap-2.5">
+                                  {(
+                                    [
+                                      { key: 'A', idx: 0, bg: 'bg-rose-500', hover: 'hover:bg-rose-400', border: 'border-rose-400' },
+                                      { key: 'B', idx: 1, bg: 'bg-indigo-600', hover: 'hover:bg-indigo-500', border: 'border-indigo-400' },
+                                      { key: 'C', idx: 2, bg: 'bg-amber-500', hover: 'hover:bg-amber-400', border: 'border-amber-400' },
+                                      { key: 'D', idx: 3, bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', border: 'border-emerald-400' },
+                                    ] as const
+                                  ).map(({ key, idx, bg, hover, border }) => {
+                                    const isSelected = partDraft.trim().toUpperCase() === key;
+                                    const optText = partOpts[idx];
+                                    return (
+                                      <button
+                                        key={key}
+                                        type="button"
+                                        disabled={isInputLocked}
+                                        onClick={() =>
+                                          handleDraftValueChange(
+                                            currentViewingSlide,
+                                            partInputKey,
+                                            key,
+                                            'immediate'
+                                          )
+                                        }
+                                        className={`min-h-[60px] p-3 rounded-2xl flex flex-col justify-between text-left transition-all border-2 ${
+                                          isInputLocked
+                                            ? 'opacity-65 cursor-not-allowed'
+                                            : 'active:scale-95 cursor-pointer'
+                                        } ${
+                                          isSelected
+                                            ? `${bg} text-white ${border} shadow-lg`
+                                            : `bg-slate-950/90 text-slate-200 border-slate-800 ${
+                                                isInputLocked ? '' : hover
+                                              }`
+                                        }`}
+                                      >
+                                        <div className="flex items-center justify-between w-full">
+                                          <span className="font-mono-code font-black text-base">
+                                            {key}
+                                          </span>
+                                          {isSelected && <Check className="w-4 h-4 text-white" />}
+                                        </div>
+                                        <span className="text-[11px] font-semibold truncate w-full mt-0.5">
+                                          {optText || `Možnost ${key}`}
                                         </span>
-                                        {isSelected && <Check className="w-4 h-4 text-white" />}
-                                      </div>
-                                      <span className="text-[11px] font-semibold truncate w-full mt-0.5">
-                                        {optText || `Možnost ${key}`}
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            ) : part.type === 'closest_number' ? (
-                              <input
-                                key={partInputKey}
-                                type="number"
-                                step="any"
-                                inputMode="decimal"
-                                value={partDraft}
-                                onChange={(e) =>
-                                  handleDraftValueChange(
-                                    currentViewingSlide,
-                                    partInputKey,
-                                    e.target.value,
-                                    'debounce'
-                                  )
-                                }
-                                placeholder="Vpiši številko..."
-                                className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-violet-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-violet-500"
-                              />
-                            ) : part.type === 'closest_date' ? (
-                              <div className="space-y-1.5">
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              ) : part.type === 'closest_number' ? (
                                 <input
                                   key={partInputKey}
-                                  type="date"
+                                  type="number"
+                                  step="any"
+                                  inputMode="decimal"
+                                  disabled={isInputLocked}
                                   value={partDraft}
-                                  onChange={(e) => {
-                                    const val = e.target.value;
-                                    const isCompleteDate = /^\d{4}-\d{2}-\d{2}$/.test(val);
+                                  onChange={(e) =>
                                     handleDraftValueChange(
                                       currentViewingSlide,
                                       partInputKey,
-                                      val,
-                                      isCompleteDate ? 'immediate' : 'debounce'
-                                    );
-                                  }}
-                                  className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-base text-center focus:outline-none focus:border-cyan-500"
+                                      e.target.value,
+                                      'debounce'
+                                    )
+                                  }
+                                  placeholder="Vpiši številko..."
+                                  className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-violet-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-violet-500 disabled:opacity-60 disabled:cursor-not-allowed"
                                 />
-                                {partDraft && (
-                                  <p className="text-xs font-bold text-cyan-300 text-center">
-                                    📅 Izbrano: {formatSloveneDate(partDraft)}
-                                  </p>
-                                )}
-                              </div>
-                            ) : (
-                              <input
-                                key={partInputKey}
-                                type="text"
-                                value={partDraft}
-                                onChange={(e) =>
-                                  handleDraftValueChange(
-                                    currentViewingSlide,
-                                    partInputKey,
-                                    e.target.value,
-                                    'debounce'
-                                  )
-                                }
-                                placeholder={
-                                  isBonusPart
-                                    ? 'Vpiši odgovor na bonus vprašanje...'
-                                    : 'Vpiši odgovor...'
-                                }
-                                className={`w-full px-3.5 py-3 rounded-2xl bg-slate-950 border text-slate-100 font-semibold text-sm focus:outline-none ${
-                                  isBonusPart
-                                    ? 'border-amber-500/40 focus:border-amber-400'
-                                    : 'border-slate-800 focus:border-emerald-500'
-                                }`}
-                              />
-                            )}
-                          </div>
-                        );
-                      })}
+                              ) : part.type === 'closest_date' ? (
+                                <div className="space-y-1.5">
+                                  <input
+                                    key={partInputKey}
+                                    type="date"
+                                    disabled={isInputLocked}
+                                    value={partDraft}
+                                    onChange={(e) => {
+                                      const val = e.target.value;
+                                      const isCompleteDate = /^\d{4}-\d{2}-\d{2}$/.test(val);
+                                      handleDraftValueChange(
+                                        currentViewingSlide,
+                                        partInputKey,
+                                        val,
+                                        isCompleteDate ? 'immediate' : 'debounce'
+                                      );
+                                    }}
+                                    className="w-full px-3.5 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-base text-center focus:outline-none focus:border-cyan-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                                  />
+                                  {partDraft && (
+                                    <p className="text-xs font-bold text-cyan-300 text-center">
+                                      📅 Izbrano: {formatSloveneDate(partDraft)}
+                                    </p>
+                                  )}
+                                </div>
+                              ) : (
+                                <input
+                                  key={partInputKey}
+                                  type="text"
+                                  disabled={isInputLocked}
+                                  value={partDraft}
+                                  onChange={(e) =>
+                                    handleDraftValueChange(
+                                      currentViewingSlide,
+                                      partInputKey,
+                                      e.target.value,
+                                      'debounce'
+                                    )
+                                  }
+                                  placeholder={
+                                    isBonusPart
+                                      ? 'Vpiši odgovor na bonus vprašanje...'
+                                      : 'Vpiši odgovor...'
+                                  }
+                                  className={`w-full px-3.5 py-3 rounded-2xl bg-slate-950 border text-slate-100 font-semibold text-sm focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed ${
+                                    isBonusPart
+                                      ? 'border-amber-500/40 focus:border-amber-400'
+                                      : 'border-slate-800 focus:border-emerald-500'
+                                  }`}
+                                />
+                              )}
+                            </div>
+                          );
+                        })}
 
-                      <div className="flex flex-wrap items-center justify-between gap-2.5">
-                        <button
-                          type="button"
-                          disabled={!canManualSaveMultiPart}
-                          onClick={() => {
-                            void handleManualSaveSlide(currentViewingSlide);
-                          }}
-                          className="flex-1 min-w-[175px] py-3.5 px-4 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                        >
-                          <Send className="w-4 h-4 shrink-0" />
-                          <span>Shrani vse odgovore</span>
-                        </button>
-                        {renderAutoSaveBadge(currentViewingSlide)}
-                      </div>
-                    </>
-                  );
-                })()}
-              </div>
-            ) : currentViewingSlide.slide_type === 'multiple_choice' ? (
-              /* A / B / C / D Veliki barvni gumbi */
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between gap-2 px-1">
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                    Izberi odgovor (klik takoj shrani):
-                  </span>
-                  {renderAutoSaveBadge(currentViewingSlide, true)}
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  {(
-                    [
-                      { key: 'A', bg: 'bg-rose-500', hover: 'hover:bg-rose-400', border: 'border-rose-400' },
-                      { key: 'B', bg: 'bg-indigo-600', hover: 'hover:bg-indigo-500', border: 'border-indigo-400' },
-                      { key: 'C', bg: 'bg-amber-500', hover: 'hover:bg-amber-400', border: 'border-amber-400' },
-                      { key: 'D', bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', border: 'border-emerald-400' },
-                    ] as const
-                  ).map(({ key, bg, hover, border }) => {
-                    const isSelected = currentDraft.trim().toUpperCase() === key;
-                    const optionText = currentViewingSlide.options[key];
-
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() =>
-                          handleDraftValueChange(
-                            currentViewingSlide,
-                            currentViewingSlide.id,
-                            key,
-                            'immediate'
-                          )
-                        }
-                        className={`min-h-[74px] p-3.5 rounded-2xl flex flex-col justify-between text-left transition-all active:scale-95 cursor-pointer border-2 ${
-                          isSelected
-                            ? `${bg} text-white ${border} shadow-lg ring-4 ring-white/20 scale-102`
-                            : `bg-slate-900/90 text-slate-200 border-slate-800 ${hover}`
-                        }`}
-                      >
-                        <div className="flex items-center justify-between w-full">
-                          <span className="font-mono-code font-black text-lg">
-                            {key}
-                          </span>
-                          {isSelected && <Check className="w-5 h-5 text-white" />}
+                        <div className="flex flex-wrap items-center justify-between gap-2.5">
+                          <button
+                            type="button"
+                            disabled={isInputLocked || !canManualSaveMultiPart}
+                            onClick={() => {
+                              void handleManualSaveSlide(currentViewingSlide);
+                            }}
+                            className="flex-1 min-w-[175px] py-3.5 px-4 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <Send className="w-4 h-4 shrink-0" />
+                            <span>Shrani vse odgovore</span>
+                          </button>
+                          {renderAutoSaveBadge(currentViewingSlide)}
                         </div>
-                        <span className="text-xs font-semibold truncate w-full mt-1">
-                          {optionText || `Možnost ${key}`}
-                        </span>
-                      </button>
+                      </>
                     );
-                  })}
+                  })()}
                 </div>
-              </div>
-            ) : currentViewingSlide.slide_type === 'closest_number' ? (
-              /* Ugani številko (closest_number) */
-              <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
-                <div>
-                  <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                    Vpiši številko (najbližji dobi točke)
-                  </label>
-                  <input
-                    key={currentViewingSlide.id}
-                    id="player-number-answer-input"
-                    type="number"
-                    step="any"
-                    inputMode="decimal"
-                    value={currentDraft}
-                    onChange={(e) =>
-                      handleDraftValueChange(
-                        currentViewingSlide,
-                        currentViewingSlide.id,
-                        e.target.value,
-                        'debounce'
-                      )
-                    }
-                    placeholder="npr. 1999"
-                    className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-violet-400 font-mono-code font-bold text-xl text-center focus:outline-none focus:border-violet-500"
-                  />
-                </div>
+              ) : currentViewingSlide.slide_type === 'multiple_choice' ? (
+                /* A / B / C / D Veliki barvni gumbi */
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 px-1">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      {isInputLocked
+                        ? 'Izbrani odgovor (zaklenjeno):'
+                        : 'Izberi odgovor (klik takoj shrani):'}
+                    </span>
+                    {renderAutoSaveBadge(currentViewingSlide, true)}
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    {(
+                      [
+                        { key: 'A', bg: 'bg-rose-500', hover: 'hover:bg-rose-400', border: 'border-rose-400' },
+                        { key: 'B', bg: 'bg-indigo-600', hover: 'hover:bg-indigo-500', border: 'border-indigo-400' },
+                        { key: 'C', bg: 'bg-amber-500', hover: 'hover:bg-amber-400', border: 'border-amber-400' },
+                        { key: 'D', bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', border: 'border-emerald-400' },
+                      ] as const
+                    ).map(({ key, bg, hover, border }) => {
+                      const isSelected = currentDraft.trim().toUpperCase() === key;
+                      const optionText = currentViewingSlide.options[key];
 
-                <div className="flex flex-wrap items-center justify-between gap-2.5">
-                  <button
-                    type="button"
-                    disabled={!currentDraft.trim() && !myCurrentAnswer?.answer_text}
-                    onClick={() => {
-                      void handleManualSaveSlide(currentViewingSlide);
-                    }}
-                    className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-violet-600 hover:bg-violet-500 text-white font-bold text-sm shadow-lg shadow-violet-600/30 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                  >
-                    <Send className="w-4 h-4 shrink-0" />
-                    <span>Shrani številko</span>
-                  </button>
-                  {renderAutoSaveBadge(currentViewingSlide)}
-                </div>
-              </div>
-            ) : currentViewingSlide.slide_type === 'closest_date' ? (
-              /* Ugani datum (closest_date) */
-              <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
-                <div className="space-y-2">
-                  <label className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-cyan-400">
-                    <Calendar className="w-3.5 h-3.5" />
-                    <span>Izberi datum (najbližji datum zmaga!)</span>
-                  </label>
-                  <input
-                    key={currentViewingSlide.id}
-                    id="player-date-answer-input"
-                    type="date"
-                    value={currentDraft}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      const isCompleteDate = /^\d{4}-\d{2}-\d{2}$/.test(val);
-                      handleDraftValueChange(
-                        currentViewingSlide,
-                        currentViewingSlide.id,
-                        val,
-                        isCompleteDate ? 'immediate' : 'debounce'
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          disabled={isInputLocked}
+                          onClick={() =>
+                            handleDraftValueChange(
+                              currentViewingSlide,
+                              currentViewingSlide.id,
+                              key,
+                              'immediate'
+                            )
+                          }
+                          className={`min-h-[74px] p-3.5 rounded-2xl flex flex-col justify-between text-left transition-all border-2 ${
+                            isInputLocked
+                              ? 'opacity-65 cursor-not-allowed'
+                              : 'active:scale-95 cursor-pointer'
+                          } ${
+                            isSelected
+                              ? `${bg} text-white ${border} shadow-lg ring-4 ring-white/20 scale-102`
+                              : `bg-slate-900/90 text-slate-200 border-slate-800 ${
+                                  isInputLocked ? '' : hover
+                                }`
+                          }`}
+                        >
+                          <div className="flex items-center justify-between w-full">
+                            <span className="font-mono-code font-black text-lg">
+                              {key}
+                            </span>
+                            {isSelected && <Check className="w-5 h-5 text-white" />}
+                          </div>
+                          <span className="text-xs font-semibold truncate w-full mt-1">
+                            {optionText || `Možnost ${key}`}
+                          </span>
+                        </button>
                       );
-                    }}
-                    className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-cyan-500"
-                  />
-                  {currentDraft && (
-                    <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-center">
-                      <span className="text-xs font-bold text-cyan-300">
-                        Izbrano: {formatSloveneDate(currentDraft)}
-                      </span>
-                    </div>
-                  )}
+                    })}
+                  </div>
                 </div>
+              ) : currentViewingSlide.slide_type === 'closest_number' ? (
+                /* Ugani številko (closest_number) */
+                <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
+                  <div>
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+                      Vpiši številko (najbližji dobi točke)
+                    </label>
+                    <input
+                      key={currentViewingSlide.id}
+                      id="player-number-answer-input"
+                      type="number"
+                      step="any"
+                      inputMode="decimal"
+                      disabled={isInputLocked}
+                      value={currentDraft}
+                      onChange={(e) =>
+                        handleDraftValueChange(
+                          currentViewingSlide,
+                          currentViewingSlide.id,
+                          e.target.value,
+                          'debounce'
+                        )
+                      }
+                      placeholder="npr. 1999"
+                      className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-violet-400 font-mono-code font-bold text-xl text-center focus:outline-none focus:border-violet-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    />
+                  </div>
 
-                <div className="flex flex-wrap items-center justify-between gap-2.5">
-                  <button
-                    type="button"
-                    disabled={!currentDraft.trim() && !myCurrentAnswer?.answer_text}
-                    onClick={() => {
-                      void handleManualSaveSlide(currentViewingSlide);
-                    }}
-                    className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                  >
-                    <Send className="w-4 h-4 shrink-0" />
-                    <span>Shrani datum</span>
-                  </button>
-                  {renderAutoSaveBadge(currentViewingSlide)}
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <button
+                      type="button"
+                      disabled={isInputLocked || (!currentDraft.trim() && !myCurrentAnswer?.answer_text)}
+                      onClick={() => {
+                        void handleManualSaveSlide(currentViewingSlide);
+                      }}
+                      className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-violet-600 hover:bg-violet-500 text-white font-bold text-sm shadow-lg shadow-violet-600/30 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Send className="w-4 h-4 shrink-0" />
+                      <span>Shrani številko</span>
+                    </button>
+                    {renderAutoSaveBadge(currentViewingSlide)}
+                  </div>
                 </div>
-              </div>
-            ) : (
-              /* Odprto besedilo (open_text) */
-              <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
-                <div>
-                  <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                    Tvoj besedilni odgovor
-                  </label>
-                  <textarea
-                    key={currentViewingSlide.id}
-                    id="player-text-answer-input"
-                    rows={2}
-                    value={currentDraft}
-                    onChange={(e) =>
-                      handleDraftValueChange(
-                        currentViewingSlide,
-                        currentViewingSlide.id,
-                        e.target.value,
-                        'debounce'
-                      )
-                    }
-                    placeholder="Vpiši svoj odgovor tukaj..."
-                    className="w-full px-4 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-slate-100 font-semibold text-sm focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
+              ) : currentViewingSlide.slide_type === 'closest_date' ? (
+                /* Ugani datum (closest_date) */
+                <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-cyan-400">
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>Izberi datum (najbližji datum zmaga!)</span>
+                    </label>
+                    <input
+                      key={currentViewingSlide.id}
+                      id="player-date-answer-input"
+                      type="date"
+                      disabled={isInputLocked}
+                      value={currentDraft}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const isCompleteDate = /^\d{4}-\d{2}-\d{2}$/.test(val);
+                        handleDraftValueChange(
+                          currentViewingSlide,
+                          currentViewingSlide.id,
+                          val,
+                          isCompleteDate ? 'immediate' : 'debounce'
+                        );
+                      }}
+                      className="w-full px-4 py-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-cyan-300 font-mono-code font-bold text-lg text-center focus:outline-none focus:border-cyan-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    />
+                    {currentDraft && (
+                      <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-center">
+                        <span className="text-xs font-bold text-cyan-300">
+                          Izbrano: {formatSloveneDate(currentDraft)}
+                        </span>
+                      </div>
+                    )}
+                  </div>
 
-                <div className="flex flex-wrap items-center justify-between gap-2.5">
-                  <button
-                    type="button"
-                    disabled={!currentDraft.trim() && !myCurrentAnswer?.answer_text}
-                    onClick={() => {
-                      void handleManualSaveSlide(currentViewingSlide);
-                    }}
-                    className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                  >
-                    <Send className="w-4 h-4 shrink-0" />
-                    <span>Shrani odgovor</span>
-                  </button>
-                  {renderAutoSaveBadge(currentViewingSlide)}
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <button
+                      type="button"
+                      disabled={isInputLocked || (!currentDraft.trim() && !myCurrentAnswer?.answer_text)}
+                      onClick={() => {
+                        void handleManualSaveSlide(currentViewingSlide);
+                      }}
+                      className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm shadow-lg shadow-cyan-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Send className="w-4 h-4 shrink-0" />
+                      <span>Shrani datum</span>
+                    </button>
+                    {renderAutoSaveBadge(currentViewingSlide)}
+                  </div>
                 </div>
-              </div>
-            )}
+              ) : (
+                /* Odprto besedilo (open_text) */
+                <div className="bg-slate-900/85 border border-slate-800 rounded-3xl p-5 space-y-4">
+                  <div>
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+                      Tvoj besedilni odgovor
+                    </label>
+                    <textarea
+                      key={currentViewingSlide.id}
+                      id="player-text-answer-input"
+                      rows={2}
+                      disabled={isInputLocked}
+                      value={currentDraft}
+                      onChange={(e) =>
+                        handleDraftValueChange(
+                          currentViewingSlide,
+                          currentViewingSlide.id,
+                          e.target.value,
+                          'debounce'
+                        )
+                      }
+                      placeholder="Vpiši svoj odgovor tukaj..."
+                      className="w-full px-4 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-slate-100 font-semibold text-sm focus:outline-none focus:border-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <button
+                      type="button"
+                      disabled={isInputLocked || (!currentDraft.trim() && !myCurrentAnswer?.answer_text)}
+                      onClick={() => {
+                        void handleManualSaveSlide(currentViewingSlide);
+                      }}
+                      className="flex-1 min-w-[165px] py-3.5 px-4 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Send className="w-4 h-4 shrink-0" />
+                      <span>Shrani odgovor</span>
+                    </button>
+                    {renderAutoSaveBadge(currentViewingSlide)}
+                  </div>
+                </div>
+              )}
 
             {/* Obvestilo o shranjenem odgovoru */}
             {saveSuccessNotice && (
@@ -1913,8 +2211,9 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
                 )}
               </div>
             )}
-          </div>
-        )}
+            </div>
+          );
+        })()}
 
         {/* ===================================================================
             D. STANJE: GRADING_THEME (Ocenjevanje gostitelja)

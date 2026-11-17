@@ -26,6 +26,7 @@ import {
 import {
   addDemoPlayer,
   fetchPresentationData,
+  normalizeGameSession,
   subscribeToDemoUpdates,
 } from '../lib/quizService';
 import { appendSupabaseConfigToUrl, getSupabaseClient } from '../lib/supabase';
@@ -107,19 +108,23 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${sessionId}` },
           (payload) => {
             if (payload && payload.new && typeof payload.new === 'object') {
-              const updatedSession = payload.new as PresentationData['session'];
+              const updatedSession = payload.new as Partial<PresentationData['session']>;
               setData((prev) => {
                 if (!prev) return prev;
+                const mergedSession = normalizeGameSession({
+                  ...prev.session,
+                  ...updatedSession,
+                });
                 const nextTheme =
-                  prev.themes.find((t) => t.id === updatedSession.current_theme_id) ||
+                  prev.themes.find((t) => t.id === mergedSession.current_theme_id) ||
                   prev.currentTheme;
                 const nextThemeSlides = nextTheme ? prev.slidesByTheme[nextTheme.id] || [] : [];
                 const nextSlide =
-                  nextThemeSlides.find((s) => s.id === updatedSession.current_slide_id) ||
+                  nextThemeSlides.find((s) => s.id === mergedSession.current_slide_id) ||
                   prev.currentSlide;
                 return {
                   ...prev,
-                  session: { ...prev.session, ...updatedSession },
+                  session: mergedSession,
                   currentTheme: nextTheme,
                   currentSlide: nextSlide,
                 };
@@ -195,16 +200,41 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     };
   }, [sessionId]);
 
+  const activeSlideTimerEntry = useMemo(() => {
+    const slide = data?.currentSlide;
+    const sess = data?.session;
+    if (
+      !slide ||
+      !sess ||
+      slide.slide_type === 'info_only' ||
+      slide.slide_type === 'theme_intro'
+    ) {
+      return null;
+    }
+    const perSlide = sess.slide_timers?.[slide.id];
+    if (perSlide && perSlide.started_at && Number(perSlide.duration) > 0) {
+      return { startedAt: perSlide.started_at, duration: Number(perSlide.duration) };
+    }
+    if (sess.timer_started_at && Number(sess.timer_duration) > 0) {
+      return { startedAt: sess.timer_started_at, duration: Number(sess.timer_duration) };
+    }
+    return null;
+  }, [
+    data?.currentSlide,
+    data?.session?.slide_timers,
+    data?.session?.timer_started_at,
+    data?.session?.timer_duration,
+  ]);
+
   // Odštevalnik časa (Timer loop)
   useEffect(() => {
-    const session = data?.session;
-    if (!session || !session.timer_started_at || !session.timer_duration || session.timer_duration <= 0) {
+    if (!activeSlideTimerEntry) {
       setTimeLeft(null);
       return;
     }
 
-    const startTime = new Date(session.timer_started_at).getTime();
-    const durationMs = session.timer_duration * 1000;
+    const startTime = new Date(activeSlideTimerEntry.startedAt).getTime();
+    const durationMs = activeSlideTimerEntry.duration * 1000;
     const endTime = startTime + durationMs;
 
     const interval = setInterval(() => {
@@ -222,7 +252,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     setTimeLeft(initialRemaining);
 
     return () => clearInterval(interval);
-  }, [data?.session?.timer_started_at, data?.session?.timer_duration]);
+  }, [activeSlideTimerEntry?.startedAt, activeSlideTimerEntry?.duration]);
 
   // Konfeti ob preklopu na lestvico ali konec kviza
   useEffect(() => {
@@ -686,7 +716,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         {session.status === 'active_theme' && currentSlide && (
           <div className="w-full h-full flex-1 flex flex-col items-center justify-center relative animate-fadeIn">
             {/* Animiran odštevalnik časa (Timer) */}
-            {session.timer_duration && session.timer_duration > 0 && timeLeft !== null && (
+            {activeSlideTimerEntry && timeLeft !== null && (
               <div className="absolute top-2 right-2 sm:top-4 sm:right-4 z-30 flex items-center gap-2.5 px-4 py-2 rounded-2xl bg-slate-900/90 backdrop-blur-xl border border-slate-800 shadow-2xl">
                 <Clock
                   className={`w-5 h-5 ${
@@ -717,7 +747,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                       style={{
                         width: `${Math.min(
                           100,
-                          Math.max(0, (timeLeft / (session.timer_duration || 1)) * 100)
+                          Math.max(0, (timeLeft / (activeSlideTimerEntry.duration || 1)) * 100)
                         )}%`,
                       }}
                     />
