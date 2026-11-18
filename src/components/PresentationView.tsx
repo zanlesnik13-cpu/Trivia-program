@@ -43,7 +43,6 @@ interface TransitionSlideLayer {
   themeTitle: string;
   status: 'theme_intro' | 'active_theme';
   phase: 'entering' | 'active' | 'exiting' | 'staging';
-  direction: 1 | -1;
 }
 
 const DEMO_NICKNAMES = [
@@ -666,16 +665,6 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
       return;
     }
 
-    // Določi smer animacije glede na globalni vrstni red slajdov
-    let direction: 1 | -1 = 1;
-    if (foreground) {
-      const prevIdx = allOrderedSlides.findIndex((s) => s.id === foreground.slide.id);
-      const nextIdx = allOrderedSlides.findIndex((s) => s.id === targetSlide.id);
-      if (prevIdx >= 0 && nextIdx >= 0 && nextIdx < prevIdx) {
-        direction = -1;
-      }
-    }
-
     layerSeqRef.current += 1;
     const nextKey = `${targetSlide.id}-${layerSeqRef.current}`;
     const imageUrl = targetSlide.slide_image_url;
@@ -692,7 +681,6 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         themeTitle: targetThemeTitle,
         status: targetSlideStatus,
         phase: 'entering',
-        direction,
       });
       slideLayersRef.current = next;
       setSlideLayers(next);
@@ -707,7 +695,6 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
       themeTitle: targetThemeTitle,
       status: targetSlideStatus,
       phase: 'staging',
-      direction,
     };
     const next = [...nextWithoutOldStaging, stagingLayer];
     slideLayersRef.current = next;
@@ -722,12 +709,11 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     targetSlideStatus,
     data?.currentSlide,
     data?.currentTheme?.title,
-    allOrderedSlides,
     preloadImage,
     promoteStagingLayer,
   ]);
 
-  // Odstrani izstopajoče plasti po zaključku 400ms prehoda in ustali novo plast
+  // Odstrani izstopajoče plasti po zaključku 800ms prehoda in ustali novo plast
   const hasTransientSlidePhase = slideLayers.some(
     (l) => l.phase === 'exiting' || l.phase === 'entering'
   );
@@ -741,7 +727,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         slideLayersRef.current = next;
         return next;
       });
-    }, 440);
+    }, 840);
     return () => clearTimeout(timer);
   }, [hasTransientSlidePhase, slideLayers]);
 
@@ -828,7 +814,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     <div
       ref={containerRef}
       className={`${
-        isImageSlideCanvas || isFullscreen ? 'h-screen' : 'min-h-screen'
+        targetSlideStatus || isFullscreen ? 'h-screen' : 'min-h-screen'
       } w-full ${
         isFullscreen ? 'bg-black' : 'bg-slate-950'
       } text-slate-100 flex flex-col select-none relative overflow-hidden ${
@@ -948,6 +934,8 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             ? `relative z-10 flex-1 min-h-0 w-full flex flex-col items-center justify-center overflow-hidden ${
                 isFullscreen ? 'p-0' : 'p-1 sm:p-1.5'
               }`
+            : targetSlideStatus
+            ? 'relative z-10 flex-1 min-h-0 w-full flex flex-col items-center overflow-hidden p-2 sm:p-4'
             : 'relative z-10 flex-1 min-h-0 w-full flex flex-col items-center overflow-y-auto p-2 sm:p-4'
         }
       >
@@ -1143,7 +1131,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
         {/* ===================================================================
             3. STANJE: ENOTEN ODER ZA SLAJDE (THEME_INTRO s sliko & ACTIVE_THEME)
-               Tekoč 400ms GPU crossfade + onLoad zaščita pred utripanjem
+               Tekoč 800ms kinematografski preliv (Crossfade + Gentle Scale) + onLoad zaščita
             =================================================================== */}
         {targetSlideStatus && (
           <div
@@ -1151,9 +1139,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             className={
               isFullscreen
                 ? 'fixed inset-0 w-screen h-screen bg-black overflow-hidden z-10 animate-screenFadeIn'
-                : isImageSlideCanvas
-                ? 'relative w-full h-full flex-1 min-h-0 flex items-center justify-center overflow-hidden animate-screenFadeIn'
-                : 'relative w-full flex-1 min-h-0 flex flex-col items-center animate-screenFadeIn'
+                : 'relative w-full h-full flex-1 min-h-0 overflow-hidden animate-screenFadeIn'
             }
           >
             {/* Animiran odštevalnik časa (Timer) za trenutni slajd */}
@@ -1205,28 +1191,26 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               </div>
             )}
 
-            {/* Plasti slajdov: izstopajoči slajd zbledi v ozadju, novi priplava po onLoad/decode */}
+            {/* Plasti slajdov: oba slajda (odhajajoči in prihajajoči) absolutno drug čez drugega */}
             {slideLayers.map((layer) => {
               const isStaging = layer.phase === 'staging';
               const isExiting = layer.phase === 'exiting';
               const isEntering = layer.phase === 'entering';
               const hasImg = Boolean(layer.slide.slide_image_url);
-              const enterAnim =
-                layer.direction >= 0 ? 'animate-slideEnterForward' : 'animate-slideEnterBackward';
 
               const layerClassName = isStaging
-                ? 'absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden opacity-0 pointer-events-none z-0 transform-gpu will-change-transform'
+                ? 'absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden opacity-0 pointer-events-none z-0 transform-gpu will-change-[opacity,transform]'
                 : isExiting
-                ? `absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden pointer-events-none z-10 transform-gpu will-change-transform animate-slideExit ${
-                    !hasImg ? 'p-4 sm:p-8' : ''
+                ? `absolute inset-0 w-full h-full pointer-events-none z-10 transform-gpu will-change-[opacity,transform] animate-slideExit ${
+                    hasImg
+                      ? 'flex items-center justify-center overflow-hidden'
+                      : 'flex flex-col items-center overflow-hidden py-12 px-4 sm:px-8'
                   }`
-                : isFullscreen || hasImg
-                ? `relative w-full h-full flex items-center justify-center overflow-hidden z-20 transform-gpu will-change-transform ${
-                    !hasImg ? 'overflow-y-auto p-4 sm:p-8' : ''
-                  } ${isEntering ? enterAnim : ''}`
-                : `relative w-full flex-1 min-h-0 flex flex-col items-center overflow-y-auto py-12 z-20 transform-gpu will-change-transform ${
-                    isEntering ? enterAnim : ''
-                  }`;
+                : `absolute inset-0 w-full h-full z-20 transform-gpu will-change-[opacity,transform] ${
+                    hasImg
+                      ? 'flex items-center justify-center overflow-hidden'
+                      : 'flex flex-col items-center overflow-y-auto py-12 px-4 sm:px-8'
+                  } ${isEntering ? 'animate-slideEnter' : ''}`;
 
               return (
                 <div key={layer.key} className={layerClassName} aria-hidden={isStaging || isExiting}>
@@ -1257,11 +1241,11 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                           promoteStagingLayer(layer.key, layer.slide.slide_image_url || '');
                         }
                       }}
-                      className="w-full h-full object-contain select-none transform-gpu will-change-transform"
+                      className="w-full h-full object-contain select-none transform-gpu will-change-[opacity,transform]"
                     />
                   ) : (
                     /* Tekstovna kartica, če slika ni naložena */
-                    <div className="w-full max-w-6xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center my-auto transform-gpu will-change-transform">
+                    <div className="w-full max-w-6xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center my-auto transform-gpu will-change-[opacity,transform]">
                       {layer.slide.slide_type === 'info_only' ? (
                         <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-xs font-semibold">
                           <Sparkles className="w-3.5 h-3.5 text-sky-400" />

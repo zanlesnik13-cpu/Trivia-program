@@ -69,21 +69,10 @@
   }
 }
 
-@keyframes slideEnterForward {
+@keyframes slideEnter {
   from {
     opacity: 0;
-    transform: translate3d(18px, 0, 0) scale(1.02);
-  }
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-}
-
-@keyframes slideEnterBackward {
-  from {
-    opacity: 0;
-    transform: translate3d(-18px, 0, 0) scale(1.02);
+    transform: translate3d(0, 0, 0) scale(1.015);
   }
   to {
     opacity: 1;
@@ -92,43 +81,42 @@
 }
 
 @keyframes slideExit {
-  from {
+  0% {
     opacity: 1;
     transform: translate3d(0, 0, 0) scale(1);
   }
-  to {
+  30% {
+    opacity: 0.92;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
     opacity: 0;
-    transform: translate3d(0, 0, 0) scale(0.98);
+    transform: translate3d(0, 0, 0) scale(1);
   }
 }
 
 .animate-fadeIn {
   animation: fadeIn 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: transform, opacity;
+  will-change: opacity, transform;
 }
 
 .animate-scaleIn {
   animation: scaleIn 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: transform, opacity;
+  will-change: opacity, transform;
 }
 
 .animate-screenFadeIn {
-  animation: screenFadeIn 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: transform, opacity;
+  animation: screenFadeIn 300ms cubic-bezier(0.25, 0.1, 0.25, 1) both;
+  will-change: opacity, transform;
 }
 
-.animate-slideEnterForward {
-  animation: slideEnterForward 400ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: transform, opacity;
-}
-
-.animate-slideEnterBackward {
-  animation: slideEnterBackward 400ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: transform, opacity;
+.animate-slideEnter {
+  animation: slideEnter 800ms cubic-bezier(0.25, 0.1, 0.25, 1) both;
+  will-change: opacity, transform;
 }
 
 .animate-slideExit {
-  animation: slideExit 400ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  will-change: transform, opacity;
+  animation: slideExit 800ms cubic-bezier(0.25, 0.1, 0.25, 1) both;
+  will-change: opacity, transform;
 }
 
