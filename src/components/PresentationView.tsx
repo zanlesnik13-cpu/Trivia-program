@@ -87,17 +87,24 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const confettiFiredRef = useRef<string | null>(null);
   const fsMouseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadSeqRef = useRef(0);
+  const latestTargetLayerKeyRef = useRef<string | null>(null);
 
-  // Nalaganje podatkov o seji
+  // Nalaganje podatkov o seji (z zaščito pred zapoznelimi odgovori pri hitrem klikanju)
   const loadData = async () => {
+    const reqSeq = ++loadSeqRef.current;
     try {
       const presData = await fetchPresentationData(sessionId);
+      if (reqSeq !== loadSeqRef.current) return;
       setData(presData);
       setError(null);
     } catch (err: unknown) {
+      if (reqSeq !== loadSeqRef.current) return;
       setError(err instanceof Error ? err.message : 'Napaka pri nalaganju seje.');
     } finally {
-      setLoading(false);
+      if (reqSeq === loadSeqRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -127,6 +134,8 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${sessionId}` },
           (payload) => {
             if (payload && payload.new && typeof payload.new === 'object') {
+              // Razveljavi morebitne starejše poizvedbe v teku, da ne povozijo svežega Realtime stanja
+              loadSeqRef.current += 1;
               const updatedSession = payload.new as Partial<PresentationData['session']>;
               setData((prev) => {
                 if (!prev) return prev;
@@ -468,23 +477,24 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   }, [themesList, slidesByThemeMap]);
 
   // Prednalaganje in dekodiranje posamezne slike slajda v pomnilnik brskalnika
-  const preloadImage = useCallback((url: string): Promise<void> => {
-    if (!url) return Promise.resolve();
-    if (decodedImageUrlsRef.current.has(url)) return Promise.resolve();
-    const existingPromise = preloadPromisesRef.current.get(url);
+  const preloadImage = useCallback((url?: string | null): Promise<void> => {
+    const cleanUrl = url?.trim();
+    if (!cleanUrl) return Promise.resolve();
+    if (decodedImageUrlsRef.current.has(cleanUrl)) return Promise.resolve();
+    const existingPromise = preloadPromisesRef.current.get(cleanUrl);
     if (existingPromise) return existingPromise;
 
     const promise = new Promise<void>((resolve) => {
       const img = new Image();
       img.decoding = 'async';
-      preloadedImagesRef.current.set(url, img);
+      preloadedImagesRef.current.set(cleanUrl, img);
 
       let settled = false;
       const finish = (markDecoded: boolean) => {
         if (settled) return;
         settled = true;
         if (markDecoded) {
-          decodedImageUrlsRef.current.add(url);
+          decodedImageUrlsRef.current.add(cleanUrl);
         }
         resolve();
       };
@@ -502,18 +512,18 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
       img.onload = decodeAndFinish;
       img.onerror = () => {
-        preloadPromisesRef.current.delete(url);
+        preloadPromisesRef.current.delete(cleanUrl);
         finish(false);
       };
 
-      img.src = url;
+      img.src = cleanUrl;
 
       if (img.complete && img.naturalWidth > 0) {
         decodeAndFinish();
       }
     });
 
-    preloadPromisesRef.current.set(url, promise);
+    preloadPromisesRef.current.set(cleanUrl, promise);
     return promise;
   }, []);
 
@@ -532,7 +542,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     const seenUrls = new Set<string>();
     const pushUrl = (idx: number, targetList: string[]) => {
       const slide = allOrderedSlides[idx];
-      const url = slide?.slide_image_url;
+      const url = slide?.slide_image_url?.trim();
       if (url && !seenUrls.has(url)) {
         seenUrls.add(url);
         targetList.push(url);
@@ -584,6 +594,9 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
   const promoteStagingLayer = useCallback((stagingKey: string, imageUrl?: string) => {
     if (promotedStagingKeysRef.current.has(stagingKey)) return;
+    if (latestTargetLayerKeyRef.current && latestTargetLayerKeyRef.current !== stagingKey) {
+      return;
+    }
     const prev = slideLayersRef.current;
     const stagingLayer = prev.find((l) => l.key === stagingKey && l.phase === 'staging');
     if (!stagingLayer) return;
@@ -610,6 +623,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     const targetThemeTitle = data?.currentTheme?.title ?? '';
 
     if (!targetSlideStatus || !targetSlide) {
+      latestTargetLayerKeyRef.current = null;
       if (slideLayersRef.current.length > 0) {
         slideLayersRef.current = [];
         setSlideLayers([]);
@@ -634,6 +648,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
       staging.slide.id === targetSlide.id &&
       staging.slide.slide_image_url === targetSlide.slide_image_url
     ) {
+      latestTargetLayerKeyRef.current = staging.key;
       if (hasMetadataChanged(staging)) {
         const next = prev.map((l) =>
           l.key === staging.key
@@ -646,15 +661,17 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
       return;
     }
 
-    // Če je ciljni slajd že v ospredju, posodobi le metapodatke brez vnovičnega zagona animacije
+    // Če je ciljni slajd že v ospredju (tudi če je bil vmes drug slajd v stagingu in se je gostitelj hitro vrnil nazaj),
+    // prekliči zastareli staging sloj in ohrani trenutni slajd v ospredju brez ponovnega zagona animacije
     if (
-      !staging &&
       foreground &&
       foreground.slide.id === targetSlide.id &&
       foreground.slide.slide_image_url === targetSlide.slide_image_url
     ) {
-      if (hasMetadataChanged(foreground)) {
-        const next = prev.map((l) =>
+      latestTargetLayerKeyRef.current = foreground.key;
+      const baseLayers = staging ? prev.filter((l) => l.phase !== 'staging') : prev;
+      if (staging || hasMetadataChanged(foreground)) {
+        const next = baseLayers.map((l) =>
           l.key === foreground.key
             ? { ...l, slide: targetSlide, status: targetSlideStatus, themeTitle: targetThemeTitle }
             : l
@@ -667,7 +684,8 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
     layerSeqRef.current += 1;
     const nextKey = `${targetSlide.id}-${layerSeqRef.current}`;
-    const imageUrl = targetSlide.slide_image_url;
+    latestTargetLayerKeyRef.current = nextKey;
+    const imageUrl = targetSlide.slide_image_url?.trim() || undefined;
     const isImageReady = !imageUrl || decodedImageUrlsRef.current.has(imageUrl);
 
     if (isImageReady) {
@@ -714,11 +732,12 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   ]);
 
   // Odstrani izstopajoče plasti po zaključku 800ms prehoda in ustali novo plast
-  const hasTransientSlidePhase = slideLayers.some(
-    (l) => l.phase === 'exiting' || l.phase === 'entering'
-  );
+  const transientPhaseSignature = slideLayers
+    .filter((l) => l.phase === 'exiting' || l.phase === 'entering')
+    .map((l) => `${l.key}:${l.phase}`)
+    .join('|');
   useEffect(() => {
-    if (!hasTransientSlidePhase) return;
+    if (!transientPhaseSignature) return;
     const timer = setTimeout(() => {
       setSlideLayers((prev) => {
         const next = prev
@@ -729,7 +748,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
       });
     }, 840);
     return () => clearTimeout(timer);
-  }, [hasTransientSlidePhase, slideLayers]);
+  }, [transientPhaseSignature]);
 
   // Dodajanje demo igralca za takojšnje testiranje čakalnice
   const handleAddTestPlayer = async () => {
@@ -1147,10 +1166,10 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               <div
                 className={
                   isFullscreen
-                    ? `fixed right-3 z-40 transition-all duration-200 flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-black/70 backdrop-blur-md border border-white/15 shadow-2xl ${
+                    ? `fixed right-3 z-40 pointer-events-none transition-all duration-200 flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-black/70 backdrop-blur-md border border-white/15 shadow-2xl ${
                         showFsExitBtn ? 'top-14' : 'top-3'
                       }`
-                    : 'absolute top-2 right-2 z-30 flex items-center gap-2.5 px-3.5 py-2 rounded-2xl bg-slate-900/85 backdrop-blur-xl border border-slate-800 shadow-2xl'
+                    : 'absolute top-2 right-2 z-30 pointer-events-none flex items-center gap-2.5 px-3.5 py-2 rounded-2xl bg-slate-900/85 backdrop-blur-xl border border-slate-800 shadow-2xl'
                 }
               >
                 <Clock
@@ -1357,7 +1376,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             {/* Lebdeča polprosojna značka za status Jokerja pri slikovnem theme_intro slajdu */}
             {effectiveStageStatus === 'theme_intro' && currentTheme && displayedForegroundLayer && (
               isFullscreen ? (
-                <div className="fixed bottom-2 left-2 z-30 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md border border-amber-500/35 text-[11px] text-amber-200/95 shadow-lg">
+                <div className="fixed bottom-2 left-2 z-30 pointer-events-none inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md border border-amber-500/35 text-[11px] text-amber-200/95 shadow-lg">
                   <span>🃏</span>
                   <span className="font-bold text-amber-300">Joker:</span>
                   <span className="font-mono-code font-bold text-slate-100">
@@ -1374,7 +1393,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                   )}
                 </div>
               ) : (
-                <div className="absolute bottom-2 left-2 z-30 max-w-[calc(100%-1rem)] sm:max-w-2xl inline-flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-amber-500/45 shadow-xl text-xs">
+                <div className="absolute bottom-2 left-2 z-30 pointer-events-none max-w-[calc(100%-1rem)] sm:max-w-2xl inline-flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-amber-500/45 shadow-xl text-xs">
                   <span className="text-base leading-none">🃏</span>
                   <span className="font-bold text-amber-300">
                     Aktivacija JOKERJA (2x točke)
@@ -1408,8 +1427,8 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                 <div
                   className={
                     isFullscreen
-                      ? 'fixed bottom-2 left-2 z-30 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md border border-white/10 text-[11px] font-medium text-slate-300/90 shadow-lg'
-                      : 'absolute bottom-2 left-2 z-30 flex items-center gap-2 px-3 py-1 rounded-xl bg-slate-900/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold shadow-xl'
+                      ? 'fixed bottom-2 left-2 z-30 pointer-events-none flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md border border-white/10 text-[11px] font-medium text-slate-300/90 shadow-lg'
+                      : 'absolute bottom-2 left-2 z-30 pointer-events-none flex items-center gap-2 px-3 py-1 rounded-xl bg-slate-900/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold shadow-xl'
                   }
                 >
                   <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />

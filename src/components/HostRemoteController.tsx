@@ -164,11 +164,13 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
   const dataRef = useRef<PresentationData | null>(null);
   const inFlightGradeCountRef = useRef<Record<string, number>>({});
   const lastGradeTimestampRef = useRef<Record<string, number>>({});
+  const loadSeqRef = useRef(0);
 
   // Beležimo, za katero temo smo že sprožili avtomatsko pred-ocenjevanje v tem pogledu
   const preGradedThemeRef = useRef<string | null>(null);
 
   const loadData = async () => {
+    const reqId = ++loadSeqRef.current;
     const fetchStartedAt = Date.now();
     try {
       const supabase = getSupabaseClient();
@@ -193,6 +195,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       }
 
       const presData = await fetchPresentationData(sessionId);
+      if (reqId !== loadSeqRef.current) return;
       setData((prev) => {
         const answerMap = new Map<string, Answer>();
         for (const srvAns of presData.answers) {
@@ -218,7 +221,9 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
       });
       setError(null);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Napaka pri nalaganju seje iz Supabase.');
+      if (reqId === loadSeqRef.current) {
+        setError(err instanceof Error ? err.message : 'Napaka pri nalaganju seje iz Supabase.');
+      }
     } finally {
       setLoading(false);
     }
@@ -250,6 +255,7 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${sessionId}` },
           (payload) => {
             if (payload && payload.new && typeof payload.new === 'object') {
+              loadSeqRef.current += 1;
               const updatedSession = payload.new as Partial<PresentationData['session']>;
               setData((prev) => {
                 if (!prev) return prev;
@@ -570,6 +576,24 @@ export const HostRemoteController: React.FC<HostRemoteControllerProps> = ({
     try {
       const maxIndex = Math.max(data.session.max_slide_index_reached, targetIndex);
       const timerPatch = buildSlideTimerPatch(targetSlide, data.session.slide_timers);
+      loadSeqRef.current += 1;
+      setData((prev) => {
+        if (!prev) return prev;
+        const nextSession = normalizeGameSession({
+          ...prev.session,
+          status: nextStatus,
+          current_slide_id: targetSlide.id,
+          max_slide_index_reached: maxIndex,
+          ...timerPatch,
+        });
+        const next = {
+          ...prev,
+          session: nextSession,
+          currentSlide: targetSlide,
+        };
+        dataRef.current = next;
+        return next;
+      });
       await updateGameSession(sessionId, {
         status: nextStatus,
         current_slide_id: targetSlide.id,

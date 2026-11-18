@@ -635,6 +635,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   }, [initialRoomCode]);
 
   const [refreshing, setRefreshing] = useState(false);
+  const refreshSeqRef = useRef(0);
 
   // Shrani čakajoče osnutke za slajde, ki jih je gostitelj pravkar zaklenil
   const flushNewlyLockedSlides = (lockedIdsRaw: unknown) => {
@@ -675,9 +676,11 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
   // 2. Osveževanje podatkov o igralcu (brez prepisovanja aktivnega tipkanja!)
   const refreshPlayerData = async () => {
     if (!activeSessionId || !activePlayerId) return;
+    const reqId = ++refreshSeqRef.current;
     const fetchStartedAt = Date.now();
     try {
       const full = await fetchPlayerGameData(activeSessionId, activePlayerId);
+      if (reqId !== refreshSeqRef.current) return;
 
       // Če je gostitelj zaklenil katerega od slajdov ali mu je potekel čas, najprej shrani morebiten neshranjen osnutek
       flushNewlyLockedSlides(full.session.locked_slide_ids);
@@ -792,6 +795,7 @@ export const PlayerView: React.FC<PlayerViewProps> = ({
           { event: '*', schema: 'public', table: 'game_sessions', filter: `id=eq.${activeSessionId}` },
           (payload) => {
             if (payload.new && typeof payload.new === 'object') {
+              refreshSeqRef.current += 1;
               const updatedSession = payload.new as Partial<PlayerFullData['session']>;
               const hostSlideOrThemeChanged = Boolean(
                 updatedSession.current_slide_id &&
