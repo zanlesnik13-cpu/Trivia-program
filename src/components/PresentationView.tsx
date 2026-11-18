@@ -30,11 +30,20 @@ import {
   subscribeToDemoUpdates,
 } from '../lib/quizService';
 import { appendSupabaseConfigToUrl, getSupabaseClient, getSynchronizedNowMs } from '../lib/supabase';
-import type { PresentationData } from '../types/quiz';
+import type { PresentationData, Slide } from '../types/quiz';
 
 interface PresentationViewProps {
   sessionId: string;
   onExit?: () => void;
+}
+
+interface TransitionSlideLayer {
+  key: string;
+  slide: Slide;
+  themeTitle: string;
+  status: 'theme_intro' | 'active_theme';
+  phase: 'entering' | 'active' | 'exiting' | 'staging';
+  direction: 1 | -1;
 }
 
 const DEMO_NICKNAMES = [
@@ -66,6 +75,15 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
   // Časovnik v živo
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
+
+  // Stanje in predpomnilnik za gladke prehode ter prednalaganje slik slajdov
+  const [slideLayers, setSlideLayers] = useState<TransitionSlideLayer[]>([]);
+  const slideLayersRef = useRef<TransitionSlideLayer[]>([]);
+  const layerSeqRef = useRef(0);
+  const promotedStagingKeysRef = useRef<Set<string>>(new Set());
+  const preloadedImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const preloadPromisesRef = useRef<Map<string, Promise<void>>>(new Map());
+  const decodedImageUrlsRef = useRef<Set<string>>(new Set());
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const confettiFiredRef = useRef<string | null>(null);
@@ -420,11 +438,19 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     };
   }, [isFullscreen]);
 
+  const displayedSlideId =
+    slideLayers.find((l) => l.phase === 'active' || l.phase === 'entering')?.slide.id ??
+    data?.currentSlide?.id;
+
+  const answersList = data?.answers;
+  const themesList = data?.themes;
+  const slidesByThemeMap = data?.slidesByTheme;
+
   // Števec oddanih odgovorov na trenutni slajd
   const answersForCurrentSlide = useMemo(() => {
-    if (!data?.currentSlide?.id || !data?.answers) return [];
-    return data.answers.filter((a) => a.slide_id === data.currentSlide?.id);
-  }, [data?.currentSlide?.id, data?.answers]);
+    if (!displayedSlideId || !answersList) return [];
+    return answersList.filter((a) => a.slide_id === displayedSlideId);
+  }, [displayedSlideId, answersList]);
 
   // Igralci, ki so v tej temi vklopili Jokerja
   const jokersForCurrentTheme = useMemo(() => {
@@ -435,6 +461,289 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         .map((pj) => pj.player_id)
     );
   }, [data?.currentTheme?.id, data?.playerJokers]);
+
+  // Vsi slajdi kviza po vrstnem redu predvajanja (za smer animacije in prednalaganje slik)
+  const allOrderedSlides = useMemo(() => {
+    if (!themesList?.length || !slidesByThemeMap) return [];
+    return themesList.flatMap((t) => slidesByThemeMap[t.id] || []);
+  }, [themesList, slidesByThemeMap]);
+
+  // Prednalaganje in dekodiranje posamezne slike slajda v pomnilnik brskalnika
+  const preloadImage = useCallback((url: string): Promise<void> => {
+    if (!url) return Promise.resolve();
+    if (decodedImageUrlsRef.current.has(url)) return Promise.resolve();
+    const existingPromise = preloadPromisesRef.current.get(url);
+    if (existingPromise) return existingPromise;
+
+    const promise = new Promise<void>((resolve) => {
+      const img = new Image();
+      img.decoding = 'async';
+      preloadedImagesRef.current.set(url, img);
+
+      let settled = false;
+      const finish = (markDecoded: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (markDecoded) {
+          decodedImageUrlsRef.current.add(url);
+        }
+        resolve();
+      };
+
+      const decodeAndFinish = () => {
+        if (typeof img.decode === 'function') {
+          img
+            .decode()
+            .then(() => finish(true))
+            .catch(() => finish(true));
+        } else {
+          finish(true);
+        }
+      };
+
+      img.onload = decodeAndFinish;
+      img.onerror = () => {
+        preloadPromisesRef.current.delete(url);
+        finish(false);
+      };
+
+      img.src = url;
+
+      if (img.complete && img.naturalWidth > 0) {
+        decodeAndFinish();
+      }
+    });
+
+    preloadPromisesRef.current.set(url, promise);
+    return promise;
+  }, []);
+
+  // Prednostno prednalaganje slik: trenutni + naslednji 3 + prejšnji 2 slajdi, nato vsi ostali slajdi
+  useEffect(() => {
+    if (allOrderedSlides.length === 0) return;
+    let cancelled = false;
+
+    const currentId = data?.currentSlide?.id;
+    const currentIdx = currentId
+      ? allOrderedSlides.findIndex((s) => s.id === currentId)
+      : 0;
+    const anchorIdx = currentIdx >= 0 ? currentIdx : 0;
+
+    const priorityUrls: string[] = [];
+    const seenUrls = new Set<string>();
+    const pushUrl = (idx: number, targetList: string[]) => {
+      const slide = allOrderedSlides[idx];
+      const url = slide?.slide_image_url;
+      if (url && !seenUrls.has(url)) {
+        seenUrls.add(url);
+        targetList.push(url);
+      }
+    };
+
+    // 1. Trenutni slajd, naslednji 3 in prejšnji 2 slajdi
+    pushUrl(anchorIdx, priorityUrls);
+    pushUrl(anchorIdx + 1, priorityUrls);
+    pushUrl(anchorIdx + 2, priorityUrls);
+    pushUrl(anchorIdx + 3, priorityUrls);
+    pushUrl(anchorIdx - 1, priorityUrls);
+    pushUrl(anchorIdx - 2, priorityUrls);
+
+    // 2. Vsi ostali slajdi kviza v ozadju
+    const remainingUrls: string[] = [];
+    for (let i = anchorIdx + 4; i < allOrderedSlides.length; i++) {
+      pushUrl(i, remainingUrls);
+    }
+    for (let i = 0; i < anchorIdx - 2; i++) {
+      pushUrl(i, remainingUrls);
+    }
+
+    const runPreloadQueue = async () => {
+      await Promise.all(priorityUrls.map((url) => preloadImage(url)));
+      const batchSize = 3;
+      for (let i = 0; i < remainingUrls.length; i += batchSize) {
+        if (cancelled) return;
+        const batch = remainingUrls.slice(i, i + batchSize);
+        await Promise.all(batch.map((url) => preloadImage(url)));
+      }
+    };
+
+    void runPreloadQueue();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [allOrderedSlides, data?.currentSlide?.id, preloadImage]);
+
+  const targetSlideStatus: 'theme_intro' | 'active_theme' | null =
+    data?.session?.status === 'active_theme' && data?.currentSlide
+      ? 'active_theme'
+      : data?.session?.status === 'theme_intro' &&
+          data?.currentTheme &&
+          data?.currentSlide?.slide_image_url
+      ? 'theme_intro'
+      : null;
+
+  const promoteStagingLayer = useCallback((stagingKey: string, imageUrl?: string) => {
+    if (promotedStagingKeysRef.current.has(stagingKey)) return;
+    const prev = slideLayersRef.current;
+    const stagingLayer = prev.find((l) => l.key === stagingKey && l.phase === 'staging');
+    if (!stagingLayer) return;
+
+    promotedStagingKeysRef.current.add(stagingKey);
+    if (imageUrl) {
+      decodedImageUrlsRef.current.add(imageUrl);
+    }
+
+    const foreground = prev.find((l) => l.phase === 'active' || l.phase === 'entering');
+    const next: TransitionSlideLayer[] = [];
+    if (foreground) {
+      next.push({ ...foreground, phase: 'exiting' });
+    }
+    next.push({ ...stagingLayer, phase: 'entering' });
+
+    slideLayersRef.current = next;
+    setSlideLayers(next);
+  }, []);
+
+  // Sinhronizacija prihajajočega in izstopajočega slajda s čakanjem na pripravljenost slike
+  useEffect(() => {
+    const targetSlide = data?.currentSlide ?? null;
+    const targetThemeTitle = data?.currentTheme?.title ?? '';
+
+    if (!targetSlideStatus || !targetSlide) {
+      if (slideLayersRef.current.length > 0) {
+        slideLayersRef.current = [];
+        setSlideLayers([]);
+      }
+      return;
+    }
+
+    const prev = slideLayersRef.current;
+    const foreground = prev.find((l) => l.phase === 'active' || l.phase === 'entering');
+    const staging = prev.find((l) => l.phase === 'staging');
+
+    const hasMetadataChanged = (existing: TransitionSlideLayer) =>
+      existing.status !== targetSlideStatus ||
+      existing.themeTitle !== targetThemeTitle ||
+      existing.slide.slide_type !== targetSlide.slide_type ||
+      existing.slide.question_text !== targetSlide.question_text ||
+      existing.slide.points !== targetSlide.points;
+
+    // Če je ciljni slajd že v pripravi (staging), posodobi samo metapodatke ob dejanski spremembi
+    if (
+      staging &&
+      staging.slide.id === targetSlide.id &&
+      staging.slide.slide_image_url === targetSlide.slide_image_url
+    ) {
+      if (hasMetadataChanged(staging)) {
+        const next = prev.map((l) =>
+          l.key === staging.key
+            ? { ...l, slide: targetSlide, status: targetSlideStatus, themeTitle: targetThemeTitle }
+            : l
+        );
+        slideLayersRef.current = next;
+        setSlideLayers(next);
+      }
+      return;
+    }
+
+    // Če je ciljni slajd že v ospredju, posodobi le metapodatke brez vnovičnega zagona animacije
+    if (
+      !staging &&
+      foreground &&
+      foreground.slide.id === targetSlide.id &&
+      foreground.slide.slide_image_url === targetSlide.slide_image_url
+    ) {
+      if (hasMetadataChanged(foreground)) {
+        const next = prev.map((l) =>
+          l.key === foreground.key
+            ? { ...l, slide: targetSlide, status: targetSlideStatus, themeTitle: targetThemeTitle }
+            : l
+        );
+        slideLayersRef.current = next;
+        setSlideLayers(next);
+      }
+      return;
+    }
+
+    // Določi smer animacije glede na globalni vrstni red slajdov
+    let direction: 1 | -1 = 1;
+    if (foreground) {
+      const prevIdx = allOrderedSlides.findIndex((s) => s.id === foreground.slide.id);
+      const nextIdx = allOrderedSlides.findIndex((s) => s.id === targetSlide.id);
+      if (prevIdx >= 0 && nextIdx >= 0 && nextIdx < prevIdx) {
+        direction = -1;
+      }
+    }
+
+    layerSeqRef.current += 1;
+    const nextKey = `${targetSlide.id}-${layerSeqRef.current}`;
+    const imageUrl = targetSlide.slide_image_url;
+    const isImageReady = !imageUrl || decodedImageUrlsRef.current.has(imageUrl);
+
+    if (isImageReady) {
+      const next: TransitionSlideLayer[] = [];
+      if (foreground) {
+        next.push({ ...foreground, phase: 'exiting' });
+      }
+      next.push({
+        key: nextKey,
+        slide: targetSlide,
+        themeTitle: targetThemeTitle,
+        status: targetSlideStatus,
+        phase: 'entering',
+        direction,
+      });
+      slideLayersRef.current = next;
+      setSlideLayers(next);
+      return;
+    }
+
+    // Slika še ni dekodirana: stari slajd ostane viden, novi čaka v nevidni plasti na onLoad + decode()
+    const nextWithoutOldStaging = prev.filter((l) => l.phase !== 'staging');
+    const stagingLayer: TransitionSlideLayer = {
+      key: nextKey,
+      slide: targetSlide,
+      themeTitle: targetThemeTitle,
+      status: targetSlideStatus,
+      phase: 'staging',
+      direction,
+    };
+    const next = [...nextWithoutOldStaging, stagingLayer];
+    slideLayersRef.current = next;
+    setSlideLayers(next);
+
+    if (imageUrl) {
+      void preloadImage(imageUrl).then(() => {
+        promoteStagingLayer(nextKey, imageUrl);
+      });
+    }
+  }, [
+    targetSlideStatus,
+    data?.currentSlide,
+    data?.currentTheme?.title,
+    allOrderedSlides,
+    preloadImage,
+    promoteStagingLayer,
+  ]);
+
+  // Odstrani izstopajoče plasti po zaključku 400ms prehoda in ustali novo plast
+  const hasTransientSlidePhase = slideLayers.some(
+    (l) => l.phase === 'exiting' || l.phase === 'entering'
+  );
+  useEffect(() => {
+    if (!hasTransientSlidePhase) return;
+    const timer = setTimeout(() => {
+      setSlideLayers((prev) => {
+        const next = prev
+          .filter((l) => l.phase !== 'exiting')
+          .map((l) => (l.phase === 'entering' ? { ...l, phase: 'active' as const } : l));
+        slideLayersRef.current = next;
+        return next;
+      });
+    }, 440);
+    return () => clearTimeout(timer);
+  }, [hasTransientSlidePhase, slideLayers]);
 
   // Dodajanje demo igralca za takojšnje testiranje čakalnice
   const handleAddTestPlayer = async () => {
@@ -504,11 +813,15 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     setTimeout(() => setCopiedRemoteUrl(false), 2000);
   };
 
-  // Indeks trenutnega slajda v temi
+  // Indeks trenutnega slajda v temi in aktivna plast odra slajdov
   const themeSlides = currentTheme ? data.slidesByTheme[currentTheme.id] || [] : [];
   const slideIndex = currentSlide ? themeSlides.findIndex((s) => s.id === currentSlide.id) : -1;
+  const displayedForegroundLayer =
+    slideLayers.find((l) => l.phase === 'active' || l.phase === 'entering') || null;
+  const effectiveStageStatus = displayedForegroundLayer?.status || targetSlideStatus;
+  const effectiveStageSlide = displayedForegroundLayer?.slide || currentSlide;
   const isImageSlideCanvas =
-    Boolean(currentSlide?.slide_image_url) &&
+    Boolean(effectiveStageSlide?.slide_image_url) &&
     (session.status === 'active_theme' || session.status === 'theme_intro');
 
   return (
@@ -642,7 +955,10 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             1. STANJE: LOBBY (Čakalnica pred začetkom)
             =================================================================== */}
         {session.status === 'lobby' && (
-          <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 animate-fadeIn my-auto">
+          <div
+            key="screen-lobby"
+            className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 animate-screenFadeIn transform-gpu will-change-transform my-auto"
+          >
             {/* Zelen indikator o uspešnem zapisu v Supabase oblak */}
             <div className="px-4 py-2.5 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs sm:text-sm font-bold flex items-center gap-2 shadow-lg">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -765,140 +1081,83 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
         )}
 
         {/* ===================================================================
-            2. STANJE: THEME_INTRO (Začetek nove tematike - Joker aktivacija!)
+            2. STANJE: THEME_INTRO BREZ SLIKE (Joker aktivacija - kartica)
             =================================================================== */}
-        {session.status === 'theme_intro' && currentTheme && (
-          currentSlide?.slide_image_url ? (
-            <div
-              className={
-                isFullscreen
-                  ? 'fixed inset-0 w-screen h-screen bg-black flex items-center justify-center overflow-hidden z-10 animate-fadeIn'
-                  : 'w-full h-full flex-1 min-h-0 flex items-center justify-center relative overflow-hidden animate-fadeIn'
-              }
-            >
-              <img
-                src={currentSlide.slide_image_url}
-                alt={currentTheme.title}
-                className="w-full h-full object-contain select-none"
-              />
-
-              {/* Lebdeča polprosojna značka za status Jokerja, ki ne zmanjšuje prostora za slajd */}
-              {isFullscreen ? (
-                <div className="fixed bottom-2 left-2 z-30 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md border border-amber-500/35 text-[11px] text-amber-200/95 shadow-lg">
-                  <span>🃏</span>
-                  <span className="font-bold text-amber-300">Joker:</span>
-                  <span className="font-mono-code font-bold text-slate-100">
-                    {jokersForCurrentTheme.size}/{players.length}
-                  </span>
-                  {jokersForCurrentTheme.size > 0 && (
-                    <span className="text-amber-100/85 max-w-[45vw] truncate">
-                      •{' '}
-                      {players
-                        .filter((p) => jokersForCurrentTheme.has(p.id))
-                        .map((p) => p.nickname)
-                        .join(', ')}
-                    </span>
-                  )}
-                </div>
-              ) : (
-                <div className="absolute bottom-2 left-2 z-30 max-w-[calc(100%-1rem)] sm:max-w-2xl inline-flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-amber-500/45 shadow-xl text-xs">
-                  <span className="text-base leading-none">🃏</span>
-                  <span className="font-bold text-amber-300">
-                    Aktivacija JOKERJA (2x točke)
-                  </span>
-                  <span className="text-slate-200 font-mono-code font-bold">
-                    {jokersForCurrentTheme.size}/{players.length}
-                  </span>
-                  {jokersForCurrentTheme.size > 0 && (
-                    <div className="flex flex-wrap gap-1">
-                      {players
-                        .filter((p) => jokersForCurrentTheme.has(p.id))
-                        .map((p) => (
-                          <span
-                            key={p.id}
-                            className="px-2 py-0.5 rounded-md bg-amber-500/20 border border-amber-500/40 text-amber-200 text-[11px] font-bold"
-                          >
-                            {p.nickname}
-                          </span>
-                        ))}
-                    </div>
-                  )}
-                </div>
-              )}
+        {session.status === 'theme_intro' && currentTheme && !currentSlide?.slide_image_url && (
+          <div
+            key="screen-theme-intro-card"
+            className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 text-center my-auto animate-screenFadeIn transform-gpu will-change-transform"
+          >
+            {/* Oznaka tematike */}
+            <div className="space-y-2">
+              <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
+                <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Začetek nove tematike</span>
+              </span>
+              <h2 className="text-3xl sm:text-6xl font-black text-slate-100 font-display">
+                {currentTheme.title}
+              </h2>
             </div>
-          ) : (
-            <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 text-center my-auto animate-fadeIn">
-              {/* Oznaka tematike */}
-              <div className="space-y-2">
-                <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
-                  <Layers className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Začetek nove tematike</span>
+
+            {/* MASIVNO OBVESTILO O JOKERJU */}
+            <div className="w-full max-w-4xl bg-gradient-to-br from-amber-500/20 via-slate-900/90 to-amber-500/10 backdrop-blur-2xl border-2 border-amber-500/60 rounded-3xl p-6 sm:p-8 shadow-2xl shadow-amber-950/50 space-y-4">
+              <div className="w-16 h-16 rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 mx-auto text-3xl shadow-lg shadow-amber-500/20">
+                🃏
+              </div>
+              <div className="space-y-1.5">
+                <h3 className="text-2xl sm:text-4xl font-black text-amber-300 tracking-tight">
+                  Čas za aktivacijo JOKERJA na vaših telefonih!
+                </h3>
+                <p className="text-base sm:text-lg font-bold text-emerald-400">
+                  Dvojne točke (2x) za vsa pravilna vprašanja v tej tematiki!
+                </p>
+                <p className="text-xs sm:text-sm text-slate-400 max-w-lg mx-auto">
+                  Pozor: Ko gostitelj zažene prvo vprašanje, Jokerja v tej temi ne bo več mogoče vklopiti.
+                </p>
+              </div>
+
+              {/* Prikaz ekip, ki so že aktivirale Jokerja */}
+              <div className="pt-2 border-t border-amber-500/20">
+                <span className="text-xs font-semibold text-amber-200 uppercase tracking-wider">
+                  Aktivirani Jokerji za ta sklop: {jokersForCurrentTheme.size} / {players.length}
                 </span>
-                <h2 className="text-3xl sm:text-6xl font-black text-slate-100 font-display">
-                  {currentTheme.title}
-                </h2>
-              </div>
-
-              {/* MASIVNO OBVESTILO O JOKERJU */}
-              <div className="w-full max-w-4xl bg-gradient-to-br from-amber-500/20 via-slate-900/90 to-amber-500/10 backdrop-blur-2xl border-2 border-amber-500/60 rounded-3xl p-6 sm:p-8 shadow-2xl shadow-amber-950/50 space-y-4">
-                <div className="w-16 h-16 rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 mx-auto text-3xl shadow-lg shadow-amber-500/20">
-                  🃏
-                </div>
-                <div className="space-y-1.5">
-                  <h3 className="text-2xl sm:text-4xl font-black text-amber-300 tracking-tight">
-                    Čas za aktivacijo JOKERJA na vaših telefonih!
-                  </h3>
-                  <p className="text-base sm:text-lg font-bold text-emerald-400">
-                    Dvojne točke (2x) za vsa pravilna vprašanja v tej tematiki!
-                  </p>
-                  <p className="text-xs sm:text-sm text-slate-400 max-w-lg mx-auto">
-                    Pozor: Ko gostitelj zažene prvo vprašanje, Jokerja v tej temi ne bo več mogoče vklopiti.
-                  </p>
-                </div>
-
-                {/* Prikaz ekip, ki so že aktivirale Jokerja */}
-                <div className="pt-2 border-t border-amber-500/20">
-                  <span className="text-xs font-semibold text-amber-200 uppercase tracking-wider">
-                    Aktivirani Jokerji za ta sklop: {jokersForCurrentTheme.size} / {players.length}
-                  </span>
-                  {jokersForCurrentTheme.size > 0 && (
-                    <div className="flex flex-wrap gap-2 justify-center mt-2.5">
-                      {players
-                        .filter((p) => jokersForCurrentTheme.has(p.id))
-                        .map((p) => (
-                          <span
-                            key={p.id}
-                            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-200 text-xs font-bold"
-                          >
-                            <span>🃏</span>
-                            <span>{p.nickname}</span>
-                          </span>
-                        ))}
-                    </div>
-                  )}
-                </div>
+                {jokersForCurrentTheme.size > 0 && (
+                  <div className="flex flex-wrap gap-2 justify-center mt-2.5">
+                    {players
+                      .filter((p) => jokersForCurrentTheme.has(p.id))
+                      .map((p) => (
+                        <span
+                          key={p.id}
+                          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-200 text-xs font-bold"
+                        >
+                          <span>🃏</span>
+                          <span>{p.nickname}</span>
+                        </span>
+                      ))}
+                  </div>
+                )}
               </div>
             </div>
-          )
+          </div>
         )}
 
         {/* ===================================================================
-            3. STANJE: ACTIVE_THEME (Prikaz slajdov in vprašanj)
+            3. STANJE: ENOTEN ODER ZA SLAJDE (THEME_INTRO s sliko & ACTIVE_THEME)
+               Tekoč 400ms GPU crossfade + onLoad zaščita pred utripanjem
             =================================================================== */}
-        {session.status === 'active_theme' && currentSlide && (
+        {targetSlideStatus && (
           <div
+            key="screen-slide-stage"
             className={
               isFullscreen
-                ? currentSlide.slide_image_url
-                  ? 'fixed inset-0 w-screen h-screen bg-black flex items-center justify-center overflow-hidden z-10 animate-fadeIn'
-                  : 'fixed inset-0 w-screen h-screen bg-black flex flex-col items-center overflow-y-auto p-4 sm:p-8 z-10 animate-fadeIn'
-                : currentSlide.slide_image_url
-                ? 'w-full h-full flex-1 min-h-0 flex items-center justify-center relative overflow-hidden animate-fadeIn'
-                : 'w-full flex-1 min-h-0 flex flex-col items-center relative overflow-y-auto py-12 animate-fadeIn'
+                ? 'fixed inset-0 w-screen h-screen bg-black overflow-hidden z-10 animate-screenFadeIn'
+                : isImageSlideCanvas
+                ? 'relative w-full h-full flex-1 min-h-0 flex items-center justify-center overflow-hidden animate-screenFadeIn'
+                : 'relative w-full flex-1 min-h-0 flex flex-col items-center animate-screenFadeIn'
             }
           >
-            {/* Animiran odštevalnik časa (Timer) */}
-            {activeSlideTimerEntry && timeLeft !== null && (
+            {/* Animiran odštevalnik časa (Timer) za trenutni slajd */}
+            {effectiveStageStatus === 'active_theme' && activeSlideTimerEntry && timeLeft !== null && (
               <div
                 className={
                   isFullscreen
@@ -946,137 +1205,236 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               </div>
             )}
 
-            {/* Prikaz vsebine slajda: Slika čez celoten razpoložljivi zaslon ali tekstovna kartica */}
-            {currentSlide.slide_image_url ? (
-              <img
-                src={currentSlide.slide_image_url}
-                alt={currentSlide.question_text || 'Slajd kviza'}
-                className="w-full h-full object-contain select-none"
-              />
-            ) : (
-              /* Tekstovna kartica, če slika ni naložena */
-              <div className="w-full max-w-6xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center my-auto">
-                {currentSlide.slide_type === 'info_only' ? (
-                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-xs font-semibold">
-                    <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-                    <span>Predstavitveni slajd</span>
-                  </div>
-                ) : (
-                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
-                    <HelpCircle className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>
-                      Vprašanje • {currentSlide.points}{' '}
-                      {currentSlide.points === 1 ? 'točka' : 'točke'}
-                    </span>
-                  </div>
-                )}
+            {/* Plasti slajdov: izstopajoči slajd zbledi v ozadju, novi priplava po onLoad/decode */}
+            {slideLayers.map((layer) => {
+              const isStaging = layer.phase === 'staging';
+              const isExiting = layer.phase === 'exiting';
+              const isEntering = layer.phase === 'entering';
+              const hasImg = Boolean(layer.slide.slide_image_url);
+              const enterAnim =
+                layer.direction >= 0 ? 'animate-slideEnterForward' : 'animate-slideEnterBackward';
 
-                <h3 className="text-2xl sm:text-4xl lg:text-5xl font-bold text-slate-100 leading-snug">
-                  {currentSlide.question_text ||
-                    (currentSlide.slide_type === 'info_only'
-                      ? currentTheme?.title || quiz.title
-                      : 'Vprašanje se bo prikazalo tukaj.')}
-                </h3>
+              const layerClassName = isStaging
+                ? 'absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden opacity-0 pointer-events-none z-0 transform-gpu will-change-transform'
+                : isExiting
+                ? `absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden pointer-events-none z-10 transform-gpu will-change-transform animate-slideExit ${
+                    !hasImg ? 'p-4 sm:p-8' : ''
+                  }`
+                : isFullscreen || hasImg
+                ? `relative w-full h-full flex items-center justify-center overflow-hidden z-20 transform-gpu will-change-transform ${
+                    !hasImg ? 'overflow-y-auto p-4 sm:p-8' : ''
+                  } ${isEntering ? enterAnim : ''}`
+                : `relative w-full flex-1 min-h-0 flex flex-col items-center overflow-y-auto py-12 z-20 transform-gpu will-change-transform ${
+                    isEntering ? enterAnim : ''
+                  }`;
 
-                {/* Če je večdelno vprašanje */}
-                {currentSlide.question_parts && currentSlide.question_parts.length > 0 ? (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
-                    {currentSlide.question_parts.map((part, pIdx) => {
-                      const isBonusPart = Boolean(part.is_bonus);
-                      return (
-                        <div
-                          key={part.id}
-                          className={`p-4 rounded-2xl space-y-2 border ${
-                            isBonusPart
-                              ? 'bg-amber-500/10 border-amber-500/50 shadow-lg shadow-amber-950/30'
-                              : 'bg-slate-950/85 border-fuchsia-500/35'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span
-                              className={`px-2.5 py-0.5 rounded-lg text-xs font-bold border ${
-                                isBonusPart
-                                  ? 'bg-amber-500 text-slate-950 border-amber-400'
-                                  : 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30'
-                              }`}
-                            >
-                              {isBonusPart
-                                ? `⭐ BONUS VPRAŠANJE: ${part.label || 'Bonus'}`
-                                : part.label || `Del ${pIdx + 1}`}
-                            </span>
-                            <span
-                              className={`text-xs font-bold ${
-                                isBonusPart ? 'text-amber-300' : 'text-emerald-400'
-                              }`}
-                            >
-                              {isBonusPart ? `+${part.points} ⭐` : `${part.points} t`}
-                            </span>
-                          </div>
-                          {part.type === 'multiple_choice' && part.options && (
-                            <div className="grid grid-cols-2 gap-1.5 pt-1">
-                              {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => (
-                                <div
-                                  key={letter}
-                                  className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-200 font-semibold truncate"
-                                >
-                                  <span className="text-indigo-400 font-bold mr-1.5">
-                                    {letter}:
+              return (
+                <div key={layer.key} className={layerClassName} aria-hidden={isStaging || isExiting}>
+                  {layer.slide.slide_image_url ? (
+                    <img
+                      src={layer.slide.slide_image_url}
+                      alt={
+                        layer.slide.question_text ||
+                        layer.themeTitle ||
+                        (layer.status === 'theme_intro' ? 'Naslovnica tematike' : 'Slajd kviza')
+                      }
+                      decoding="async"
+                      onLoad={(e) => {
+                        if (!isStaging) return;
+                        const imgEl = e.currentTarget;
+                        const url = layer.slide.slide_image_url || '';
+                        if (typeof imgEl.decode === 'function') {
+                          imgEl
+                            .decode()
+                            .then(() => promoteStagingLayer(layer.key, url))
+                            .catch(() => promoteStagingLayer(layer.key, url));
+                        } else {
+                          promoteStagingLayer(layer.key, url);
+                        }
+                      }}
+                      onError={() => {
+                        if (isStaging) {
+                          promoteStagingLayer(layer.key, layer.slide.slide_image_url || '');
+                        }
+                      }}
+                      className="w-full h-full object-contain select-none transform-gpu will-change-transform"
+                    />
+                  ) : (
+                    /* Tekstovna kartica, če slika ni naložena */
+                    <div className="w-full max-w-6xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center my-auto transform-gpu will-change-transform">
+                      {layer.slide.slide_type === 'info_only' ? (
+                        <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-xs font-semibold">
+                          <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                          <span>Predstavitveni slajd</span>
+                        </div>
+                      ) : (
+                        <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
+                          <HelpCircle className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>
+                            Vprašanje • {layer.slide.points}{' '}
+                            {layer.slide.points === 1 ? 'točka' : 'točke'}
+                          </span>
+                        </div>
+                      )}
+
+                      <h3 className="text-2xl sm:text-4xl lg:text-5xl font-bold text-slate-100 leading-snug">
+                        {layer.slide.question_text ||
+                          (layer.slide.slide_type === 'info_only'
+                            ? layer.themeTitle || quiz.title
+                            : 'Vprašanje se bo prikazalo tukaj.')}
+                      </h3>
+
+                      {/* Če je večdelno vprašanje */}
+                      {layer.slide.question_parts && layer.slide.question_parts.length > 0 ? (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
+                          {layer.slide.question_parts.map((part, pIdx) => {
+                            const isBonusPart = Boolean(part.is_bonus);
+                            return (
+                              <div
+                                key={part.id}
+                                className={`p-4 rounded-2xl space-y-2 border ${
+                                  isBonusPart
+                                    ? 'bg-amber-500/10 border-amber-500/50 shadow-lg shadow-amber-950/30'
+                                    : 'bg-slate-950/85 border-fuchsia-500/35'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <span
+                                    className={`px-2.5 py-0.5 rounded-lg text-xs font-bold border ${
+                                      isBonusPart
+                                        ? 'bg-amber-500 text-slate-950 border-amber-400'
+                                        : 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30'
+                                    }`}
+                                  >
+                                    {isBonusPart
+                                      ? `⭐ BONUS VPRAŠANJE: ${part.label || 'Bonus'}`
+                                      : part.label || `Del ${pIdx + 1}`}
                                   </span>
-                                  {part.options?.[lIdx] || `Možnost ${letter}`}
+                                  <span
+                                    className={`text-xs font-bold ${
+                                      isBonusPart ? 'text-amber-300' : 'text-emerald-400'
+                                    }`}
+                                  >
+                                    {isBonusPart ? `+${part.points} ⭐` : `${part.points} t`}
+                                  </span>
                                 </div>
-                              ))}
-                            </div>
-                          )}
+                                {part.type === 'multiple_choice' && part.options && (
+                                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                                    {(['A', 'B', 'C', 'D'] as const).map((letter, lIdx) => (
+                                      <div
+                                        key={letter}
+                                        className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-200 font-semibold truncate"
+                                      >
+                                        <span className="text-indigo-400 font-bold mr-1.5">
+                                          {letter}:
+                                        </span>
+                                        {part.options?.[lIdx] || `Možnost ${letter}`}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  /* Če je izbirni A/B/C/D tip slajda */
-                  currentSlide.slide_type === 'multiple_choice' && (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
-                      {(
-                        [
-                          { key: 'A', bg: 'bg-rose-500/15 border-rose-500/40 text-rose-300', badge: 'bg-rose-500 text-slate-950' },
-                          { key: 'B', bg: 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300', badge: 'bg-indigo-500 text-white' },
-                          { key: 'C', bg: 'bg-amber-500/15 border-amber-500/40 text-amber-300', badge: 'bg-amber-500 text-slate-950' },
-                          { key: 'D', bg: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300', badge: 'bg-emerald-500 text-slate-950' },
-                        ] as const
-                      ).map(({ key, bg, badge }) => (
-                        <div
-                          key={key}
-                          className={`flex items-center gap-3.5 p-4 rounded-2xl border ${bg} backdrop-blur-md`}
-                        >
-                          <span className={`w-9 h-9 rounded-xl font-bold flex items-center justify-center text-sm shadow-md ${badge}`}>
-                            {key}
-                          </span>
-                          <span className="text-base sm:text-lg font-semibold text-slate-100">
-                            {currentSlide.options[key] || `Možnost ${key}`}
-                          </span>
-                        </div>
-                      ))}
+                      ) : (
+                        /* Če je izbirni A/B/C/D tip slajda */
+                        layer.slide.slide_type === 'multiple_choice' && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 text-left">
+                            {(
+                              [
+                                { key: 'A', bg: 'bg-rose-500/15 border-rose-500/40 text-rose-300', badge: 'bg-rose-500 text-slate-950' },
+                                { key: 'B', bg: 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300', badge: 'bg-indigo-500 text-white' },
+                                { key: 'C', bg: 'bg-amber-500/15 border-amber-500/40 text-amber-300', badge: 'bg-amber-500 text-slate-950' },
+                                { key: 'D', bg: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300', badge: 'bg-emerald-500 text-slate-950' },
+                              ] as const
+                            ).map(({ key, bg, badge }) => (
+                              <div
+                                key={key}
+                                className={`flex items-center gap-3.5 p-4 rounded-2xl border ${bg} backdrop-blur-md`}
+                              >
+                                <span className={`w-9 h-9 rounded-xl font-bold flex items-center justify-center text-sm shadow-md ${badge}`}>
+                                  {key}
+                                </span>
+                                <span className="text-base sm:text-lg font-semibold text-slate-100">
+                                  {layer.slide.options[key] || `Možnost ${key}`}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      )}
                     </div>
-                  )
-                )}
-              </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Lebdeča polprosojna značka za status Jokerja pri slikovnem theme_intro slajdu */}
+            {effectiveStageStatus === 'theme_intro' && currentTheme && displayedForegroundLayer && (
+              isFullscreen ? (
+                <div className="fixed bottom-2 left-2 z-30 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md border border-amber-500/35 text-[11px] text-amber-200/95 shadow-lg">
+                  <span>🃏</span>
+                  <span className="font-bold text-amber-300">Joker:</span>
+                  <span className="font-mono-code font-bold text-slate-100">
+                    {jokersForCurrentTheme.size}/{players.length}
+                  </span>
+                  {jokersForCurrentTheme.size > 0 && (
+                    <span className="text-amber-100/85 max-w-[45vw] truncate">
+                      •{' '}
+                      {players
+                        .filter((p) => jokersForCurrentTheme.has(p.id))
+                        .map((p) => p.nickname)
+                        .join(', ')}
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div className="absolute bottom-2 left-2 z-30 max-w-[calc(100%-1rem)] sm:max-w-2xl inline-flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-amber-500/45 shadow-xl text-xs">
+                  <span className="text-base leading-none">🃏</span>
+                  <span className="font-bold text-amber-300">
+                    Aktivacija JOKERJA (2x točke)
+                  </span>
+                  <span className="text-slate-200 font-mono-code font-bold">
+                    {jokersForCurrentTheme.size}/{players.length}
+                  </span>
+                  {jokersForCurrentTheme.size > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {players
+                        .filter((p) => jokersForCurrentTheme.has(p.id))
+                        .map((p) => (
+                          <span
+                            key={p.id}
+                            className="px-2 py-0.5 rounded-md bg-amber-500/20 border border-amber-500/40 text-amber-200 text-[11px] font-bold"
+                          >
+                            {p.nickname}
+                          </span>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              )
             )}
 
             {/* Zelo majhna polprosojna lebdeča značka oddanih odgovorov (ne zmanjšuje prostora za slajd) */}
-            {currentSlide.slide_type !== 'info_only' && (
-              <div
-                className={
-                  isFullscreen
-                    ? 'fixed bottom-2 left-2 z-30 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md border border-white/10 text-[11px] font-medium text-slate-300/90 shadow-lg'
-                    : 'absolute bottom-2 left-2 z-30 flex items-center gap-2 px-3 py-1 rounded-xl bg-slate-900/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold shadow-xl'
-                }
-              >
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-slate-400">Odgovori:</span>
-                <span className="text-slate-100 font-mono-code font-bold">
-                  {answersForCurrentSlide.length} / {players.length}
-                </span>
-              </div>
-            )}
+            {effectiveStageStatus === 'active_theme' &&
+              displayedForegroundLayer &&
+              effectiveStageSlide &&
+              effectiveStageSlide.slide_type !== 'info_only' && (
+                <div
+                  className={
+                    isFullscreen
+                      ? 'fixed bottom-2 left-2 z-30 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md border border-white/10 text-[11px] font-medium text-slate-300/90 shadow-lg'
+                      : 'absolute bottom-2 left-2 z-30 flex items-center gap-2 px-3 py-1 rounded-xl bg-slate-900/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold shadow-xl'
+                  }
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="text-slate-400">Odgovori:</span>
+                  <span className="text-slate-100 font-mono-code font-bold">
+                    {answersForCurrentSlide.length} / {players.length}
+                  </span>
+                </div>
+              )}
           </div>
         )}
 
@@ -1084,7 +1442,10 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             4. STANJE: GRADING_THEME (Konec sklopa - Ocenjevanje)
             =================================================================== */}
         {session.status === 'grading_theme' && (
-          <div className="w-full max-w-2xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-8 sm:p-12 text-center space-y-6 shadow-2xl animate-fadeIn my-auto">
+          <div
+            key="screen-grading_theme"
+            className="w-full max-w-2xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-8 sm:p-12 text-center space-y-6 shadow-2xl animate-screenFadeIn transform-gpu will-change-transform my-auto"
+          >
             <div className="w-20 h-20 rounded-3xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400 mx-auto shadow-xl">
               <Loader2 className="w-10 h-10 animate-spin text-emerald-400" />
             </div>
@@ -1106,7 +1467,10 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             5. STANJE: FINISHED (Slavnostni oder zmagovalcev - Grand Podium)
             =================================================================== */}
         {session.status === 'finished' && (
-          <div className="w-full max-w-5xl space-y-10 animate-fadeIn text-center my-auto">
+          <div
+            key="screen-finished"
+            className="w-full max-w-5xl space-y-10 animate-screenFadeIn transform-gpu will-change-transform text-center my-auto"
+          >
             <div className="space-y-3">
               <div className="inline-flex items-center gap-2 px-5 py-2 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-300 text-sm font-black shadow-lg shadow-amber-500/10">
                 <Crown className="w-5 h-5 text-amber-400 animate-bounce" />
@@ -1256,7 +1620,10 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             6. STANJE: LEADERBOARD (Vmesna lestvica po končani temi)
             =================================================================== */}
         {session.status === 'leaderboard' && (
-          <div className="w-full max-w-4xl space-y-8 animate-fadeIn text-center my-auto">
+          <div
+            key="screen-leaderboard"
+            className="w-full max-w-4xl space-y-8 animate-screenFadeIn transform-gpu will-change-transform text-center my-auto"
+          >
             <div className="space-y-2">
               <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-bold">
                 <Trophy className="w-4 h-4 text-amber-400" />
