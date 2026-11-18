@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import confetti from 'canvas-confetti';
 import {
@@ -58,6 +58,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [showFsExitBtn, setShowFsExitBtn] = useState(false);
   const [addingBot, setAddingBot] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [showRemoteQrModal, setShowRemoteQrModal] = useState(false);
@@ -68,6 +69,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const confettiFiredRef = useRef<string | null>(null);
+  const fsMouseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Nalaganje podatkov o seji
   const loadData = async () => {
@@ -307,28 +309,116 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
     }
   }, [data?.session?.status]);
 
+  // Pomožna funkcija za preverjanje celozaslonskega elementa (vključno s Safari/WebKit)
+  const getFullscreenElement = () => {
+    if (typeof document === 'undefined') return null;
+    const doc = document as Document & { webkitFullscreenElement?: Element | null };
+    return doc.fullscreenElement || doc.webkitFullscreenElement || null;
+  };
+
   // Celozaslonski način (Fullscreen API)
-  const toggleFullscreen = async () => {
+  const toggleFullscreen = useCallback(async () => {
     try {
-      if (!document.fullscreenElement) {
-        await document.documentElement.requestFullscreen();
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element | null;
+        webkitExitFullscreen?: () => Promise<void> | void;
+      };
+      const rootEl = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void> | void;
+      };
+      if (!getFullscreenElement()) {
+        if (rootEl.requestFullscreen) {
+          await rootEl.requestFullscreen();
+        } else if (rootEl.webkitRequestFullscreen) {
+          await rootEl.webkitRequestFullscreen();
+        }
         setIsFullscreen(true);
       } else {
         if (document.exitFullscreen) {
           await document.exitFullscreen();
-          setIsFullscreen(false);
+        } else if (doc.webkitExitFullscreen) {
+          await doc.webkitExitFullscreen();
         }
+        setIsFullscreen(false);
+        setShowFsExitBtn(false);
       }
     } catch {
-      // ignore
+      // ignore fullscreen permission/policy errors
     }
-  };
+  }, []);
 
   useEffect(() => {
-    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    const onFsChange = () => {
+      const active = Boolean(getFullscreenElement());
+      setIsFullscreen(active);
+      if (!active) {
+        setShowFsExitBtn(false);
+      }
+    };
     document.addEventListener('fullscreenchange', onFsChange);
-    return () => document.removeEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+    };
   }, []);
+
+  // Bližnjica na tipkovnici: tipka 'F' za preklop celozaslonskega načina
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key === 'f' || e.key === 'F') {
+        e.preventDefault();
+        void toggleFullscreen();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [toggleFullscreen]);
+
+  // Ob premiku miške v celozaslonskem načinu za 3s prikaži diskreten gumb za izhod
+  useEffect(() => {
+    if (!isFullscreen) {
+      if (fsMouseTimerRef.current) {
+        clearTimeout(fsMouseTimerRef.current);
+        fsMouseTimerRef.current = null;
+      }
+      return;
+    }
+
+    const handlePointerActivity = () => {
+      setShowFsExitBtn(true);
+      if (fsMouseTimerRef.current) {
+        clearTimeout(fsMouseTimerRef.current);
+      }
+      fsMouseTimerRef.current = setTimeout(() => {
+        setShowFsExitBtn(false);
+        fsMouseTimerRef.current = null;
+      }, 3000);
+    };
+
+    window.addEventListener('mousemove', handlePointerActivity);
+    window.addEventListener('touchstart', handlePointerActivity);
+
+    return () => {
+      window.removeEventListener('mousemove', handlePointerActivity);
+      window.removeEventListener('touchstart', handlePointerActivity);
+      if (fsMouseTimerRef.current) {
+        clearTimeout(fsMouseTimerRef.current);
+        fsMouseTimerRef.current = null;
+      }
+    };
+  }, [isFullscreen]);
 
   // Števec oddanih odgovorov na trenutni slajd
   const answersForCurrentSlide = useMemo(() => {
@@ -417,115 +507,142 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
   // Indeks trenutnega slajda v temi
   const themeSlides = currentTheme ? data.slidesByTheme[currentTheme.id] || [] : [];
   const slideIndex = currentSlide ? themeSlides.findIndex((s) => s.id === currentSlide.id) : -1;
+  const isImageSlideCanvas =
+    Boolean(currentSlide?.slide_image_url) &&
+    (session.status === 'active_theme' || session.status === 'theme_intro');
 
   return (
     <div
       ref={containerRef}
-      className="min-h-screen w-full bg-slate-950 text-slate-100 flex flex-col select-none relative overflow-hidden"
+      className={`${
+        isImageSlideCanvas || isFullscreen ? 'h-screen' : 'min-h-screen'
+      } w-full ${
+        isFullscreen ? 'bg-black' : 'bg-slate-950'
+      } text-slate-100 flex flex-col select-none relative overflow-hidden ${
+        isFullscreen && !showFsExitBtn ? 'cursor-none' : ''
+      }`}
     >
-      {/* Ambientni neon sij v ozadju */}
-      <div className="pointer-events-none absolute inset-0 overflow-hidden z-0">
-        <div className="absolute -top-32 -left-32 w-[600px] h-[600px] bg-indigo-600/12 rounded-full blur-[130px]" />
-        <div className="absolute top-1/3 -right-32 w-[550px] h-[550px] bg-emerald-500/10 rounded-full blur-[130px]" />
-        <div className="absolute -bottom-32 left-1/3 w-[550px] h-[550px] bg-violet-600/10 rounded-full blur-[130px]" />
-      </div>
+      {/* Ambientni neon sij v ozadju (v Fullscreen načinu za slajde ostane čisto črna podlaga) */}
+      {!isFullscreen && (
+        <div className="pointer-events-none absolute inset-0 overflow-hidden z-0">
+          <div className="absolute -top-32 -left-32 w-[600px] h-[600px] bg-indigo-600/12 rounded-full blur-[130px]" />
+          <div className="absolute top-1/3 -right-32 w-[550px] h-[550px] bg-emerald-500/10 rounded-full blur-[130px]" />
+          <div className="absolute -bottom-32 left-1/3 w-[550px] h-[550px] bg-violet-600/10 rounded-full blur-[130px]" />
+        </div>
+      )}
 
-      {/* ZGORNJA PREGLEDNA VRSTICA (Discreet Presentation Header) */}
-      <header className="relative z-20 flex items-center justify-between px-6 py-4 border-b border-slate-900 bg-slate-950/70 backdrop-blur-md">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
-            <Radio className="w-5 h-5 animate-pulse text-emerald-400" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-sm sm:text-base font-bold text-slate-100 font-display truncate max-w-[260px] sm:max-w-md">
+      {/* Diskreten lebdeči gumb za izhod iz celozaslonskega načina (ob premiku miške v Fullscreen za 3s) */}
+      {isFullscreen && showFsExitBtn && (
+        <button
+          id="fullscreen-floating-exit-btn"
+          type="button"
+          onClick={toggleFullscreen}
+          className="fixed top-3 right-3 z-50 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/75 hover:bg-black/90 text-slate-200 hover:text-white border border-white/15 backdrop-blur-md text-xs font-semibold shadow-2xl transition-all cursor-pointer"
+          title="Izhod iz celozaslonskega načina (ESC ali F)"
+        >
+          <Minimize className="w-3.5 h-3.5 text-slate-300" />
+          <span>ESC / Izhod iz celotnega zaslona</span>
+        </button>
+      )}
+
+      {/* KOMPAKTNA ZGORNJA VRSTICA (skrita v celozaslonskem načinu) */}
+      {!isFullscreen && (
+        <header className="relative z-20 flex items-center justify-between gap-2 px-3 py-1.5 text-xs border-b border-slate-900 bg-slate-950/80 backdrop-blur-md shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-6 h-6 rounded-lg bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 shrink-0">
+              <Radio className="w-3.5 h-3.5 animate-pulse text-emerald-400" />
+            </div>
+            <div className="flex items-center gap-2 min-w-0">
+              <h1 className="text-xs sm:text-sm font-bold text-slate-100 font-display truncate max-w-[180px] sm:max-w-xs">
                 {quiz.title}
               </h1>
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shrink-0">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
                 V ŽIVO
               </span>
-              <span className="hidden lg:inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                ✅ Seja uspešno zapisana v Supabase oblak (Dosegljiva na vseh napravah)
+              {currentTheme && session.status !== 'lobby' && (
+                <span className="hidden md:inline text-[11px] text-slate-400 truncate max-w-[260px]">
+                  {currentTheme.title}
+                  {slideIndex >= 0 && ` • Slajd ${slideIndex + 1}/${themeSlides.length}`}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Sredinski / Desni indikatorji */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Gumb: Poveži telefon gostitelja (Daljinec) */}
+            <button
+              id="open-host-remote-qr-header-btn"
+              onClick={() => setShowRemoteQrModal(true)}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35 text-[11px] font-semibold transition-all cursor-pointer"
+              title="Prikaži QR kodo za telefon gostitelja (Daljinec)"
+            >
+              <Smartphone className="w-3 h-3 text-emerald-400" />
+              <span className="hidden lg:inline">📱 Daljinec</span>
+            </button>
+
+            {/* 4-mestna koda sobe */}
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900/90 border border-slate-800 text-[11px]">
+              <span className="text-slate-400 font-medium hidden sm:inline">Koda:</span>
+              <span className="font-mono-code font-bold tracking-wider text-emerald-400">
+                {session.room_code}
               </span>
             </div>
-            {currentTheme && session.status !== 'lobby' && (
-              <p className="text-xs text-slate-400">
-                {currentTheme.title}
-                {slideIndex >= 0 && ` • Slajd ${slideIndex + 1} od ${themeSlides.length}`}
-              </p>
+
+            {/* Števec igralcev */}
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900/90 border border-slate-800 text-[11px] text-slate-300">
+              <Users className="w-3 h-3 text-indigo-400" />
+              <span className="font-bold">{players.length}</span>
+            </div>
+
+            {/* Ročna osvežitev (Fallback) */}
+            <button
+              onClick={handleManualRefresh}
+              className="p-1.5 rounded-lg bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 transition-colors cursor-pointer"
+              title="Ročno osveži podatke seje"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin text-emerald-400' : ''}`} />
+            </button>
+
+            {/* Gumb za celozaslonski način (Fullscreen) */}
+            <button
+              id="toggle-fullscreen-btn"
+              onClick={toggleFullscreen}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 hover:text-white border border-indigo-500/40 text-[11px] font-semibold transition-colors cursor-pointer"
+              title="Celozaslonski način (tipka F)"
+            >
+              <Maximize className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Cel zaslon (F)</span>
+            </button>
+
+            {onExit && (
+              <button
+                onClick={onExit}
+                className="px-2 py-1 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 cursor-pointer"
+              >
+                Zapri
+              </button>
             )}
           </div>
-        </div>
+        </header>
+      )}
 
-        {/* Sredinski / Desni indikatorji */}
-        <div className="flex items-center gap-2.5 sm:gap-3.5">
-          {/* Gumb: Poveži telefon gostitelja (Daljinec) */}
-          <button
-            id="open-host-remote-qr-header-btn"
-            onClick={() => setShowRemoteQrModal(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35 text-xs font-semibold transition-all cursor-pointer"
-            title="Prikaži QR kodo za telefon gostitelja (Daljinec)"
-          >
-            <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden md:inline">📱 Poveži telefon gostitelja (Daljinec)</span>
-            <span className="md:hidden">📱 Daljinec</span>
-          </button>
-
-          {/* 4-mestna koda sobe */}
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs">
-            <span className="text-slate-400 font-medium hidden sm:inline">Koda sobe:</span>
-            <span className="font-mono-code font-bold tracking-widest text-emerald-400 text-sm">
-              {session.room_code}
-            </span>
-          </div>
-
-          {/* Števec igralcev */}
-          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs text-slate-300">
-            <Users className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="font-bold">{players.length}</span>
-            <span className="hidden sm:inline text-slate-400">
-              {players.length === 1 ? 'ekipa' : players.length === 2 ? 'ekipi' : 'ekip'}
-            </span>
-          </div>
-
-          {/* Ročna osvežitev (Fallback) */}
-          <button
-            onClick={handleManualRefresh}
-            className="p-2 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 transition-colors cursor-pointer"
-            title="Ročno osveži podatke seje"
-          >
-            <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin text-emerald-400' : ''}`} />
-          </button>
-
-          {/* Gumb za celozaslonski način (Fullscreen) */}
-          <button
-            id="toggle-fullscreen-btn"
-            onClick={toggleFullscreen}
-            className="p-2 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 transition-colors cursor-pointer"
-            title={isFullscreen ? 'Izhod iz celozaslonskega načina' : 'Celozaslonski način (Fullscreen)'}
-          >
-            {isFullscreen ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
-          </button>
-
-          {onExit && (
-            <button
-              onClick={onExit}
-              className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 cursor-pointer"
-            >
-              Zapri
-            </button>
-          )}
-        </div>
-      </header>
-
-      {/* GLAVNO PLATNO ZA PRIKAZ (glede na session.status) */}
-      <main className="relative z-10 flex-1 flex flex-col items-center justify-center p-4 sm:p-6 lg:p-8 overflow-y-auto">
+      {/* GLAVNO PLATNO ZA PRIKAZ (minimalni odmiki za maksimalno velikost slajda) */}
+      <main
+        className={
+          isImageSlideCanvas
+            ? `relative z-10 flex-1 min-h-0 w-full flex flex-col items-center justify-center overflow-hidden ${
+                isFullscreen ? 'p-0' : 'p-1 sm:p-1.5'
+              }`
+            : 'relative z-10 flex-1 min-h-0 w-full flex flex-col items-center overflow-y-auto p-2 sm:p-4'
+        }
+      >
         {/* ===================================================================
             1. STANJE: LOBBY (Čakalnica pred začetkom)
             =================================================================== */}
         {session.status === 'lobby' && (
-          <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 animate-fadeIn">
+          <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 animate-fadeIn my-auto">
             {/* Zelen indikator o uspešnem zapisu v Supabase oblak */}
             <div className="px-4 py-2.5 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs sm:text-sm font-bold flex items-center gap-2 shadow-lg">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -651,79 +768,146 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             2. STANJE: THEME_INTRO (Začetek nove tematike - Joker aktivacija!)
             =================================================================== */}
         {session.status === 'theme_intro' && currentTheme && (
-          <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 text-center animate-fadeIn">
-            {/* Oznaka tematike */}
-            <div className="space-y-2">
-              <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
-                <Layers className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Začetek nove tematike</span>
-              </span>
-              <h2 className="text-3xl sm:text-6xl font-black text-slate-100 font-display">
-                {currentTheme.title}
-              </h2>
+          currentSlide?.slide_image_url ? (
+            <div
+              className={
+                isFullscreen
+                  ? 'fixed inset-0 w-screen h-screen bg-black flex items-center justify-center overflow-hidden z-10 animate-fadeIn'
+                  : 'w-full h-full flex-1 min-h-0 flex items-center justify-center relative overflow-hidden animate-fadeIn'
+              }
+            >
+              <img
+                src={currentSlide.slide_image_url}
+                alt={currentTheme.title}
+                className="w-full h-full object-contain select-none"
+              />
+
+              {/* Lebdeča polprosojna značka za status Jokerja, ki ne zmanjšuje prostora za slajd */}
+              {isFullscreen ? (
+                <div className="fixed bottom-2 left-2 z-30 inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/60 backdrop-blur-md border border-amber-500/35 text-[11px] text-amber-200/95 shadow-lg">
+                  <span>🃏</span>
+                  <span className="font-bold text-amber-300">Joker:</span>
+                  <span className="font-mono-code font-bold text-slate-100">
+                    {jokersForCurrentTheme.size}/{players.length}
+                  </span>
+                  {jokersForCurrentTheme.size > 0 && (
+                    <span className="text-amber-100/85 max-w-[45vw] truncate">
+                      •{' '}
+                      {players
+                        .filter((p) => jokersForCurrentTheme.has(p.id))
+                        .map((p) => p.nickname)
+                        .join(', ')}
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div className="absolute bottom-2 left-2 z-30 max-w-[calc(100%-1rem)] sm:max-w-2xl inline-flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/75 backdrop-blur-md border border-amber-500/45 shadow-xl text-xs">
+                  <span className="text-base leading-none">🃏</span>
+                  <span className="font-bold text-amber-300">
+                    Aktivacija JOKERJA (2x točke)
+                  </span>
+                  <span className="text-slate-200 font-mono-code font-bold">
+                    {jokersForCurrentTheme.size}/{players.length}
+                  </span>
+                  {jokersForCurrentTheme.size > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {players
+                        .filter((p) => jokersForCurrentTheme.has(p.id))
+                        .map((p) => (
+                          <span
+                            key={p.id}
+                            className="px-2 py-0.5 rounded-md bg-amber-500/20 border border-amber-500/40 text-amber-200 text-[11px] font-bold"
+                          >
+                            {p.nickname}
+                          </span>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
-
-            {/* Predstavitveni slajd teme (če ima naloženo sliko) */}
-            {currentSlide?.slide_image_url && (
-              <div className="w-full max-w-3xl aspect-video rounded-3xl overflow-hidden border border-slate-800 shadow-2xl bg-slate-950 flex items-center justify-center">
-                <img
-                  src={currentSlide.slide_image_url}
-                  alt={currentTheme.title}
-                  className="w-full h-full object-contain"
-                />
-              </div>
-            )}
-
-            {/* MASIVNO OBVESTILO O JOKERJU */}
-            <div className="w-full max-w-3xl bg-gradient-to-br from-amber-500/20 via-slate-900/90 to-amber-500/10 backdrop-blur-2xl border-2 border-amber-500/60 rounded-3xl p-6 sm:p-8 shadow-2xl shadow-amber-950/50 space-y-4">
-              <div className="w-16 h-16 rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 mx-auto text-3xl shadow-lg shadow-amber-500/20">
-                🃏
-              </div>
-              <div className="space-y-1.5">
-                <h3 className="text-2xl sm:text-4xl font-black text-amber-300 tracking-tight">
-                  Čas za aktivacijo JOKERJA na vaših telefonih!
-                </h3>
-                <p className="text-base sm:text-lg font-bold text-emerald-400">
-                  Dvojne točke (2x) za vsa pravilna vprašanja v tej tematiki!
-                </p>
-                <p className="text-xs sm:text-sm text-slate-400 max-w-lg mx-auto">
-                  Pozor: Ko gostitelj zažene prvo vprašanje, Jokerja v tej temi ne bo več mogoče vklopiti.
-                </p>
-              </div>
-
-              {/* Prikaz ekip, ki so že aktivirale Jokerja */}
-              <div className="pt-2 border-t border-amber-500/20">
-                <span className="text-xs font-semibold text-amber-200 uppercase tracking-wider">
-                  Aktivirani Jokerji za ta sklop: {jokersForCurrentTheme.size} / {players.length}
+          ) : (
+            <div className="w-full max-w-5xl flex flex-col items-center justify-center space-y-6 text-center my-auto animate-fadeIn">
+              {/* Oznaka tematike */}
+              <div className="space-y-2">
+                <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-semibold">
+                  <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>Začetek nove tematike</span>
                 </span>
-                {jokersForCurrentTheme.size > 0 && (
-                  <div className="flex flex-wrap gap-2 justify-center mt-2.5">
-                    {players
-                      .filter((p) => jokersForCurrentTheme.has(p.id))
-                      .map((p) => (
-                        <span
-                          key={p.id}
-                          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-200 text-xs font-bold"
-                        >
-                          <span>🃏</span>
-                          <span>{p.nickname}</span>
-                        </span>
-                      ))}
-                  </div>
-                )}
+                <h2 className="text-3xl sm:text-6xl font-black text-slate-100 font-display">
+                  {currentTheme.title}
+                </h2>
+              </div>
+
+              {/* MASIVNO OBVESTILO O JOKERJU */}
+              <div className="w-full max-w-4xl bg-gradient-to-br from-amber-500/20 via-slate-900/90 to-amber-500/10 backdrop-blur-2xl border-2 border-amber-500/60 rounded-3xl p-6 sm:p-8 shadow-2xl shadow-amber-950/50 space-y-4">
+                <div className="w-16 h-16 rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 mx-auto text-3xl shadow-lg shadow-amber-500/20">
+                  🃏
+                </div>
+                <div className="space-y-1.5">
+                  <h3 className="text-2xl sm:text-4xl font-black text-amber-300 tracking-tight">
+                    Čas za aktivacijo JOKERJA na vaših telefonih!
+                  </h3>
+                  <p className="text-base sm:text-lg font-bold text-emerald-400">
+                    Dvojne točke (2x) za vsa pravilna vprašanja v tej tematiki!
+                  </p>
+                  <p className="text-xs sm:text-sm text-slate-400 max-w-lg mx-auto">
+                    Pozor: Ko gostitelj zažene prvo vprašanje, Jokerja v tej temi ne bo več mogoče vklopiti.
+                  </p>
+                </div>
+
+                {/* Prikaz ekip, ki so že aktivirale Jokerja */}
+                <div className="pt-2 border-t border-amber-500/20">
+                  <span className="text-xs font-semibold text-amber-200 uppercase tracking-wider">
+                    Aktivirani Jokerji za ta sklop: {jokersForCurrentTheme.size} / {players.length}
+                  </span>
+                  {jokersForCurrentTheme.size > 0 && (
+                    <div className="flex flex-wrap gap-2 justify-center mt-2.5">
+                      {players
+                        .filter((p) => jokersForCurrentTheme.has(p.id))
+                        .map((p) => (
+                          <span
+                            key={p.id}
+                            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-200 text-xs font-bold"
+                          >
+                            <span>🃏</span>
+                            <span>{p.nickname}</span>
+                          </span>
+                        ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
-          </div>
+          )
         )}
 
         {/* ===================================================================
             3. STANJE: ACTIVE_THEME (Prikaz slajdov in vprašanj)
             =================================================================== */}
         {session.status === 'active_theme' && currentSlide && (
-          <div className="w-full h-full flex-1 flex flex-col items-center justify-center relative animate-fadeIn">
+          <div
+            className={
+              isFullscreen
+                ? currentSlide.slide_image_url
+                  ? 'fixed inset-0 w-screen h-screen bg-black flex items-center justify-center overflow-hidden z-10 animate-fadeIn'
+                  : 'fixed inset-0 w-screen h-screen bg-black flex flex-col items-center overflow-y-auto p-4 sm:p-8 z-10 animate-fadeIn'
+                : currentSlide.slide_image_url
+                ? 'w-full h-full flex-1 min-h-0 flex items-center justify-center relative overflow-hidden animate-fadeIn'
+                : 'w-full flex-1 min-h-0 flex flex-col items-center relative overflow-y-auto py-12 animate-fadeIn'
+            }
+          >
             {/* Animiran odštevalnik časa (Timer) */}
             {activeSlideTimerEntry && timeLeft !== null && (
-              <div className="absolute top-2 right-2 sm:top-4 sm:right-4 z-30 flex items-center gap-2.5 px-4 py-2 rounded-2xl bg-slate-900/90 backdrop-blur-xl border border-slate-800 shadow-2xl">
+              <div
+                className={
+                  isFullscreen
+                    ? `fixed right-3 z-40 transition-all duration-200 flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-black/70 backdrop-blur-md border border-white/15 shadow-2xl ${
+                        showFsExitBtn ? 'top-14' : 'top-3'
+                      }`
+                    : 'absolute top-2 right-2 z-30 flex items-center gap-2.5 px-3.5 py-2 rounded-2xl bg-slate-900/85 backdrop-blur-xl border border-slate-800 shadow-2xl'
+                }
+              >
                 <Clock
                   className={`w-5 h-5 ${
                     timeLeft <= 5 ? 'text-rose-400 animate-bounce' : 'text-indigo-400'
@@ -762,18 +946,16 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               </div>
             )}
 
-            {/* Prikaz vsebine slajda: Slika ali vprašanje */}
+            {/* Prikaz vsebine slajda: Slika čez celoten razpoložljivi zaslon ali tekstovna kartica */}
             {currentSlide.slide_image_url ? (
-              <div className="w-full flex-1 flex items-center justify-center p-2">
-                <img
-                  src={currentSlide.slide_image_url}
-                  alt={currentSlide.question_text || 'Slajd kviza'}
-                  className="max-h-[78vh] w-auto max-w-full object-contain rounded-2xl shadow-2xl border border-slate-800/80"
-                />
-              </div>
+              <img
+                src={currentSlide.slide_image_url}
+                alt={currentSlide.question_text || 'Slajd kviza'}
+                className="w-full h-full object-contain select-none"
+              />
             ) : (
               /* Tekstovna kartica, če slika ni naložena */
-              <div className="w-full max-w-4xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center">
+              <div className="w-full max-w-6xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-6 text-center my-auto">
                 {currentSlide.slide_type === 'info_only' ? (
                   <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-xs font-semibold">
                     <Sparkles className="w-3.5 h-3.5 text-sky-400" />
@@ -789,7 +971,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
                   </div>
                 )}
 
-                <h3 className="text-2xl sm:text-4xl font-bold text-slate-100 leading-snug">
+                <h3 className="text-2xl sm:text-4xl lg:text-5xl font-bold text-slate-100 leading-snug">
                   {currentSlide.question_text ||
                     (currentSlide.slide_type === 'info_only'
                       ? currentTheme?.title || quiz.title
@@ -879,14 +1061,22 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
               </div>
             )}
 
-            {/* Diskreten števec oddanih odgovorov v spodnjem kotu */}
-            <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 z-30 flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-900/90 backdrop-blur-xl border border-slate-800 text-xs sm:text-sm font-semibold shadow-2xl">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              <span className="text-slate-400">Odgovori:</span>
-              <span className="text-slate-100 font-bold">
-                {answersForCurrentSlide.length} / {players.length}
-              </span>
-            </div>
+            {/* Zelo majhna polprosojna lebdeča značka oddanih odgovorov (ne zmanjšuje prostora za slajd) */}
+            {currentSlide.slide_type !== 'info_only' && (
+              <div
+                className={
+                  isFullscreen
+                    ? 'fixed bottom-2 left-2 z-30 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/55 backdrop-blur-md border border-white/10 text-[11px] font-medium text-slate-300/90 shadow-lg'
+                    : 'absolute bottom-2 left-2 z-30 flex items-center gap-2 px-3 py-1 rounded-xl bg-slate-900/75 backdrop-blur-md border border-slate-800/80 text-xs font-semibold shadow-xl'
+                }
+              >
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="text-slate-400">Odgovori:</span>
+                <span className="text-slate-100 font-mono-code font-bold">
+                  {answersForCurrentSlide.length} / {players.length}
+                </span>
+              </div>
+            )}
           </div>
         )}
 
@@ -894,7 +1084,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             4. STANJE: GRADING_THEME (Konec sklopa - Ocenjevanje)
             =================================================================== */}
         {session.status === 'grading_theme' && (
-          <div className="w-full max-w-2xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-8 sm:p-12 text-center space-y-6 shadow-2xl animate-fadeIn">
+          <div className="w-full max-w-2xl bg-slate-900/85 backdrop-blur-2xl border border-slate-800 rounded-3xl p-8 sm:p-12 text-center space-y-6 shadow-2xl animate-fadeIn my-auto">
             <div className="w-20 h-20 rounded-3xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400 mx-auto shadow-xl">
               <Loader2 className="w-10 h-10 animate-spin text-emerald-400" />
             </div>
@@ -916,7 +1106,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             5. STANJE: FINISHED (Slavnostni oder zmagovalcev - Grand Podium)
             =================================================================== */}
         {session.status === 'finished' && (
-          <div className="w-full max-w-5xl space-y-10 animate-fadeIn text-center">
+          <div className="w-full max-w-5xl space-y-10 animate-fadeIn text-center my-auto">
             <div className="space-y-3">
               <div className="inline-flex items-center gap-2 px-5 py-2 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-300 text-sm font-black shadow-lg shadow-amber-500/10">
                 <Crown className="w-5 h-5 text-amber-400 animate-bounce" />
@@ -1066,7 +1256,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
             6. STANJE: LEADERBOARD (Vmesna lestvica po končani temi)
             =================================================================== */}
         {session.status === 'leaderboard' && (
-          <div className="w-full max-w-4xl space-y-8 animate-fadeIn text-center">
+          <div className="w-full max-w-4xl space-y-8 animate-fadeIn text-center my-auto">
             <div className="space-y-2">
               <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-bold">
                 <Trophy className="w-4 h-4 text-amber-400" />
@@ -1198,7 +1388,7 @@ export const PresentationView: React.FC<PresentationViewProps> = ({
           MODAL ZA HITRO POVEZAVO TELEFONA GOSTITELJA (DALJINEC PREK QR KODE)
           =================================================================== */}
       {showRemoteQrModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
           <div className="w-full max-w-md bg-slate-900/95 backdrop-blur-xl border border-emerald-500/40 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6 text-center animate-scaleIn">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800">
               <div className="flex items-center gap-2.5 text-left">
